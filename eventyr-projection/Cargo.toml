@@ -1,0 +1,14 @@
+[package]
+name = "eventyr-projection"
+description = "Projection runner and checkpointing for eventyr."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["event-sourcing", "projection", "cqrs"]
+
+[lints]
+workspace = true
+
+[dependencies]
+eventyr-core = { workspace = true }

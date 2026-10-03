@@ -1,0 +1,19 @@
+[package]
+name = "eventyr"
+description = "Event sourcing for Rust — pure machines, thin drivers. Umbrella crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["event-sourcing", "cqrs", "event-store", "sans-io", "ddd"]
+
+[lints]
+workspace = true
+
+[features]
+default = ["time"]
+# Carries `Metadata::timestamp` through the re-exported core.
+time = ["eventyr-core/time"]
+
+[dependencies]
+eventyr-core = { workspace = true, features = ["time"] }

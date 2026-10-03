@@ -1,0 +1,14 @@
+[package]
+name = "eventyr-subscription"
+description = "Catch-up subscriptions and the event bus trait for eventyr."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["event-sourcing", "subscription", "event-bus"]
+
+[lints]
+workspace = true
+
+[dependencies]
+eventyr-core = { workspace = true }

@@ -1,0 +1,23 @@
+[package]
+name = "eventyr-core"
+description = "Pure sans-IO core for event sourcing: the Aggregate trait, protocol vocabulary, and the write machine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["event-sourcing", "cqrs", "event-store", "sans-io", "no-std"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Carries `Metadata::timestamp` (`Option<OffsetDateTime>`). Off here, on in the
+# umbrella crate — the rest of the core needs no runtime at all.
+time = ["dep:time"]
+
+[dependencies]
+time = { version = "0.3", default-features = false, optional = true }
+
+[dev-dependencies]
+proptest = "1"

@@ -1,0 +1,15 @@
+[package]
+name = "eventyr-store-postgres"
+description = "Postgres event store for eventyr, via sqlx."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["event-sourcing", "postgres", "sqlx"]
+
+[lints]
+workspace = true
+
+[dependencies]
+eventyr-core = { workspace = true }
+eventyr-store = { path = "../eventyr-store", version = "0.1.0" }

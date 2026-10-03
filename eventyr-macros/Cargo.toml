@@ -1,0 +1,14 @@
+[package]
+name = "eventyr-macros"
+description = "Derive macros for eventyr: #[derive(Aggregate)] and friends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["event-sourcing", "cqrs", "proc-macro"]
+
+[lints]
+workspace = true
+
+[lib]
+proc-macro = true

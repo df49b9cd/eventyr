@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "eventyr",
+    "eventyr-core",
+    "eventyr-macros",
+    "eventyr-projection",
+    "eventyr-store",
+    "eventyr-store-postgres",
+    "eventyr-subscription",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+eventyr-core = { path = "eventyr-core", version = "0.1.0" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
