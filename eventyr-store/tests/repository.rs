@@ -1,0 +1,397 @@
+//! End-to-end tests: repository → driver → machine → in-memory store.
+
+use std::fmt;
+use std::sync::Arc;
+
+use eventyr_core::aggregate::Aggregate;
+use eventyr_core::envelope::EventEnvelope;
+use eventyr_core::prelude::*;
+use eventyr_store::prelude::*;
+use futures::TryStreamExt;
+
+// -- test aggregate: a small bank account -------------------------------
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct AccountId(u64);
+
+impl fmt::Display for AccountId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+enum AccountEvent {
+    Opened { owner: String },
+    Deposited { amount: u64 },
+    Withdrawn { amount: u64 },
+}
+
+#[derive(Clone, Debug)]
+enum AccountCommand {
+    Open { owner: String },
+    Deposit { amount: u64 },
+    Withdraw { amount: u64 },
+}
+
+#[derive(Debug, PartialEq)]
+enum AccountError {
+    AlreadyOpen,
+    NotOpen,
+    InsufficientFunds,
+}
+
+impl fmt::Display for AccountError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            AccountError::AlreadyOpen => "account is already open",
+            AccountError::NotOpen => "account is not open",
+            AccountError::InsufficientFunds => "insufficient funds",
+        })
+    }
+}
+
+#[derive(Debug)]
+struct AccountState {
+    open: bool,
+    balance: u64,
+}
+
+struct Account;
+
+impl Aggregate for Account {
+    const NAME: &'static str = "account";
+    type Id = AccountId;
+    type State = AccountState;
+    type Event = AccountEvent;
+    type Command = AccountCommand;
+    type Error = AccountError;
+
+    fn initial(_id: &Self::Id) -> Self::State {
+        AccountState {
+            open: false,
+            balance: 0,
+        }
+    }
+
+    fn apply(state: &mut Self::State, event: &Self::Event) {
+        match event {
+            AccountEvent::Opened { .. } => {
+                state.open = true;
+                state.balance = 0;
+            }
+            AccountEvent::Deposited { amount } => state.balance += amount,
+            AccountEvent::Withdrawn { amount } => state.balance -= amount,
+        }
+    }
+
+    fn decide(
+        state: &Self::State,
+        command: &Self::Command,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        match command {
+            AccountCommand::Open { .. } if state.open => Err(AccountError::AlreadyOpen),
+            AccountCommand::Open { owner } => {
+                Ok(vec![AccountEvent::Opened { owner: owner.clone() }])
+            }
+            AccountCommand::Deposit { .. }
+            | AccountCommand::Withdraw { .. }
+                if !state.open =>
+            {
+                Err(AccountError::NotOpen)
+            }
+            AccountCommand::Deposit { amount } => {
+                Ok(vec![AccountEvent::Deposited { amount: *amount }])
+            }
+            AccountCommand::Withdraw { amount } if *amount > state.balance => {
+                Err(AccountError::InsufficientFunds)
+            }
+            AccountCommand::Withdraw { amount } => {
+                Ok(vec![AccountEvent::Withdrawn { amount: *amount }])
+            }
+        }
+    }
+}
+
+// -- helpers -------------------------------------------------------------
+
+fn repository() -> AggregateRepository<Account, Arc<InMemoryStore<AccountEvent>>> {
+    AggregateRepository::new(Arc::new(InMemoryStore::new()), RetryPolicy::default())
+}
+
+async fn stream_of(
+    store: &InMemoryStore<AccountEvent>,
+    id: u64,
+) -> Vec<EventEnvelope<AccountEvent>> {
+    store
+        .stream(
+            &StreamId::for_aggregate::<Account>(&AccountId(id)),
+            Version::EMPTY,
+        )
+        .try_collect()
+        .await
+        .expect("stream read")
+}
+
+// -- the loop ------------------------------------------------------------
+
+#[tokio::test]
+async fn open_deposit_withdraw_roundtrip() {
+    let repo = repository();
+    let id = AccountId(1);
+
+    // Open: empty stream, expects `Empty`.
+    repo.execute(
+        id.clone(),
+        AccountCommand::Open {
+            owner: "me".into(),
+        },
+    )
+    .await
+    .expect("open");
+
+    // Deposit twice: state folds across interactions.
+    repo.execute(id.clone(), AccountCommand::Deposit { amount: 100 })
+        .await
+        .expect("deposit 1");
+    repo.execute(id.clone(), AccountCommand::Deposit { amount: 50 })
+        .await
+        .expect("deposit 2");
+
+    // Withdraw: decided against the folded balance of 150.
+    let outcome = repo
+        .execute(id.clone(), AccountCommand::Withdraw { amount: 120 })
+        .await
+        .expect("withdraw");
+    let ExecutionOutcome::Committed(events) = outcome else {
+        panic!("expected a commit")
+    };
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].version, Version::new(4));
+
+    // The domain rejects what the folded state forbids.
+    let error = repo
+        .execute(id, AccountCommand::Withdraw { amount: 100 })
+        .await
+        .expect_err("only 30 left");
+    assert!(matches!(error, ExecutionError::Domain(AccountError::InsufficientFunds)));
+}
+
+#[tokio::test]
+async fn domain_rejection_leaves_the_stream_untouched() {
+    let repo = repository();
+    let id = AccountId(2);
+
+    // Withdraw on a nonexistent account: rejected before any append.
+    let error = repo
+        .execute(id.clone(), AccountCommand::Withdraw { amount: 10 })
+        .await
+        .expect_err("not open");
+    assert!(matches!(error, ExecutionError::Domain(AccountError::NotOpen)));
+
+    let events = stream_of(repo.store(), id.0).await;
+    assert!(events.is_empty(), "a rejection must not append");
+}
+
+#[tokio::test]
+async fn concurrent_executions_all_land_contiguously() {
+    let repo = repository();
+    let id = AccountId(3);
+
+    repo.execute(
+        id.clone(),
+        AccountCommand::Open {
+            owner: "me".into(),
+        },
+    )
+    .await
+    .expect("open");
+
+    // Three concurrent deposits on one task: the in-memory store never
+    // yields, so these interleave at await points only — but whatever
+    // the interleaving, all three must land with contiguous versions
+    // and no lost updates.
+    let store = Arc::clone(repo.store());
+    let (a, b, c) = tokio::join!(
+        repo.execute(id.clone(), AccountCommand::Deposit { amount: 10 }),
+        repo.execute(id.clone(), AccountCommand::Deposit { amount: 20 }),
+        repo.execute(id, AccountCommand::Deposit { amount: 30 }),
+    );
+    a.expect("deposit a");
+    b.expect("deposit b");
+    c.expect("deposit c");
+
+    let events = stream_of(&store, 3).await;
+    assert_eq!(events.len(), 4);
+    let versions: Vec<_> = events.iter().map(|e| e.version).collect();
+    assert_eq!(
+        versions,
+        vec![Version::new(1), Version::new(2), Version::new(3), Version::new(4)]
+    );
+}
+
+/// Drives a machine by hand to its `Append` action — the deterministic
+/// way to put a writer in the window between load and append.
+async fn drive_to_append(
+    store: &InMemoryStore<AccountEvent>,
+    id: u64,
+    amount: u64,
+    retry_policy: RetryPolicy,
+) -> (WriteMachine<Account>, StreamId, ExpectedVersion, Vec<NewEvent<AccountEvent>>) {
+    let mut machine = WriteMachine::<Account>::new(
+        AccountId(id),
+        AccountCommand::Deposit { amount },
+        retry_policy,
+    );
+    let WriteAction::LoadStream { stream_id, from } = machine.start() else {
+        unreachable!("start always loads")
+    };
+    let events: Vec<_> = store
+        .stream(&stream_id, from)
+        .try_collect()
+        .await
+        .expect("load");
+    let WriteAction::Append {
+        stream_id,
+        expected,
+        events,
+    } = machine.handle(WriteInput::Loaded { events })
+    else {
+        unreachable!("a deposit on an open account always appends")
+    };
+    (machine, stream_id, expected, events)
+}
+
+#[tokio::test]
+async fn conflict_retry_commits_against_fresh_state() {
+    let store = Arc::new(InMemoryStore::new());
+    let repo = AggregateRepository::<Account, _>::new(Arc::clone(&store), RetryPolicy::default());
+    let id = AccountId(4);
+
+    repo.execute(
+        id.clone(),
+        AccountCommand::Open {
+            owner: "me".into(),
+        },
+    )
+    .await
+    .expect("open");
+
+    // Writer A reaches its append (expecting v1)...
+    let (mut machine, stream_id, expected, events) =
+        drive_to_append(&store, 4, 10, RetryPolicy::default()).await;
+    assert_eq!(expected, ExpectedVersion::Exact(Version::new(1)));
+
+    // ...but a competing writer commits v2 first.
+    store
+        .append(
+            &stream_id,
+            expected,
+            vec![NewEvent::new(AccountEvent::Deposited { amount: 99 })],
+        )
+        .await
+        .expect("competing append wins the race");
+
+    // A's append now conflicts; the machine must reload the delta and
+    // re-decide against the fresh balance.
+    let Err(StoreError::Conflict { current }) = store.append(&stream_id, expected, events).await
+    else {
+        unreachable!("the expectation no longer matches")
+    };
+    let WriteAction::LoadStream { from, .. } = machine.handle(WriteInput::Conflict { current })
+    else {
+        unreachable!("a conflict with retries left reloads")
+    };
+    assert_eq!(from, Version::new(1), "only the delta since the fold");
+
+    let delta: Vec<_> = store
+        .stream(&stream_id, from)
+        .try_collect()
+        .await
+        .expect("delta read");
+    let WriteAction::Append {
+        expected,
+        events: retry_events,
+        ..
+    } = machine.handle(WriteInput::Loaded { events: delta })
+    else {
+        unreachable!("re-decide appends")
+    };
+    assert_eq!(expected, ExpectedVersion::Exact(Version::new(2)));
+
+    let committed = store
+        .append(&stream_id, expected, retry_events)
+        .await
+        .expect("the retried append commits");
+    let action = machine.handle(WriteInput::Appended { committed });
+    assert!(matches!(
+        action,
+        WriteAction::Done(WriteOutcome::Committed(_))
+    ));
+
+    // Both deposits are on the stream: v2 (the competitor) and v3 (ours).
+    let events = stream_of(&store, 4).await;
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[2].version, Version::new(3));
+}
+
+#[tokio::test]
+async fn conflict_beyond_the_retry_budget_fails() {
+    let store = Arc::new(InMemoryStore::new());
+    let repo = AggregateRepository::<Account, _>::new(Arc::clone(&store), RetryPolicy::NEVER);
+    let id = AccountId(5);
+
+    repo.execute(
+        id.clone(),
+        AccountCommand::Open {
+            owner: "me".into(),
+        },
+    )
+    .await
+    .expect("open");
+
+    // Writer A reaches its append with no retry budget...
+    let (mut machine, stream_id, expected, events) =
+        drive_to_append(&store, 5, 10, RetryPolicy::NEVER).await;
+
+    // ...the competing writer wins...
+    store
+        .append(
+            &stream_id,
+            expected,
+            vec![NewEvent::new(AccountEvent::Deposited { amount: 99 })],
+        )
+        .await
+        .expect("competing append wins the race");
+
+    // ...and A's conflict is terminal: NEVER means no reload.
+    let Err(StoreError::Conflict { current }) = store.append(&stream_id, expected, events).await
+    else {
+        unreachable!("the expectation no longer matches")
+    };
+    let action = machine.handle(WriteInput::Conflict { current });
+    assert!(matches!(
+        action,
+        WriteAction::Done(WriteOutcome::Failed(StoreError::Conflict { .. }))
+    ));
+}
+
+// -- store access from the repository -------------------------------------
+
+/// The repository exposes its store for reads (projections, queries).
+#[tokio::test]
+async fn repository_exposes_the_store_for_reads() {
+    let repo = repository();
+    repo.execute(
+        AccountId(5),
+        AccountCommand::Open {
+            owner: "me".into(),
+        },
+    )
+    .await
+    .expect("open");
+
+    let events = stream_of(repo.store(), 5).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event, AccountEvent::Opened { owner: "me".into() });
+}

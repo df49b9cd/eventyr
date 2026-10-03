@@ -12,3 +12,7 @@ workspace = true
 
 [dependencies]
 eventyr-core = { workspace = true }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
