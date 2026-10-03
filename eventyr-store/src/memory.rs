@@ -218,9 +218,13 @@ mod tests {
         ));
 
         // `Exact` with the wrong version.
-        let error = append(&store, ExpectedVersion::Exact(Version::new(5)), vec![new_event(2)])
-            .await
-            .expect_err("version does not match");
+        let error = append(
+            &store,
+            ExpectedVersion::Exact(Version::new(5)),
+            vec![new_event(2)],
+        )
+        .await
+        .expect_err("version does not match");
         assert!(matches!(
             error,
             StoreError::Conflict { current } if current == Version::new(1)
@@ -247,9 +251,13 @@ mod tests {
             .expect("first append succeeds");
 
         // A conflicting batch of two must not commit anything.
-        append(&store, ExpectedVersion::Empty, vec![new_event(2), new_event(3)])
-            .await
-            .expect_err("conflict");
+        append(
+            &store,
+            ExpectedVersion::Empty,
+            vec![new_event(2), new_event(3)],
+        )
+        .await
+        .expect_err("conflict");
 
         let events: Vec<_> = store
             .stream(&sid(), Version::EMPTY)
@@ -262,9 +270,13 @@ mod tests {
     #[tokio::test]
     async fn stream_reads_from_exclusive_bound() {
         let store = InMemoryStore::new();
-        append(&store, ExpectedVersion::Any, vec![new_event(1), new_event(2), new_event(3)])
-            .await
-            .expect("append");
+        append(
+            &store,
+            ExpectedVersion::Any,
+            vec![new_event(1), new_event(2), new_event(3)],
+        )
+        .await
+        .expect("append");
 
         let all: Vec<_> = store
             .stream(&sid(), Version::EMPTY)
@@ -308,7 +320,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .append(&a, ExpectedVersion::Exact(Version::new(1)), vec![new_event(3)])
+            .append(
+                &a,
+                ExpectedVersion::Exact(Version::new(1)),
+                vec![new_event(3)],
+            )
             .await
             .unwrap();
 
@@ -318,8 +334,14 @@ mod tests {
             .await
             .expect("global stream");
         assert_eq!(
-            all.iter().map(|e| (e.sequence, e.event)).collect::<Vec<_>>(),
-            vec![(Sequence::new(1), 1), (Sequence::new(2), 2), (Sequence::new(3), 3)]
+            all.iter()
+                .map(|e| (e.sequence, e.event))
+                .collect::<Vec<_>>(),
+            vec![
+                (Sequence::new(1), 1),
+                (Sequence::new(2), 2),
+                (Sequence::new(3), 3)
+            ]
         );
 
         let tail: Vec<_> = store

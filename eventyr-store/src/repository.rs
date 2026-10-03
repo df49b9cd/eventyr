@@ -101,6 +101,12 @@ where
     /// appends them under the expected version. On a conflict the
     /// interaction is retried (reload the delta, re-fold, re-decide)
     /// until the retry budget is spent.
+    ///
+    /// Events are appended with empty metadata. Correlation and
+    /// causation ids are not yet reachable through this path — a
+    /// metadata-aware variant arrives with 0.2; until then, hand-drive
+    /// the [`WriteMachine`](eventyr_core::write::WriteMachine) to
+    /// enrich events.
     pub async fn execute(
         &self,
         id: A::Id,
@@ -111,9 +117,7 @@ where
             Ok(WriteOutcome::Committed(events)) => Ok(ExecutionOutcome::Committed(events)),
             Ok(WriteOutcome::Noop) => Ok(ExecutionOutcome::Noop),
             Ok(WriteOutcome::Rejected(error)) => Err(ExecutionError::Domain(error)),
-            Ok(WriteOutcome::Failed(error)) | Err(error) => {
-                Err(ExecutionError::Store(error))
-            }
+            Ok(WriteOutcome::Failed(error)) | Err(error) => Err(ExecutionError::Store(error)),
         }
     }
 }

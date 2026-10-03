@@ -6,7 +6,6 @@
 //! handling — lives in the machine, so the same loop serves every
 //! aggregate and every store.
 
-use futures::StreamExt;
 use futures::TryStreamExt;
 
 use eventyr_core::aggregate::Aggregate;
@@ -45,10 +44,8 @@ where
     loop {
         match action {
             WriteAction::LoadStream { stream_id, from } => {
-                let events: Vec<EventEnvelope<A::Event>> = store
-                    .stream(&stream_id, from)
-                    .try_collect()
-                    .await?;
+                let events: Vec<EventEnvelope<A::Event>> =
+                    store.stream(&stream_id, from).try_collect().await?;
                 action = machine.handle(WriteInput::Loaded { events });
             }
             WriteAction::Append {
@@ -68,9 +65,3 @@ where
         }
     }
 }
-
-// `StreamExt` is needed for `try_collect` on the store's stream type; keep
-// the import visible to the compiler even if the trait goes unused in
-// future refactors.
-#[allow(unused_imports)]
-use StreamExt as _;

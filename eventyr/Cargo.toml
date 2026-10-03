@@ -16,4 +16,4 @@ default = ["time"]
 time = ["eventyr-core/time"]
 
 [dependencies]
-eventyr-core = { workspace = true, features = ["time"] }
+eventyr-core = { workspace = true }

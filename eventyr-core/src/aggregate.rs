@@ -66,6 +66,8 @@ pub trait Aggregate {
     /// failures. Anything the decision needs from the environment (time,
     /// catalogs) belongs in the command payload or a context type, not in
     /// the environment.
-    fn decide(state: &Self::State, command: &Self::Command)
-        -> Result<Vec<Self::Event>, Self::Error>;
+    fn decide(
+        state: &Self::State,
+        command: &Self::Command,
+    ) -> Result<Vec<Self::Event>, Self::Error>;
 }

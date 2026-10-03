@@ -10,8 +10,8 @@
 //! in a unit test with a `Vec` of inputs (see
 //! [`drive_scripted`](crate::testing::drive_scripted)).
 
-use alloc::vec::Vec;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use crate::aggregate::Aggregate;
 use crate::envelope::{EventEnvelope, NewEvent};
@@ -303,120 +303,12 @@ impl<A: Aggregate> WriteMachine<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aggregate::Aggregate;
     use crate::envelope::{EventEnvelope, Metadata};
+    use crate::testing::account::{Account, AccountCommand, AccountError, AccountEvent, AccountId};
     use crate::testing::drive_scripted;
     use crate::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
     use alloc::string::String;
-    use core::fmt;
     use proptest::prelude::*;
-
-    // -- test aggregate: a small bank account ---------------------------
-
-    #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-    struct AccountId(u64);
-
-    impl fmt::Display for AccountId {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "{}", self.0)
-        }
-    }
-
-    #[derive(Clone, PartialEq, Debug)]
-    enum AccountEvent {
-        Opened { owner: String },
-        Deposited { amount: u64 },
-        Withdrawn { amount: u64 },
-    }
-
-    #[derive(Clone, Debug)]
-    enum AccountCommand {
-        Open { owner: String },
-        Deposit { amount: u64 },
-        Withdraw { amount: u64 },
-        CheckBalance,
-    }
-
-    #[derive(Debug, PartialEq)]
-    enum AccountError {
-        AlreadyOpen,
-        NotOpen,
-        InsufficientFunds,
-    }
-
-    impl fmt::Display for AccountError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(match self {
-                AccountError::AlreadyOpen => "account is already open",
-                AccountError::NotOpen => "account is not open",
-                AccountError::InsufficientFunds => "insufficient funds",
-            })
-        }
-    }
-
-    #[derive(Debug)]
-    struct AccountState {
-        open: bool,
-        balance: u64,
-    }
-
-    struct Account;
-
-    impl Aggregate for Account {
-        const NAME: &'static str = "account";
-        type Id = AccountId;
-        type State = AccountState;
-        type Event = AccountEvent;
-        type Command = AccountCommand;
-        type Error = AccountError;
-
-        fn initial(_id: &Self::Id) -> Self::State {
-            AccountState {
-                open: false,
-                balance: 0,
-            }
-        }
-
-        fn apply(state: &mut Self::State, event: &Self::Event) {
-            match event {
-                AccountEvent::Opened { .. } => {
-                    state.open = true;
-                    state.balance = 0;
-                }
-                AccountEvent::Deposited { amount } => state.balance += amount,
-                AccountEvent::Withdrawn { amount } => state.balance -= amount,
-            }
-        }
-
-        fn decide(
-            state: &Self::State,
-            command: &Self::Command,
-        ) -> Result<Vec<Self::Event>, Self::Error> {
-            match command {
-                AccountCommand::Open { .. } if state.open => Err(AccountError::AlreadyOpen),
-                AccountCommand::Open { owner } => {
-                    Ok(vec![AccountEvent::Opened { owner: owner.clone() }])
-                }
-                AccountCommand::Deposit { .. }
-                | AccountCommand::Withdraw { .. }
-                | AccountCommand::CheckBalance
-                    if !state.open =>
-                {
-                    Err(AccountError::NotOpen)
-                }
-                AccountCommand::Deposit { amount } => {
-                    Ok(vec![AccountEvent::Deposited { amount: *amount }])
-                }
-                AccountCommand::Withdraw { amount } if *amount > state.balance => {
-                    Err(AccountError::InsufficientFunds)
-                }
-                AccountCommand::Withdraw { amount } => {
-                    Ok(vec![AccountEvent::Withdrawn { amount: *amount }])
-                }
-                AccountCommand::CheckBalance => Ok(vec![]),
-            }
-        }
-    }
 
     // -- helpers ---------------------------------------------------------
 
@@ -436,7 +328,9 @@ mod tests {
 
     fn machine(command: AccountCommand) -> WriteMachine<Account> {
         WriteMachine::new(AccountId(7), command, RetryPolicy::default())
-    }    fn is_protocol_violation(action: &WriteAction<AccountEvent, AccountError>) -> bool {
+    }
+
+    fn is_protocol_violation(action: &WriteAction<AccountEvent, AccountError>) -> bool {
         matches!(
             action,
             WriteAction::Done(WriteOutcome::Failed(StoreError::Other(_)))
@@ -671,9 +565,9 @@ mod tests {
         let mut m = machine(AccountCommand::CheckBalance);
         m.start();
         m.handle(WriteInput::Loaded { events: vec![] }); // Done(Noop)
-        assert!(is_protocol_violation(&m.handle(WriteInput::Appended {
-            committed: vec![]
-        })));
+        assert!(is_protocol_violation(
+            &m.handle(WriteInput::Appended { committed: vec![] })
+        ));
         assert!(is_protocol_violation(&m.start()));
     }
 
@@ -682,18 +576,18 @@ mod tests {
         let mut m = machine(AccountCommand::Deposit { amount: 5 });
         m.start();
         m.handle(WriteInput::Loaded { events: vec![] }); // → Appending
-        assert!(is_protocol_violation(&m.handle(WriteInput::Loaded {
-            events: vec![]
-        })));
+        assert!(is_protocol_violation(
+            &m.handle(WriteInput::Loaded { events: vec![] })
+        ));
     }
 
     #[test]
     fn appended_outside_appending_is_a_protocol_violation() {
         let mut m = machine(AccountCommand::Deposit { amount: 5 });
         m.start();
-        assert!(is_protocol_violation(&m.handle(WriteInput::Appended {
-            committed: vec![]
-        })));
+        assert!(is_protocol_violation(
+            &m.handle(WriteInput::Appended { committed: vec![] })
+        ));
     }
 
     #[test]
