@@ -97,8 +97,40 @@ pub async fn drive_projector<E, S, C, P, F, Fut>(
     name: &str,
     source: &S,
     checkpoints: &C,
+    projection: P,
+    sleep: F,
+) -> SubscriptionOutcome
+where
+    S: SubscriptionSource<Event = E>,
+    C: CheckpointStore,
+    P: Projection<Event = E>,
+    P::Error: core::fmt::Display,
+    F: FnMut(core::time::Duration) -> Fut,
+    Fut: Future<Output = ()>,
+    E: Clone + Send,
+{
+    drive_projector_with_metrics(
+        machine,
+        name,
+        source,
+        checkpoints,
+        projection,
+        sleep,
+        &eventyr_store::metrics::NoopMetrics,
+    )
+    .await
+}
+
+/// [`drive_projector`] with metrics (0.5.3): each apply and ack reports
+/// through `metrics` — projection lag and throughput become observable.
+pub async fn drive_projector_with_metrics<E, S, C, P, F, Fut>(
+    machine: &mut SubscriptionMachine<E>,
+    name: &str,
+    source: &S,
+    checkpoints: &C,
     mut projection: P,
     mut sleep: F,
+    metrics: &(dyn eventyr_store::metrics::Metrics + Send + Sync),
 ) -> SubscriptionOutcome
 where
     S: SubscriptionSource<Event = E>,
@@ -118,8 +150,15 @@ where
             },
             SubscriptionAction::Apply { envelope } => {
                 let sequence = envelope.sequence;
-                match projection.apply(&envelope).await {
-                    Ok(()) => machine.handle(SubscriptionInput::Applied),
+                let result = projection.apply(&envelope).await;
+                match result {
+                    Ok(()) => {
+                        metrics.counter(
+                            eventyr_store::metrics::names::PROJECTED_EVENTS,
+                            1,
+                        );
+                        machine.handle(SubscriptionInput::Applied)
+                    }
                     Err(error) => machine.handle(SubscriptionInput::ApplyFailed {
                         error: StoreError::other(format!(
                             "projection applying sequence {sequence}: {error}"

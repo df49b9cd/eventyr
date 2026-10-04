@@ -10,9 +10,17 @@ keywords = ["event-sourcing", "cqrs", "event-store"]
 [lints]
 workspace = true
 
+[features]
+default = []
+# The reference backend for the `Metrics` port: a `tracing` event per
+# instrument call.
+tracing = ["dep:tracing"]
+
 [dependencies]
 eventyr-core = { workspace = true }
 futures = { version = "0.3", default-features = false, features = ["alloc", "executor"] }
+tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

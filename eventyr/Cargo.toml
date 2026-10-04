@@ -30,6 +30,9 @@ postgres = ["store", "dep:eventyr-store-postgres"]
 snapshots = ["postgres", "eventyr-store-postgres/snapshots"]
 # The embedded store over fjall (no server, no runtime needed to drive).
 fjall = ["store", "dep:eventyr-store-fjall"]
+# The `Metrics` port's tracing backend (0.5.3): store/projector drivers
+# report through it when this feature is on.
+metrics = ["store", "eventyr-store/tracing"]
 
 [dependencies]
 eventyr-core = { workspace = true }

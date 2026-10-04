@@ -87,7 +87,7 @@ pub mod prelude {
     #[cfg(feature = "bus")]
     pub use crate::bus::{EventBus, Subscription};
     pub use crate::checkpoint::{CheckpointStore, InMemoryCheckpointStore};
-    pub use crate::runner::{Projection, Projector, drive_projector};
+    pub use crate::runner::{Projection, Projector, drive_projector, drive_projector_with_metrics};
     pub use crate::source::{StoreSubscription, SubscriptionSource};
     pub use eventyr_core::subscription::{
         Batch, Checkpoint, SubscriptionAction, SubscriptionInput, SubscriptionMachine,

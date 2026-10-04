@@ -379,3 +379,38 @@ async fn execute_with_metadata_stamps_every_committed_event() {
     assert_eq!(events[1].metadata.causation_id.as_deref(), Some("cmd-42"));
     assert_eq!(events[1].metadata.correlation_id.as_deref(), Some("request-7"));
 }
+
+#[tokio::test]
+async fn a_driver_reports_append_metrics() {
+    use std::sync::Mutex;
+
+    // A tiny in-memory Metrics: counts, in order.
+    struct Spy(Mutex<Vec<u64>>);
+    impl eventyr_store::metrics::Metrics for Spy {
+        fn counter(&self, name: &'static str, by: u64) {
+            if name == eventyr_store::metrics::names::APPENDS {
+                self.0.lock().unwrap().push(by);
+            }
+        }
+        fn gauge(&self, _: &'static str, _: u64) {}
+        fn histogram(&self, _: &'static str, _: std::time::Duration) {}
+    }
+
+    let store = Arc::new(InMemoryStore::new());
+    let repo = AggregateRepository::<Account, _>::new(store.clone(), RetryPolicy::default());
+    let metrics = Spy(Mutex::new(Vec::new()));
+
+    // Seed: open, then a machine driven with metrics on.
+    repo.execute(AccountId(11), AccountCommand::Open { owner: "me".into() })
+        .await
+        .expect("open");
+    let mut machine = WriteMachine::<Account>::new(
+        AccountId(11),
+        AccountCommand::Deposit { amount: 3 },
+        RetryPolicy::default(),
+    );
+    eventyr_store::driver::drive_write_with_metrics(&mut machine, &*store, &metrics).await;
+
+    // The deposit committed: the driver counted the one event it appended.
+    assert_eq!(metrics.0.lock().unwrap().as_slice(), &[1]);
+}

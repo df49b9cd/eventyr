@@ -20,6 +20,7 @@ use eventyr_core::error::StoreError;
 use eventyr_core::snapshot::HasSnapshotState;
 use eventyr_core::write::{WriteAction, WriteInput, WriteMachine, WriteOutcome};
 
+use crate::metrics::{Metrics, names};
 use crate::snapshot_store::SnapshotStore;
 use crate::store::EventStore;
 
@@ -55,6 +56,21 @@ where
     A: Aggregate,
     S: EventStore<Event = A::Event>,
 {
+    drive_write_with_metrics(machine, store, &crate::metrics::NoopMetrics).await
+}
+
+/// [`drive_write`] with metrics: every append reports a latency, every
+/// conflict a counter tick, every snapshot load a read. The metrics are
+/// the driver's view of its own I/O; the machine never sees them.
+pub async fn drive_write_with_metrics<A, S>(
+    machine: &mut WriteMachine<A>,
+    store: &S,
+    metrics: &(dyn Metrics + Send + Sync),
+) -> WriteOutcome<A::Event, A::Error>
+where
+    A: Aggregate,
+    S: EventStore<Event = A::Event>,
+{
     let mut action = machine.start();
     loop {
         action = match action {
@@ -67,24 +83,27 @@ where
                 }
             }
             WriteAction::LoadSnapshot { .. } => {
-                // A snapshots-off machine never emits this; a snapshots-on
-                // one driven here is a driver/protocol bug. Answer `None`
-                // (no snapshot — always honest), letting the machine fall
-                // back to a full stream read rather than violating the
-                // protocol.
                 machine.handle(WriteInput::SnapshotLoaded { snapshot: None })
             }
             WriteAction::Append {
                 stream_id,
                 expected,
                 events,
-            } => match store.append(&stream_id, expected, events).await {
-                Ok(committed) => machine.handle(WriteInput::Appended { committed }),
-                Err(StoreError::Conflict { current, .. }) => {
-                    machine.handle(WriteInput::Conflict { current })
+            } => {
+                let start = std::time::Instant::now();
+                match store.append(&stream_id, expected, events).await {
+                    Ok(committed) => {
+                        metrics.histogram(names::APPEND_LATENCY, start.elapsed());
+                        metrics.counter(names::APPENDS, committed.len() as u64);
+                        machine.handle(WriteInput::Appended { committed })
+                    }
+                    Err(StoreError::Conflict { current, .. }) => {
+                        metrics.counter(names::CONFLICTS, 1);
+                        machine.handle(WriteInput::Conflict { current })
+                    }
+                    Err(error) => machine.handle(WriteInput::Failed(error)),
                 }
-                Err(error) => machine.handle(WriteInput::Failed(error)),
-            },
+            }
             WriteAction::Done(outcome) => return outcome,
         };
     }
@@ -115,6 +134,24 @@ where
     S: EventStore<Event = A::Event>,
     SS: SnapshotStore<State = A::State>,
 {
+    drive_write_with_snapshots_and_metrics(machine, store, snapshots, &crate::metrics::NoopMetrics)
+        .await
+}
+
+/// [`drive_write_with_snapshots`] with metrics (0.5.3): appends,
+/// conflicts, and the snapshot save all report through `metrics`.
+pub async fn drive_write_with_snapshots_and_metrics<A, S, SS>(
+    machine: &mut WriteMachine<A, A::State>,
+    store: &S,
+    snapshots: &SS,
+    metrics: &(dyn Metrics + Send + Sync),
+) -> WriteOutcome<A::Event, A::Error, A::State>
+where
+    A: HasSnapshotState,
+    A::State: Clone + Send,
+    S: EventStore<Event = A::Event>,
+    SS: SnapshotStore<State = A::State>,
+{
     let mut action = machine.start();
     loop {
         action = match action {
@@ -127,20 +164,31 @@ where
                 }
             }
             WriteAction::LoadSnapshot { stream_id } => match snapshots.load(&stream_id).await {
-                Ok(snapshot) => machine.handle(WriteInput::SnapshotLoaded { snapshot }),
+                Ok(snapshot) => {
+                    metrics.counter(names::SNAPSHOTS, 1);
+                    machine.handle(WriteInput::SnapshotLoaded { snapshot })
+                }
                 Err(error) => machine.handle(WriteInput::Failed(error)),
             },
             WriteAction::Append {
                 stream_id,
                 expected,
                 events,
-            } => match store.append(&stream_id, expected, events).await {
-                Ok(committed) => machine.handle(WriteInput::Appended { committed }),
-                Err(StoreError::Conflict { current, .. }) => {
-                    machine.handle(WriteInput::Conflict { current })
+            } => {
+                let start = std::time::Instant::now();
+                match store.append(&stream_id, expected, events).await {
+                    Ok(committed) => {
+                        metrics.histogram(names::APPEND_LATENCY, start.elapsed());
+                        metrics.counter(names::APPENDS, committed.len() as u64);
+                        machine.handle(WriteInput::Appended { committed })
+                    }
+                    Err(StoreError::Conflict { current, .. }) => {
+                        metrics.counter(names::CONFLICTS, 1);
+                        machine.handle(WriteInput::Conflict { current })
+                    }
+                    Err(error) => machine.handle(WriteInput::Failed(error)),
                 }
-                Err(error) => machine.handle(WriteInput::Failed(error)),
-            },
+            }
             WriteAction::Done(outcome) => {
                 // Fire-and-forget: persist the offer if the policy fired;
                 // the caller's outcome is already fixed either way.
@@ -225,6 +273,21 @@ where
     D: Decide<E, Err>,
     S: EventStore<Event = E>,
 {
+    drive_write_batch_with_metrics(machine, store, &crate::metrics::NoopMetrics).await
+}
+
+/// [`drive_write_batch`] with metrics (0.5.3): the atomic batch append
+/// reports a latency, a conflict-tick on conflict, and the per-stream
+/// count of committed events on commit.
+pub async fn drive_write_batch_with_metrics<E, Err, D, S>(
+    machine: &mut BatchMachine<E, Err, D>,
+    store: &S,
+    metrics: &(dyn Metrics + Send + Sync),
+) -> BatchOutcome<E, Err>
+where
+    D: Decide<E, Err>,
+    S: EventStore<Event = E>,
+{
     let mut action = machine.start();
     loop {
         action = match action {
@@ -261,16 +324,25 @@ where
                     ))),
                 }
             }
-            BatchAction::AppendBatch { appends } => match store.append_batch(appends).await {
-                Ok(committed) => machine.handle(BatchInput::Appended { committed }),
-                Err(StoreError::Conflict { stream_id, current }) => {
-                    let stream = stream_id
-                        .or_else(|| machine.streams().first().cloned())
-                        .unwrap_or_default();
-                    machine.handle(BatchInput::Conflict { stream, current })
+            BatchAction::AppendBatch { appends } => {
+                let start = std::time::Instant::now();
+                match store.append_batch(appends).await {
+                    Ok(committed) => {
+                        metrics.histogram(names::APPEND_LATENCY, start.elapsed());
+                        let count: u64 = committed.iter().map(|c| c.events.len() as u64).sum();
+                        metrics.counter(names::APPENDS, count);
+                        machine.handle(BatchInput::Appended { committed })
+                    }
+                    Err(StoreError::Conflict { stream_id, current }) => {
+                        metrics.counter(names::CONFLICTS, 1);
+                        let stream = stream_id
+                            .or_else(|| machine.streams().first().cloned())
+                            .unwrap_or_default();
+                        machine.handle(BatchInput::Conflict { stream, current })
+                    }
+                    Err(error) => machine.handle(BatchInput::Failed(error)),
                 }
-                Err(error) => machine.handle(BatchInput::Failed(error)),
-            },
+            }
             BatchAction::Done(outcome) => return outcome,
         };
     }
