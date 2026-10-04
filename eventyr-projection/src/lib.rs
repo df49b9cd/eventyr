@@ -129,9 +129,7 @@ pub mod prelude {
     //! and schema-versioned rebuilds.
 
     pub use crate::chain::{ClosureUpcaster, UpcasterChain};
-    pub use crate::rebuild::{
-        RebuildPlan, SchemaCheckpointStore, SchemaVersion, checkpoint_key,
-    };
+    pub use crate::rebuild::{RebuildPlan, SchemaCheckpointStore, SchemaVersion, checkpoint_key};
     pub use crate::source::UpcastingSource;
     pub use eventyr_core::upcast::{RawEvent, Upcaster};
 }

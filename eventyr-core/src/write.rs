@@ -491,7 +491,10 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
         }
         self.phase = Phase::Done;
         let snapshot = self.snapshot_offer(&committed);
-        WriteAction::Done(WriteOutcome::Committed { committed, snapshot })
+        WriteAction::Done(WriteOutcome::Committed {
+            committed,
+            snapshot,
+        })
     }
 
     /// Build the fire-and-forget post-commit snapshot offer.
@@ -1284,4 +1287,3 @@ mod tests {
         }
     }
 }
-

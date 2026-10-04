@@ -30,11 +30,7 @@ async fn in_memory_snapshot_store_roundtrips_the_newest() {
     let stream = StreamId::from("account-1");
 
     assert!(
-        store
-            .load(&stream)
-            .await
-            .expect("load")
-            .is_none(),
+        store.load(&stream).await.expect("load").is_none(),
         "an unknown stream has no snapshot"
     );
 
@@ -80,7 +76,11 @@ async fn in_memory_snapshot_store_never_regresses_the_version() {
     // offers applied out of order) is dropped, not stored over it.
     store.save(snap(5, 50)).await.expect("save 5");
     let found = store.load(&stream).await.expect("load").expect("present");
-    assert_eq!(found.version, Version::new(7), "an older offer cannot regress the row");
+    assert_eq!(
+        found.version,
+        Version::new(7),
+        "an older offer cannot regress the row"
+    );
     assert_eq!(found.state.balance, 70);
 
     // The same version does not count as newer either: the first of two
@@ -101,7 +101,11 @@ async fn snapshots_off_execute_matches_the_pre_snapshot_protocol() {
         .execute(AccountId(1), AccountCommand::Open { owner: "me".into() })
         .await
         .expect("open");
-    let ExecutionOutcome::Committed { committed, snapshot } = outcome else {
+    let ExecutionOutcome::Committed {
+        committed,
+        snapshot,
+    } = outcome
+    else {
         panic!("expected a commit")
     };
     assert_eq!(committed.len(), 1);
@@ -160,7 +164,11 @@ async fn snapshots_on_offers_and_persists_after_the_cadence() {
         .execute_with_snapshots(id.clone(), AccountCommand::Deposit { amount: 50 })
         .await
         .expect("deposit from snapshot");
-    let ExecutionOutcome::Committed { committed, snapshot } = outcome else {
+    let ExecutionOutcome::Committed {
+        committed,
+        snapshot,
+    } = outcome
+    else {
         panic!("expected a commit")
     };
     assert_eq!(committed.len(), 1);
@@ -215,7 +223,10 @@ async fn snapshots_on_conflict_retry_still_converges() {
         .await
         .expect("delta read");
     let action = machine.handle(WriteInput::Loaded { events: delta });
-    let WriteAction::Append { expected, events, .. } = action else {
+    let WriteAction::Append {
+        expected, events, ..
+    } = action
+    else {
         unreachable!("decide appends")
     };
     assert_eq!(expected, ExpectedVersion::Exact(Version::new(2)));
@@ -232,7 +243,9 @@ async fn snapshots_on_conflict_retry_still_converges() {
             let action = machine.handle(WriteInput::Conflict { current });
             // The retry reloads the delta from the folded version — the
             // snapshot was folded once, never re-snapshotted.
-            assert!(matches!(action, WriteAction::LoadStream { from, .. } if from == Version::new(2)));
+            assert!(
+                matches!(action, WriteAction::LoadStream { from, .. } if from == Version::new(2))
+            );
         }
         Ok(_) => panic!("the conflict must surface"),
         Err(other) => panic!("unexpected store failure: {other:?}"),

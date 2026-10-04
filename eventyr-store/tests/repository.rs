@@ -54,7 +54,10 @@ async fn open_deposit_withdraw_roundtrip() {
         .execute(id.clone(), AccountCommand::Withdraw { amount: 120 })
         .await
         .expect("withdraw");
-    let ExecutionOutcome::Committed { committed: events, .. } = outcome else {
+    let ExecutionOutcome::Committed {
+        committed: events, ..
+    } = outcome
+    else {
         panic!("expected a commit")
     };
     assert_eq!(events.len(), 1);

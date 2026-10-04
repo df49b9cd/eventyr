@@ -222,19 +222,24 @@ mod tests {
             Upcaster::upcast(&chain, raw("AmountV1", "7")).expect("nested upcast"),
             7
         );
-        assert_eq!(chain.upcast(raw("Other", "anything")).expect("own entry"), 0);
+        assert_eq!(
+            chain.upcast(raw("Other", "anything")).expect("own entry"),
+            0
+        );
     }
 
     #[test]
     fn a_version_ladder_composes_rung_by_rung() {
         // A1 -> A2 doubles; A2 -> A3 (the current shape) adds one.
         let chain = UpcasterChain::new()
-            .with("AmountV2", ClosureUpcaster::new(|raw: RawEvent| parse_amount(raw).map(
-                |old| old + 1,
-            )))
-            .with("AmountV1", ClosureUpcaster::new(|raw: RawEvent| {
-                parse_amount(raw).map(|a1| a1 * 2 + 1)
-            }));
+            .with(
+                "AmountV2",
+                ClosureUpcaster::new(|raw: RawEvent| parse_amount(raw).map(|old| old + 1)),
+            )
+            .with(
+                "AmountV1",
+                ClosureUpcaster::new(|raw: RawEvent| parse_amount(raw).map(|a1| a1 * 2 + 1)),
+            );
         assert_eq!(chain.upcast(raw("AmountV1", "3")).expect("ladder"), 7);
         assert_eq!(chain.upcast(raw("AmountV2", "3")).expect("ladder"), 4);
     }

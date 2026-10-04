@@ -74,9 +74,9 @@
 //! # }
 //! ```
 
-pub mod checkpoint;
 #[cfg(feature = "bus")]
 pub mod bus;
+pub mod checkpoint;
 pub mod runner;
 pub mod source;
 
@@ -84,10 +84,10 @@ pub mod prelude {
     //! The subscription side: the projection runner, the store-source
     //! adapter, and the checkpoint port.
 
-    pub use crate::checkpoint::{CheckpointStore, InMemoryCheckpointStore};
     #[cfg(feature = "bus")]
     pub use crate::bus::{EventBus, Subscription};
-    pub use crate::runner::{Projector, Projection, drive_projector};
+    pub use crate::checkpoint::{CheckpointStore, InMemoryCheckpointStore};
+    pub use crate::runner::{Projection, Projector, drive_projector};
     pub use crate::source::{StoreSubscription, SubscriptionSource};
     pub use eventyr_core::subscription::{
         Batch, Checkpoint, SubscriptionAction, SubscriptionInput, SubscriptionMachine,

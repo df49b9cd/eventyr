@@ -108,9 +108,8 @@ where
 
         // Positions must be non-negative — a negative one is corrupt
         // data, not a number to wrap.
-        let invalid = |value: i64| {
-            PgStoreError::CorruptRow(format!("negative position in the log: {value}"))
-        };
+        let invalid =
+            |value: i64| PgStoreError::CorruptRow(format!("negative position in the log: {value}"));
         // `Metadata::default()` fills `timestamp` — present only when
         // core's `time` feature is on (it can be switched on by the
         // umbrella crate without this crate's `time`; the constructor
@@ -337,8 +336,8 @@ mod tests {
     fn a_well_formed_row_decodes() {
         // A full pass through the happy path pins the decode contract
         // the failure tests below interrupt.
-        let envelope =
-            EventEnvelope::<TestEvent>::try_from(row(good_payload(), good_metadata())).expect("decodes");
+        let envelope = EventEnvelope::<TestEvent>::try_from(row(good_payload(), good_metadata()))
+            .expect("decodes");
         assert_eq!(envelope.event, TestEvent::Ping { value: 9 });
         assert_eq!(envelope.sequence, Sequence::new(1));
         assert_eq!(envelope.version, Version::new(1));
@@ -396,8 +395,9 @@ mod tests {
     fn a_corrupt_row_maps_to_store_error_other() {
         // The store-level conversion the streams lean on: a corrupt row
         // is fatal-by-construction, not a conflict or an outage.
-        let error =
-            StoreError::from(PgStoreError::CorruptRow("the payload does not decode".into()));
+        let error = StoreError::from(PgStoreError::CorruptRow(
+            "the payload does not decode".into(),
+        ));
         assert!(matches!(error, StoreError::Other(_)));
     }
 
@@ -405,7 +405,10 @@ mod tests {
     fn expectation_args_encode_kind_and_version() {
         assert_eq!(expectation_args(ExpectedVersion::Any), (0, 0));
         assert_eq!(expectation_args(ExpectedVersion::Empty), (1, 0));
-        assert_eq!(expectation_args(ExpectedVersion::Exact(Version::new(3))), (2, 3));
+        assert_eq!(
+            expectation_args(ExpectedVersion::Exact(Version::new(3))),
+            (2, 3)
+        );
         // A version beyond i64 saturates rather than wrapping.
         assert_eq!(
             expectation_args(ExpectedVersion::Exact(Version::new(u64::MAX))),

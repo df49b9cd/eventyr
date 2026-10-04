@@ -246,16 +246,17 @@ where
         let policy = self
             .policy
             .snapshot
-            .expect("with_snapshots sets the policy before this method is reachable");        let mut machine = WriteMachine::<A, A::State>::with_snapshots(
-            id,
-            command,
-            self.policy.retry,
-            policy,
-        );
+            .expect("with_snapshots sets the policy before this method is reachable");
+        let mut machine =
+            WriteMachine::<A, A::State>::with_snapshots(id, command, self.policy.retry, policy);
         match drive_write_with_snapshots(&mut machine, &self.store, &self.snapshots).await {
-            WriteOutcome::Committed { committed, snapshot } => {
-                Ok(ExecutionOutcome::Committed { committed, snapshot })
-            }
+            WriteOutcome::Committed {
+                committed,
+                snapshot,
+            } => Ok(ExecutionOutcome::Committed {
+                committed,
+                snapshot,
+            }),
             WriteOutcome::Noop => Ok(ExecutionOutcome::Noop),
             WriteOutcome::Rejected(error) => Err(ExecutionError::Domain(error)),
             WriteOutcome::Failed(error) => Err(ExecutionError::Store(error)),

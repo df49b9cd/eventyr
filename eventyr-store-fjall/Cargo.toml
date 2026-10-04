@@ -1,0 +1,30 @@
+[package]
+name = "eventyr-store-fjall"
+description = "Embedded (fjall / LSM) event store for eventyr — no server, no runtime needed to drive."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["event-sourcing", "embedded", "fjall", "kv"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# The `SnapshotStore` implementation over a third partition. Off by
+# default: stores that only want the event log pay nothing.
+snapshots = []
+
+[dependencies]
+eventyr-core = { workspace = true, features = ["serde"] }
+eventyr-store = { workspace = true }
+fjall = { version = "2", features = ["single_writer_tx"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+thiserror = { version = "2", default-features = false }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+eventyr-store-testing = { workspace = true }
+tempfile = { version = "3" }

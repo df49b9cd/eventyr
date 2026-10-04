@@ -24,10 +24,13 @@ user-implementable trait), no ORM, no DDD toolkit.
 | `eventyr-macros` | `#[derive(Aggregate)]`, `#[derive(EventName)]` — convention wiring, sugar not API | shipped |
 | `eventyr-store-postgres` | sqlx-based `EventStore`/`StreamsAll` (`PgStore`, `append_events` PL/pgSQL, DESIGN §9's single-table sketch made real) — a standalone crate, not an umbrella feature yet | shipped |
 | `eventyr-projection` | Read-path correctness layer: `UpcasterChain`/`ClosureUpcaster`, `UpcastingSource` (raw→typed), `RebuildPlan`/`SchemaVersion`/`checkpoint_key` | shipped |
-| `eventyr-subscription` | Catch-up runner: `Projection` trait, `Projector`/`drive_projector`, `CheckpointStore`/`InMemoryCheckpointStore`, `StoreSubscription`; `EventBus` trait behind its `bus` feature | shipped |
+| `eventyr-subscription` | Catch-up runner: `Projection` trait, `Projector`/`drive_projector` (`drive_projector_blocking` too), `Fanout`, `CheckpointStore`/`InMemoryCheckpointStore`, `StoreSubscription`; `EventBus` trait behind its `bus` feature | shipped |
+| `eventyr-store-fjall` | Embedded `EventStore`/`StreamsAll` over fjall — transactional appends, no server, driveable without an async runtime | shipped |
+| `eventyr-store-testing` | The store contract: `event_store_contract` / `streams_all_contract` / `snapshot_contract`, self-tested against the in-memory store | shipped |
 
 Postgres persistence is a standalone crate today; the umbrella pulls it in
-as its own feature over time.
+as its own feature. The embedded store arrives as `eventyr-store-fjall`,
+also behind its own umbrella feature.
 
 ## Umbrella features
 
@@ -39,6 +42,7 @@ as its own feature over time.
 | `subscription` | no | `eventyr::subscription` — `Projection`, `Projector`, checkpoint store |
 | `bus` | no | `subscription` + the `EventBus` live-push trait |
 | `projection` | no | `subscription` + `eventyr::projection` — upcaster chains, rebuilds |
+| `fjall` | no | `eventyr::fjall` — the embedded store |
 
 ## A taste
 

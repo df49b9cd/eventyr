@@ -27,7 +27,10 @@ impl Projection for Seen {
     type Error = core::convert::Infallible;
 
     async fn apply(&mut self, event: &EventEnvelope<u64>) -> Result<(), Self::Error> {
-        self.0.lock().expect("poisoned").push(event.sequence.as_u64());
+        self.0
+            .lock()
+            .expect("poisoned")
+            .push(event.sequence.as_u64());
         Ok(())
     }
 }
@@ -171,8 +174,10 @@ fn apply_failed_redelivers_the_whole_batch() {
                     Some(Checkpoint::new(Sequence::new(2))),
                 ),
             },
-            SubscriptionInput::Applied,     // applied 1
-            SubscriptionInput::ApplyFailed { error: StoreError::other("boom") }, // failed 2
+            SubscriptionInput::Applied, // applied 1
+            SubscriptionInput::ApplyFailed {
+                error: StoreError::other("boom"),
+            }, // failed 2
             SubscriptionInput::Slept,
             SubscriptionInput::Fetched {
                 batch: Batch::new(

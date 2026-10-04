@@ -27,11 +27,7 @@ struct ScriptedSource {
 impl SubscriptionSource for ScriptedSource {
     type Event = RawEvent;
 
-    async fn fetch(
-        &self,
-        from: Checkpoint,
-        max: usize,
-    ) -> Result<Batch<Self::Event>, StoreError> {
+    async fn fetch(&self, from: Checkpoint, max: usize) -> Result<Batch<Self::Event>, StoreError> {
         let events: Vec<_> = self
             .events
             .iter()
@@ -46,7 +42,9 @@ impl SubscriptionSource for ScriptedSource {
                 metadata: Default::default(),
             })
             .collect();
-        let upper = events.last().map(|envelope| Checkpoint::new(envelope.sequence));
+        let upper = events
+            .last()
+            .map(|envelope| Checkpoint::new(envelope.sequence));
         Ok(Batch::new(events, upper))
     }
 }
@@ -246,9 +244,7 @@ async fn a_planned_projector_runs_through_the_subscription_runner_unchanged() {
     let total = Total::default();
     let projector: Projector<_, InMemoryCheckpointStore, _> =
         RebuildPlan::new("balance", SchemaVersion(1), parse_amount_chain())
-            .with_policy(
-                SubscriptionPolicy::default().stop_at_catch_up(),
-            )
+            .with_policy(SubscriptionPolicy::default().stop_at_catch_up())
             .projector(
                 StoreSubscription::new(&store),
                 InMemoryCheckpointStore::new(),

@@ -1,13 +1,17 @@
-//! The async driver: performs a [`WriteMachine`]'s actions against an
+//! The drivers: perform a [`WriteMachine`]'s actions against an
 //! [`EventStore`] (and, when the machine asks, a [`SnapshotStore`]),
 //! feeding results back until the machine is done.
 //!
 //! A driver is a boring loop: interpret the action, do the I/O, report
 //! the input. All policy — retries, version expectations, snapshot
 //! cadence, conflict handling — lives in the machine, so the same loop
-//! serves every aggregate and every store.
+//! serves every aggregate and every store, once per runtime: async
+//! ([`drive_write`], [`drive_write_with_snapshots`]) for service code,
+//! blocking ([`drive_write_blocking`],
+//! [`drive_write_with_snapshots_blocking`]) for CLI and embedded use.
 
 use futures::TryStreamExt;
+use futures::executor::block_on;
 
 use eventyr_core::aggregate::Aggregate;
 use eventyr_core::envelope::EventEnvelope;
@@ -121,12 +125,10 @@ where
                     Err(error) => machine.handle(WriteInput::Failed(error)),
                 }
             }
-            WriteAction::LoadSnapshot { stream_id } => {
-                match snapshots.load(&stream_id).await {
-                    Ok(snapshot) => machine.handle(WriteInput::SnapshotLoaded { snapshot }),
-                    Err(error) => machine.handle(WriteInput::Failed(error)),
-                }
-            }
+            WriteAction::LoadSnapshot { stream_id } => match snapshots.load(&stream_id).await {
+                Ok(snapshot) => machine.handle(WriteInput::SnapshotLoaded { snapshot }),
+                Err(error) => machine.handle(WriteInput::Failed(error)),
+            },
             WriteAction::Append {
                 stream_id,
                 expected,
@@ -156,4 +158,37 @@ where
             }
         };
     }
+}
+
+/// The blocking [`drive_write`]: drives `machine` to its outcome
+/// without an async runtime, parking the thread through the store's
+/// futures (a synchronous store's futures resolve immediately).
+///
+/// The machine's protocol is untouched — one loop per runtime, the
+/// machine never knows which is driving it.
+pub fn drive_write_blocking<A, S>(
+    machine: &mut WriteMachine<A>,
+    store: &S,
+) -> WriteOutcome<A::Event, A::Error>
+where
+    A: Aggregate,
+    S: EventStore<Event = A::Event>,
+{
+    block_on(drive_write(machine, store))
+}
+
+/// The blocking [`drive_write_with_snapshots`]: drives a snapshots-on
+/// `machine` without an async runtime.
+pub fn drive_write_with_snapshots_blocking<A, S, SS>(
+    machine: &mut WriteMachine<A, A::State>,
+    store: &S,
+    snapshots: &SS,
+) -> WriteOutcome<A::Event, A::Error, A::State>
+where
+    A: HasSnapshotState,
+    A::State: Clone + Send,
+    S: EventStore<Event = A::Event>,
+    SS: SnapshotStore<State = A::State>,
+{
+    block_on(drive_write_with_snapshots(machine, store, snapshots))
 }

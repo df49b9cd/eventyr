@@ -56,3 +56,10 @@ pub use eventyr_projection as projection;
 /// `snapshots` feature), the `SnapshotStore` — over Postgres.
 #[cfg(feature = "postgres")]
 pub use eventyr_store_postgres as postgres;
+
+/// The embedded store: a durable `EventStore`/`StreamsAll` over
+/// [fjall](https://crates.io/crates/fjall) — no server, and no async
+/// runtime needed to drive it (the futures resolve immediately; drive
+/// it through `store::prelude::drive_write_blocking`).
+#[cfg(feature = "fjall")]
+pub use eventyr_store_fjall as fjall;

@@ -112,12 +112,10 @@ where
     let mut action = machine.start();
     loop {
         action = match action {
-            SubscriptionAction::Fetch { from, limit } => {
-                match source.fetch(from, limit).await {
-                    Ok(batch) => machine.handle(SubscriptionInput::Fetched { batch }),
-                    Err(error) => machine.handle(SubscriptionInput::Failed(error)),
-                }
-            }
+            SubscriptionAction::Fetch { from, limit } => match source.fetch(from, limit).await {
+                Ok(batch) => machine.handle(SubscriptionInput::Fetched { batch }),
+                Err(error) => machine.handle(SubscriptionInput::Failed(error)),
+            },
             SubscriptionAction::Apply { envelope } => {
                 let sequence = envelope.sequence;
                 match projection.apply(&envelope).await {

@@ -2,7 +2,7 @@
 //!
 //! The store side of event sourcing: the [`store::EventStore`] and
 //! [`store::StreamsAll`] ports, an in-memory implementation for tests
-//! and examples, the async [`driver::drive_write`] driver, and the
+//! and examples, the [`driver`]: async (`drive_write`) and blocking (`drive_write_blocking`) faces of one protocol, and the
 //! [`repository::AggregateRepository`] — the ergonomic entry point
 //! that hides the machine behind one method.
 //!
@@ -112,7 +112,10 @@ pub mod store;
 pub mod prelude {
     //! The store side: ports, in-memory store, driver, repository.
 
-    pub use crate::driver::{drive_write, drive_write_with_snapshots};
+    pub use crate::driver::{
+        drive_write, drive_write_blocking, drive_write_with_snapshots,
+        drive_write_with_snapshots_blocking,
+    };
     pub use crate::memory::InMemoryStore;
     pub use crate::repository::{AggregateRepository, ExecutionError, ExecutionOutcome};
     pub use crate::snapshot_store::{InMemorySnapshotStore, SnapshotStore};

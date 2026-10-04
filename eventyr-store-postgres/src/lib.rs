@@ -21,9 +21,9 @@
 //! separate column — so payload-struct renames are free and historical
 //! payloads stay selectable by an upcaster.
 
-pub mod store;
 #[cfg(feature = "snapshots")]
 pub mod snapshots;
+pub mod store;
 
 use std::sync::Arc;
 

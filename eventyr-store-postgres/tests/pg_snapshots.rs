@@ -89,7 +89,9 @@ async fn snapshot_save_and_load_roundtrip() {
             balance: 1,
         },
     };
-    SnapshotStore::save(&store, stale).await.expect("stale save");
+    SnapshotStore::save(&store, stale)
+        .await
+        .expect("stale save");
     let loaded = SnapshotStore::load(&store, &stream)
         .await
         .expect("load")
@@ -138,7 +140,9 @@ async fn snapshot_offers_persist_through_the_store_directly() {
             balance: 0,
         },
     };
-    SnapshotStore::save(&store, stale).await.expect("stale offer");
+    SnapshotStore::save(&store, stale)
+        .await
+        .expect("stale offer");
     let loaded = SnapshotStore::load(&store, &stream)
         .await
         .expect("load")

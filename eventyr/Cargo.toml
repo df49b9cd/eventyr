@@ -28,10 +28,13 @@ projection = ["subscription", "dep:eventyr-projection"]
 # The Postgres store, with its snapshot persistence enabled.
 postgres = ["store", "dep:eventyr-store-postgres"]
 snapshots = ["postgres", "eventyr-store-postgres/snapshots"]
+# The embedded store over fjall (no server, no runtime needed to drive).
+fjall = ["store", "dep:eventyr-store-fjall"]
 
 [dependencies]
 eventyr-core = { workspace = true }
 eventyr-store = { workspace = true, optional = true }
+eventyr-store-fjall = { workspace = true, optional = true }
 eventyr-store-postgres = { workspace = true, optional = true }
 eventyr-subscription = { workspace = true, optional = true }
 eventyr-projection = { workspace = true, optional = true }

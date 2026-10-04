@@ -1,18 +1,20 @@
 [package]
-name = "eventyr-store"
-description = "Store-side traits for eventyr: EventStore, StreamsAll, drivers, and the repository."
+name = "eventyr-store-testing"
+description = "Contract tests any eventyr EventStore / SnapshotStore implementation must pass."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-keywords = ["event-sourcing", "cqrs", "event-store"]
+keywords = ["event-sourcing", "event-store", "testing"]
 
 [lints]
 workspace = true
 
 [dependencies]
 eventyr-core = { workspace = true }
+eventyr-store = { workspace = true }
 futures = { version = "0.3", default-features = false, features = ["alloc", "executor"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+

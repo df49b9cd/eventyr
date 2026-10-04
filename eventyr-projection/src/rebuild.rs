@@ -176,7 +176,11 @@ mod tests {
     async fn versioned_keys_are_scoped_per_version() {
         let store = InMemoryCheckpointStore::new();
         store
-            .store_versioned("balance", SchemaVersion(1), Checkpoint::new(Sequence::new(9)))
+            .store_versioned(
+                "balance",
+                SchemaVersion(1),
+                Checkpoint::new(Sequence::new(9)),
+            )
             .await
             .expect("store");
         assert_eq!(
@@ -198,8 +202,10 @@ mod tests {
 
     #[test]
     fn a_rebuild_plan_forces_stop_at_catch_up() {
-        let plan = RebuildPlan::<u64>::new("balance", SchemaVersion(1), UpcasterChain::new())
-            .with_policy(SubscriptionPolicy::new(1, core::time::Duration::ZERO, core::time::Duration::ZERO));
+        let plan =
+            RebuildPlan::<u64>::new("balance", SchemaVersion(1), UpcasterChain::new()).with_policy(
+                SubscriptionPolicy::new(1, core::time::Duration::ZERO, core::time::Duration::ZERO),
+            );
         // The key is versioned even before the projector is built.
         assert_eq!(plan.checkpoint_key(), "balance@v1");
     }

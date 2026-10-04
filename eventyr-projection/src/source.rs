@@ -54,11 +54,7 @@ where
     /// Fetch from the raw source and map each envelope's event through
     /// the chain — the whole body of the port impl, factored out so the
     /// reference/`Arc` delegations share it instead of duplicating it.
-    async fn fetch_upcasting(
-        &self,
-        from: Checkpoint,
-        max: usize,
-    ) -> Result<Batch<E>, StoreError> {
+    async fn fetch_upcasting(&self, from: Checkpoint, max: usize) -> Result<Batch<E>, StoreError> {
         let batch = self.inner.fetch(from, max).await?;
         let mut events = Vec::with_capacity(batch.events.len());
         for envelope in batch.events {
@@ -90,11 +86,7 @@ where
 {
     type Event = E;
 
-    async fn fetch(
-        &self,
-        from: Checkpoint,
-        max: usize,
-    ) -> Result<Batch<E>, StoreError> {
+    async fn fetch(&self, from: Checkpoint, max: usize) -> Result<Batch<E>, StoreError> {
         self.fetch_upcasting(from, max).await
     }
 }

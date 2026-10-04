@@ -28,10 +28,13 @@ use crate::write::RetryPolicy;
 /// [`LoadSnapshot`](crate::write::WriteAction::LoadSnapshot).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(bound(
-    serialize = "S: serde::Serialize",
-    deserialize = "S: serde::de::DeserializeOwned"
-)))]
+#[cfg_attr(
+    feature = "serde",
+    serde(bound(
+        serialize = "S: serde::Serialize",
+        deserialize = "S: serde::de::DeserializeOwned"
+    ))
+)]
 pub struct Snapshot<S> {
     /// The stream this snapshot belongs to.
     pub stream_id: StreamId,
@@ -68,7 +71,10 @@ impl SnapshotPolicy {
     /// crossed a multiple of `every` on the way from `base` to
     /// `committed`.
     pub fn is_due(&self, base_version: Version, committed_version: Version) -> bool {
-        committed_version.as_u64().saturating_sub(base_version.as_u64()) >= self.every.get()
+        committed_version
+            .as_u64()
+            .saturating_sub(base_version.as_u64())
+            >= self.every.get()
     }
 }
 
@@ -137,10 +143,13 @@ where
 /// names what it's for.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(bound(
-    serialize = "S: serde::Serialize",
-    deserialize = "S: serde::de::DeserializeOwned"
-)))]
+#[cfg_attr(
+    feature = "serde",
+    serde(bound(
+        serialize = "S: serde::Serialize",
+        deserialize = "S: serde::de::DeserializeOwned"
+    ))
+)]
 pub struct OfferSnapshot<S>(pub Snapshot<S>);
 
 impl<S> OfferSnapshot<S> {
@@ -149,4 +158,3 @@ impl<S> OfferSnapshot<S> {
         self.0
     }
 }
-

@@ -620,14 +620,18 @@ mod tests {
         let mut m = machine();
         assert!(matches!(
             m.start(),
-            SubscriptionAction::Fetch { from: Checkpoint::ORIGIN, limit: 128 }
+            SubscriptionAction::Fetch {
+                from: Checkpoint::ORIGIN,
+                limit: 128
+            }
         ));
     }
 
     #[test]
     fn resume_loads_from_the_last_acked_checkpoint() {
         let checkpoint = Checkpoint::new(Sequence::new(41));
-        let mut m = SubscriptionMachine::<AccountEvent>::new(SubscriptionPolicy::default(), checkpoint);
+        let mut m =
+            SubscriptionMachine::<AccountEvent>::new(SubscriptionPolicy::default(), checkpoint);
         assert!(matches!(
             m.start(),
             SubscriptionAction::Fetch { from, .. } if from == checkpoint
@@ -708,7 +712,10 @@ mod tests {
         let action = m.handle(SubscriptionInput::Slept);
         assert!(matches!(
             action,
-            SubscriptionAction::Fetch { from: Checkpoint::ORIGIN, .. }
+            SubscriptionAction::Fetch {
+                from: Checkpoint::ORIGIN,
+                ..
+            }
         ));
     }
 
@@ -865,9 +872,7 @@ mod tests {
         let mut m = machine();
         m.start();
         m.handle(SubscriptionInput::Failed(StoreError::Unavailable)); // Done
-        assert!(is_protocol_violation(
-            &m.handle(SubscriptionInput::Applied)
-        ));
+        assert!(is_protocol_violation(&m.handle(SubscriptionInput::Applied)));
         assert!(is_protocol_violation(&m.start()));
     }
 
@@ -878,9 +883,11 @@ mod tests {
         m.handle(SubscriptionInput::Fetched {
             batch: batch(vec![envelope(1)]),
         });
-        assert!(is_protocol_violation(&m.handle(SubscriptionInput::Fetched {
-            batch: batch(vec![envelope(2)]),
-        })));
+        assert!(is_protocol_violation(&m.handle(
+            SubscriptionInput::Fetched {
+                batch: batch(vec![envelope(2)]),
+            }
+        )));
     }
 
     #[test]
@@ -1020,10 +1027,10 @@ mod tests {
     fn arb_subscription_input() -> BoxedStrategy<SubscriptionInput<AccountEvent>> {
         prop_oneof![
             (arb_sequence(), 0usize..3).prop_map(|(start, len)| {
-                let events: Vec<_> = (0..len as u64)
-                    .map(|i| envelope(start + i + 1))
-                    .collect();
-                SubscriptionInput::Fetched { batch: batch(events) }
+                let events: Vec<_> = (0..len as u64).map(|i| envelope(start + i + 1)).collect();
+                SubscriptionInput::Fetched {
+                    batch: batch(events),
+                }
             }),
             Just(SubscriptionInput::Applied),
             Just(SubscriptionInput::ApplyFailed {

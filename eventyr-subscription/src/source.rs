@@ -77,20 +77,14 @@ where
 {
     type Event = S::Event;
 
-    async fn fetch(
-        &self,
-        from: Checkpoint,
-        max: usize,
-    ) -> Result<Batch<Self::Event>, StoreError> {
+    async fn fetch(&self, from: Checkpoint, max: usize) -> Result<Batch<Self::Event>, StoreError> {
         let events: Vec<EventEnvelope<Self::Event>> = self
             .store
             .stream_all(from.as_sequence())
             .take(max)
             .try_collect()
             .await?;
-        let upper = events
-            .last()
-            .map(|e| Checkpoint::new(e.sequence));
+        let upper = events.last().map(|e| Checkpoint::new(e.sequence));
         Ok(Batch::new(events, upper))
     }
 }

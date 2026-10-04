@@ -255,6 +255,7 @@ pub mod account {
 
     /// The account's domain events.
     #[derive(Clone, PartialEq, Debug)]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     pub enum AccountEvent {
         /// The account was opened by `owner`.
         Opened {
@@ -404,18 +405,13 @@ mod tests {
 
     #[test]
     fn happy_path_emits_the_expected_events() {
-        Scenario::<Account>::given(
-            &AccountId(1),
-            [AccountEvent::Opened {
-                owner: "me".into(),
-            }],
-        )
-        .when(&AccountCommand::Deposit { amount: 50 })
-        .then_events(&[AccountEvent::Deposited { amount: 50 }])
-        .with_state(|s| {
-            assert!(s.open);
-            assert_eq!(s.balance, 0); // state is pre-command
-        });
+        Scenario::<Account>::given(&AccountId(1), [AccountEvent::Opened { owner: "me".into() }])
+            .when(&AccountCommand::Deposit { amount: 50 })
+            .then_events(&[AccountEvent::Deposited { amount: 50 }])
+            .with_state(|s| {
+                assert!(s.open);
+                assert_eq!(s.balance, 0); // state is pre-command
+            });
     }
 
     #[test]
@@ -423,9 +419,7 @@ mod tests {
         Scenario::<Account>::given(
             &AccountId(1),
             [
-                AccountEvent::Opened {
-                    owner: "me".into(),
-                },
+                AccountEvent::Opened { owner: "me".into() },
                 AccountEvent::Deposited { amount: 50 },
             ],
         )
@@ -463,9 +457,7 @@ mod tests {
         Scenario::<Account>::given(
             &AccountId(1),
             [
-                AccountEvent::Opened {
-                    owner: "me".into(),
-                },
+                AccountEvent::Opened { owner: "me".into() },
                 AccountEvent::Deposited { amount: 50 },
             ],
         )
@@ -474,14 +466,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "expected events [Withdrawn { amount: 100 }], got rejection insufficient funds")]
+    #[should_panic(
+        expected = "expected events [Withdrawn { amount: 100 }], got rejection insufficient funds"
+    )]
     fn events_expectation_surfaces_a_rejection_readably() {
         Scenario::<Account>::given(
             &AccountId(1),
             [
-                AccountEvent::Opened {
-                    owner: "me".into(),
-                },
+                AccountEvent::Opened { owner: "me".into() },
                 AccountEvent::Deposited { amount: 50 },
             ],
         )
