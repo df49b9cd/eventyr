@@ -117,7 +117,7 @@ pub enum WriteInput<E, S = ()> {
     Failed(StoreError),
 }
 
-/// The terminal outcome of a driven write machine .
+/// The terminal outcome of a driven write machine.
 #[derive(Clone, Debug)]
 pub enum WriteOutcome<E, Err, S = ()> {
     /// The events were committed; the envelopes are as the store
@@ -226,6 +226,40 @@ impl Snapshots {
 /// machine only when snapshots are on (where `S = A::State`).
 type FoldCommitted<A, S> = fn(&mut S, &[EventEnvelope<<A as Aggregate>::Event>]);
 
+/// The hooks a snapshots-on machine needs to cross from `A::State` to
+/// the snapshot channel `S`.
+///
+/// Kept as one unit — snapshots are on exactly when the hooks are
+/// present: a snapshots-off machine has `S = ()` and `None`, a
+/// snapshots-on one has `S = A::State` and the three function pointers
+/// [`with_snapshots`](WriteMachine::with_snapshots) installs. Bundling
+/// them into one struct makes "all present or all absent" structural;
+/// three separate `Option<fn>` fields would leave it documented.
+struct SnapshotHooks<A: Aggregate, S> {
+    /// Adopt the loaded snapshot's state as the fold's starting point.
+    adopt: fn(&mut A::State, S),
+    /// Fold committed events into a snapshot-channel state, so the
+    /// post-commit offer carries the state *at* the committed version.
+    fold_committed: FoldCommitted<A, S>,
+    /// Clone the folded state into the snapshot channel, for the
+    /// post-commit offer.
+    materialize: fn(&A::State) -> S,
+}
+
+impl<A: Aggregate, S> SnapshotHooks<A, S> {
+    fn adopt_snapshot(&self, folded: &mut A::State, state: S) {
+        (self.adopt)(folded, state);
+    }
+
+    fn fold_committed(&self, state: &mut S, committed: &[EventEnvelope<A::Event>]) {
+        (self.fold_committed)(state, committed);
+    }
+
+    fn materialize(&self, folded: &A::State) -> S {
+        (self.materialize)(folded)
+    }
+}
+
 /// The sans-IO machine behind command execution: load → fold → decide →
 /// append, with conflict retry.
 ///
@@ -261,13 +295,7 @@ pub struct WriteMachine<A: Aggregate, S = ()> {
     /// Adopt the loaded snapshot's state as the fold's starting point.
     /// Set only on a snapshots-on machine (there `S = A::State`, so the
     /// hook is a plain move). `None` — unreachable — otherwise.
-    adopt_snapshot: Option<fn(&mut A::State, S)>,
-    /// Fold committed events into a snapshot-channel state, so the
-    /// post-commit offer carries the state *at* the committed version.
-    fold_committed: Option<FoldCommitted<A, S>>,
-    /// Clone the folded state into the snapshot channel, for the
-    /// post-commit offer. Same installation rule as `adopt_snapshot`.
-    materialize: Option<fn(&A::State) -> S>,
+    hooks: Option<SnapshotHooks<A, S>>,
     _channel: PhantomData<fn() -> S>,
 }
 
@@ -286,9 +314,7 @@ impl<A: Aggregate> WriteMachine<A, ()> {
             phase: Phase::Loading,
             folded: A::initial(&id),
             version: Version::EMPTY,
-            adopt_snapshot: None,
-            fold_committed: None,
-            materialize: None,
+            hooks: None,
             _channel: PhantomData,
         }
     }
@@ -325,13 +351,15 @@ where
             phase: Phase::LoadingSnapshot,
             folded: A::initial(&id),
             version: Version::EMPTY,
-            adopt_snapshot: Some(|folded, state| *folded = state),
-            fold_committed: Some(|state, committed| {
-                for envelope in committed {
-                    A::apply(state, &envelope.event);
-                }
+            hooks: Some(SnapshotHooks {
+                adopt: |folded, state| *folded = state,
+                fold_committed: |state, committed| {
+                    for envelope in committed {
+                        A::apply(state, &envelope.event);
+                    }
+                },
+                materialize: Clone::clone,
             }),
-            materialize: Some(Clone::clone),
             _channel: PhantomData,
         }
     }
@@ -406,10 +434,11 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
             if snapshot.version < self.version {
                 return self.violation("`SnapshotLoaded` is older than the state already folded");
             }
-            let adopt = self
-                .adopt_snapshot
-                .expect("a snapshots-on machine installs the adopt hook");
-            adopt(&mut self.folded, snapshot.state);
+            let hooks = self
+                .hooks
+                .as_ref()
+                .expect("a snapshots-on machine installs the hooks");
+            hooks.adopt_snapshot(&mut self.folded, snapshot.state);
             self.version = snapshot.version;
             *base_version = snapshot.version;
         }
@@ -475,8 +504,7 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
     /// what a later `LoadSnapshot` answer wants to carry.
     fn snapshot_offer(&self, committed: &[EventEnvelope<A::Event>]) -> Option<OfferSnapshot<S>> {
         let policy = self.snapshots.policy()?;
-        let materialize = self.materialize?;
-        let fold_committed = self.fold_committed?;
+        let hooks = self.hooks.as_ref()?;
         let committed_version = committed.last().map_or(self.version, |e| e.version);
         if !policy.is_due(self.snapshots.base_version(), committed_version) {
             return None;
@@ -486,8 +514,8 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
         // and apply the batch on top (via `fold_committed`). `A::apply`
         // is pure and total, so this is exactly the state the commit
         // produced.
-        let mut state = materialize(&self.folded);
-        fold_committed(&mut state, committed);
+        let mut state = hooks.materialize(&self.folded);
+        hooks.fold_committed(&mut state, committed);
         Some(OfferSnapshot(Snapshot {
             stream_id: self.stream_id.clone(),
             version: committed_version,

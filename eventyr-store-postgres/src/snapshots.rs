@@ -19,55 +19,6 @@ use eventyr_core::vocabulary::Version;
 
 use crate::{PgStore, PgStoreError};
 
-/// Wire snapshot persistence alongside a store-backed subscription:
-/// the subscription keeps reading the event stream, and
-/// [`SubscriptionSnapshots::save_snapshot`] routes a snapshot offer
-/// straight through to the [`SnapshotStore`](eventyr_store::snapshot_store::SnapshotStore)
-/// the same pool provides.
-///
-/// Behind the `snapshots` feature. Construct via
-/// [`SubscriptionSnapshots::new`] with the store (or a `StoreSubscription`
-/// over it), then route commit-offered snapshots through it.
-pub struct SubscriptionSnapshots<S> {
-    inner: S,
-}
-
-impl<S> SubscriptionSnapshots<S> {
-    /// Wrap a `StoreSubscription<PgStore<E>>` (or any wrapper around
-    /// it). The snapshots persist against the same pool the
-    /// subscription reads from.
-    pub fn new(inner: S) -> Self {
-        Self { inner }
-    }
-
-    /// The wrapped subscription.
-    pub fn into_inner(self) -> S {
-        self.inner
-    }
-
-    /// The wrapped subscription, for polling.
-    pub fn inner(&self) -> &S {
-        &self.inner
-    }
-}
-
-impl<S, E> SubscriptionSnapshots<S>
-where
-    S: std::ops::Deref,
-    S::Target: eventyr_store::snapshot_store::SnapshotStore<State = E>,
-    E: Clone + Send,
-{
-    /// Persist a snapshot offer against the subscription's store —
-    /// fire-and-forget at the caller's side: the error is reported but
-    /// the caller (the write driver) deliberately drops it.
-    pub async fn save_snapshot(
-        &self,
-        snapshot: Snapshot<E>,
-    ) -> Result<(), StoreError> {
-        eventyr_store::snapshot_store::SnapshotStore::save(&*self.inner, snapshot).await
-    }
-}
-
 /// The row shape: `payload` is the materialized state as JSON;
 /// `version` the stream version at snapshot time (CHECK-positive in
 /// the schema).

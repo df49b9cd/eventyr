@@ -11,7 +11,6 @@
 use eventyr_core::snapshot::Snapshot;
 use eventyr_core::vocabulary::{StreamId, Version};
 use eventyr_store::snapshot_store::SnapshotStore;
-use eventyr_store_postgres::snapshots::SubscriptionSnapshots;
 use eventyr_store_postgres::PgStore;
 
 use serde::{Deserialize, Serialize};
@@ -100,7 +99,7 @@ async fn snapshot_save_and_load_roundtrip() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
-async fn subscription_snapshots_route_the_offer_through_the_stores_pool() {
+async fn snapshot_offers_persist_through_the_store_directly() {
     let url = std::env::var("EVENTYR_TEST_PG_URL")
         .expect("EVENTYR_TEST_PG_URL must point at a real Postgres");
     let store = PgStore::<AccountState>::connect(&url)
@@ -108,11 +107,9 @@ async fn subscription_snapshots_route_the_offer_through_the_stores_pool() {
         .expect("connect and migrate");
     let stream = new_stream();
 
-    // The bound path the design promises: a `SubscriptionSnapshots`
-    // over the same store routes an offer to the same pool the
-    // subscription reads from (here &PgStore: it derefs to the
-    // `SnapshotStore` impl).
-    let snapshots = SubscriptionSnapshots::new(&store);
+    // `PgStore<E>` *is* the `SnapshotStore<State = E>`: no adapter
+    // layer. A commit's offer routes straight to `save` on the store —
+    // the fire-and-forget caller drops the result.
     let offer = Snapshot {
         stream_id: stream.clone(),
         version: Version::new(3),
@@ -121,8 +118,7 @@ async fn subscription_snapshots_route_the_offer_through_the_stores_pool() {
             balance: 7,
         },
     };
-    snapshots
-        .save_snapshot(offer)
+    SnapshotStore::save(&store, offer)
         .await
         .expect("the offer persists through the store's pool");
     let loaded = SnapshotStore::load(&store, &stream)
@@ -132,9 +128,8 @@ async fn subscription_snapshots_route_the_offer_through_the_stores_pool() {
     assert_eq!(loaded.version, Version::new(3));
     assert_eq!(loaded.state.balance, 7);
 
-    // The save_snapshot contract is fire-and-forget-friendly: a stale
-    // offer reports Ok (the store dropped it monotonicity-side) and the
-    // persisted snapshot is untouched.
+    // Fire-and-forget stays safe under a stale offer: the store's
+    // monotonic upsert drops it and the persisted snapshot is untouched.
     let stale = Snapshot {
         stream_id: stream.clone(),
         version: Version::new(2),
@@ -143,7 +138,7 @@ async fn subscription_snapshots_route_the_offer_through_the_stores_pool() {
             balance: 0,
         },
     };
-    snapshots.save_snapshot(stale).await.expect("stale offer");
+    SnapshotStore::save(&store, stale).await.expect("stale offer");
     let loaded = SnapshotStore::load(&store, &stream)
         .await
         .expect("load")

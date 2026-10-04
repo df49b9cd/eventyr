@@ -11,11 +11,3 @@ CREATE TABLE snapshots (
     payload     JSONB       NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
--- Snapshots: persisted write-side read models.
-CREATE TABLE snapshots (
-    stream_id  TEXT PRIMARY KEY,
-    version    BIGINT NOT NULL CHECK (version > 0),
-    payload    JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);

@@ -195,6 +195,10 @@ where
     /// versions past the version the fold started from. Persistence is
     /// fire-and-forget — a failed save logs nothing and changes
     /// nothing; the next load simply folds a longer delta.
+    ///
+    /// Takes a [`SnapshotPolicy`] (not a [`WritePolicy`]) so the
+    /// "snapshots on, but no cadence" shape is unrepresentable at the
+    /// type level — no `assert!` for what the signature rules out.
     pub fn with_snapshots<SS>(
         self,
         snapshots: SS,
@@ -210,31 +214,6 @@ where
                 retry: self.policy.retry,
                 snapshot: Some(policy),
             },
-            _aggregate: core::marker::PhantomData,
-        }
-    }
-
-    /// Turn snapshots on with the whole write-side tuning at once:
-    /// `policy.retry` bounds conflict retries, `policy.snapshot` must
-    /// carry the cadence (a `None` snapshot policy on a snapshots-on
-    /// repository is a caller bug — the machine would have nothing to
-    /// fire on).
-    pub fn with_snapshots_policy<SS>(
-        self,
-        snapshots: SS,
-        policy: WritePolicy,
-    ) -> AggregateRepository<A, S, SS>
-    where
-        SS: SnapshotStore<State = A::State>,
-    {
-        assert!(
-            policy.snapshot.is_some(),
-            "with_snapshots_policy requires policy.snapshot to be Some"
-        );
-        AggregateRepository {
-            store: self.store,
-            snapshots,
-            policy,
             _aggregate: core::marker::PhantomData,
         }
     }
@@ -267,8 +246,7 @@ where
         let policy = self
             .policy
             .snapshot
-            .expect("with_snapshots sets the policy before this method is reachable");
-        let mut machine = WriteMachine::<A, A::State>::with_snapshots(
+            .expect("with_snapshots sets the policy before this method is reachable");        let mut machine = WriteMachine::<A, A::State>::with_snapshots(
             id,
             command,
             self.policy.retry,
