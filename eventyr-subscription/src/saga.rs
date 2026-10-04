@@ -112,15 +112,19 @@ where
     Fut: core::future::Future<Output = Result<(), StoreError>>,
 {
     let mut action = machine.start(event.clone());
+    // The interaction's stamp, read once: the saga's boundary answer is
+    // fixed at construction (with_metadata), so the dispatch overlay is
+    // a constant for the whole interaction.
+    let interaction = machine.metadata().clone();
     loop {
         action = match action {
             SagaAction::React { event } => {
-                let interaction = machine.metadata().clone();
                 let commands = machine
                     .react(&event)
                     .into_iter()
                     .map(|mut command| {
-                        command.overlay_metadata(interaction.clone(), event.metadata.clone());
+                        command.metadata =
+                            Metadata::overlay(&interaction, &event.metadata, &command.metadata);
                         command
                     })
                     .collect();

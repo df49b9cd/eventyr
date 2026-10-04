@@ -120,7 +120,7 @@ pub mod prelude {
     };
     pub use crate::memory::InMemoryStore;
     pub use crate::metrics::{Metrics, NoopMetrics};
-    pub use crate::repository::{AggregateRepository, ExecutionError, ExecutionOutcome};
+    pub use crate::repository::{AggregateRepository, CachedRepository, ExecutionError, ExecutionOutcome};
     pub use crate::snapshot_store::{InMemorySnapshotStore, SnapshotStore};
     pub use crate::store::{EventStore, StreamsAll, append_batch_fallback, expected_version_matches};
     #[cfg(feature = "tracing")]

@@ -138,6 +138,63 @@ where
 {
 }
 
+/// The cache the cache-primed write path (0.6.5) answers through:
+/// read at `/lookup/`, re-based on each commit's snapshot via
+/// [`prime`](SnapshotCache::prime).
+///
+/// There is no cache in core where the machine lives — the machine's
+/// only rewrite of its own fold is the *seed* the caller planted, which
+/// the commit's optimistic-concurrency guard revalidates. The cache is
+/// a store-side promoted snapshot, per the same rule
+/// [`SnapshotStore`](crate::snapshot) follows: a stale read is
+/// answered by the next append's conflict, never written back through.
+pub trait SnapshotCache<S> {
+    /// The last-committed snapshot the cache holds for `stream_id`,
+    /// if the caller has primed it. `None` whenever it has not.
+    fn lookup(&self, stream_id: &StreamId) -> Option<Snapshot<S>>;
+
+    /// Re-base: the cache's next `lookup` answers the snapshot this
+    /// commit offered. (The driver calls it on
+    /// [`Committed`](crate::write::WriteOutcome::Committed)'s offer.)
+    /// Re-priming an older snapshot is the caller's bug to spot, not
+    /// the cache's — `prime` is the terminal movement per interaction;
+    /// a regression later than the next commit cannot arrive.
+    fn prime(&mut self, snapshot: Snapshot<S>);
+}
+
+/// The in-memory store's cache: one row per stream, newest wins — the
+/// same newest-wins rule the [`SnapshotStore`](crate::snapshot) port
+/// carries, kept in-process.
+#[derive(Debug, Default)]
+pub struct InMemorySnapshotCache<S> {
+    inner: alloc::collections::BTreeMap<StreamId, Snapshot<S>>,
+}
+
+impl<S> InMemorySnapshotCache<S> {
+    /// An empty cache.
+    pub fn new() -> Self {
+        Self {
+            inner: alloc::collections::BTreeMap::new(),
+        }
+    }
+}
+
+impl<S: Clone> SnapshotCache<S> for InMemorySnapshotCache<S> {
+    fn lookup(&self, stream_id: &StreamId) -> Option<Snapshot<S>> {
+        self.inner.get(stream_id).cloned()
+    }
+
+    fn prime(&mut self, snapshot: Snapshot<S>) {
+        // Newest wins: replayed offers never regress the cache.
+        match self.inner.get(&snapshot.stream_id) {
+            Some(existing) if existing.version >= snapshot.version => {}
+            _ => {
+                self.inner.insert(snapshot.stream_id.clone(), snapshot);
+            }
+        }
+    }
+}
+
 /// A snapshot candidate offered to the driver after a commit, when the
 /// policy fired. Wrapper around [`Snapshot`] so the outcome's payload
 /// names what it's for.

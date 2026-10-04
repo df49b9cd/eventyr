@@ -62,6 +62,14 @@ pub enum WriteAction<E, Err, S = ()> {
         /// The stream to read the snapshot for.
         stream_id: StreamId,
     },
+    /// The primed machine's first step: the driver (or owning
+    /// repository) answers the baseline the cache holds for this stream
+    /// with [`Cached`](WriteInput::Cached). `stream_id` names the cache
+    /// key the agent should consult.
+    Primed {
+        /// The stream the cache answers for.
+        stream_id: StreamId,
+    },
     /// Append events, guarded by the expected version.
     ///
     /// Drivers may enrich each event's metadata (correlation,
@@ -89,6 +97,16 @@ pub enum WriteInput<E, S = ()> {
     Loaded {
         /// The events read, in stream order.
         events: Vec<EventEnvelope<E>>,
+    },
+    /// Baseline the fold with this snapshot, without reading the store:
+    /// the cache-primed machine's answer to [`Primed`](WriteAction::Primed).
+    /// Its rules are the snapshot mount's: version monotone against the
+    /// fold (the cache never carries a regression), the store's own
+    /// expectation still guards the append against staleness the cache
+    /// could never see.
+    Cached {
+        /// The snapshot the caller says is current.
+        snapshot: Snapshot<S>,
     },
     /// The snapshot read completed: the newest persisted snapshot for
     /// the stream, or `None` when the store has none.
@@ -176,6 +194,12 @@ enum Phase {
     /// Waiting for `SnapshotLoaded` — only on a snapshots-on machine,
     /// only as its first phase.
     LoadingSnapshot,
+    /// The primed-start phase of a [`with_cache`](WriteMachine::with_cache)
+    /// machine: answer with [`Cached`](WriteInput::Cached) — the state
+    /// the interaction proceeds from — and never a store round-trip.
+    /// Skipped by construction on every other shape; the machine's first
+    /// movement is always `LoadStream` there.
+    Warm,
     /// Waiting for `Loaded`.
     Loading,
     /// Waiting for `Appended`/`Conflict`/`Failed`.
@@ -221,6 +245,7 @@ impl Snapshots {
         }
     }
 }
+
 
 /// Fold committed events into a snapshot-channel state. Stored on the
 /// machine only when snapshots are on (where `S = A::State`).
@@ -301,6 +326,9 @@ pub struct WriteMachine<A: Aggregate, S = ()> {
     /// Set only on a snapshots-on machine (there `S = A::State`, so the
     /// hook is a plain move). `None` — unreachable — otherwise.
     hooks: Option<SnapshotHooks<A, S>>,
+    /// Offer a snapshot on every commit, regardless of cadence (the
+    /// cache-primed machine's coherence rule; 0.6.5).
+    offer_always: bool,
     _channel: PhantomData<fn() -> S>,
 }
 
@@ -321,6 +349,7 @@ impl<A: Aggregate> WriteMachine<A, ()> {
             folded: A::initial(&id),
             version: Version::EMPTY,
             hooks: None,
+            offer_always: false,
             _channel: PhantomData,
         }
     }
@@ -331,6 +360,49 @@ where
     A: HasSnapshotState,
     A::State: Clone,
 {
+    /// Begin an interaction primed from the caller's cache: `seed` is
+    /// the last-committed snapshot of this stream the caller holds.
+    ///
+    /// The machine runs the ordinary write protocol on top of the seed
+    /// with no store round-trip to load anything: `start` emits
+    /// [`Primed`](WriteAction::Primed) — "what the cache says" — and the
+    /// first answer *is* that seed's state (re-delivered through
+    /// [`Cached`](WriteInput::Cached)) for the domain to decide on. A
+    /// stale seed still lands on the append's optimistic-concurrency
+    /// expectation: the cache carries the machine's *baseline*, the
+    /// store owns the truth, and a miss surfaces as an ordinary
+    /// conflict.
+    ///
+    /// The write side of the cache is this machine's commit: every
+    /// commit offers a snapshot unconditionally (the cache stays
+    /// current only when every commit re-bases it), so
+    /// 0.6.5's invariant — the driver's cache is written exactly when
+    /// the snapshot it keeps fires — lives here, not in the driver.
+    pub fn with_cache(id: A::Id, command: A::Command, retry_policy: RetryPolicy) -> Self {
+        Self {
+            stream_id: StreamId::for_aggregate::<A>(&id),
+            command,
+            metadata: crate::envelope::Metadata::default(),
+            retry_policy,
+            snapshots: Snapshots::Off, // the store says nothing at load time
+            retries_used: 0,
+            phase: Phase::Warm,
+            folded: A::initial(&id),
+            version: Version::EMPTY,
+            hooks: Some(SnapshotHooks {
+                adopt: |folded, state| *folded = state,
+                fold_committed: |state, committed| {
+                    for envelope in committed {
+                        A::apply(state, &envelope.event);
+                    }
+                },
+                materialize: Clone::clone,
+            }),
+            offer_always: true,
+            _channel: PhantomData,
+        }
+    }
+
     /// Begin an interaction whose load may start from a stored snapshot
     /// and whose commit may offer one.
     ///
@@ -367,6 +439,7 @@ where
                 },
                 materialize: Clone::clone,
             }),
+            offer_always: false,
             _channel: PhantomData,
         }
     }
@@ -382,6 +455,9 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
             Phase::LoadingSnapshot => WriteAction::LoadSnapshot {
                 stream_id: self.stream_id.clone(),
             },
+            Phase::Warm => WriteAction::Primed {
+                stream_id: self.stream_id.clone(),
+            },
             Phase::Loading => WriteAction::LoadStream {
                 stream_id: self.stream_id.clone(),
                 from: self.version,
@@ -393,12 +469,38 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
     /// Consume a driver result, transition, and emit the next action.
     pub fn handle(&mut self, input: WriteInput<A::Event, S>) -> WriteAction<A::Event, A::Error, S> {
         match input {
+            WriteInput::Cached { snapshot } => self.on_cached(snapshot),
             WriteInput::Loaded { events } => self.on_loaded(events),
             WriteInput::SnapshotLoaded { snapshot } => self.on_snapshot_loaded(snapshot),
             WriteInput::Appended { committed } => self.on_appended(committed),
             WriteInput::Conflict { current } => self.on_conflict(current),
             WriteInput::Failed(error) => self.on_failed(error),
         }
+    }
+
+    fn on_cached(&mut self, snapshot: Snapshot<S>) -> WriteAction<A::Event, A::Error, S> {
+        if self.phase != Phase::Warm {
+            return self.violation("`Cached` outside the priming phase");
+        }
+        if snapshot.stream_id != self.stream_id {
+            return self.violation("`Cached` delivered a snapshot for another stream");
+        }
+        // The cache's monotonicity is the fold's monotonicity: a
+        // snapshot cannot move it backwards.
+        if snapshot.version < self.version {
+            return self.violation("`Cached` is older than the state already folded");
+        }
+        let hooks = self
+            .hooks
+            .as_ref()
+            .expect("a primed machine installs the hooks");
+        hooks.adopt_snapshot(&mut self.folded, snapshot.state);
+        self.version = snapshot.version;
+        // No new fold from the store: the cache seeds everything the
+        // loaded events would have said. `Base` is the cache's version,
+        // so the offer-fire rule speaks in progress since the seed.
+        self.phase = Phase::Loading;
+        self.decide_and_emit()
     }
 
     /// The stream this machine writes to.
@@ -409,6 +511,13 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
     /// The metadata this machine stamps onto every event it emits.
     pub fn metadata(&self) -> &crate::envelope::Metadata {
         &self.metadata
+    }
+
+    /// The fold's starting state — what the interaction decides on
+    /// before any event lands. For a cache-off machine this is
+    /// `A::initial`; for a primed machine it is the seed.
+    pub fn initial_state(&self) -> &A::State {
+        &self.folded
     }
 
     /// Builder-style: set the metadata stamped on every emitted event
@@ -528,10 +637,13 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
     /// committed events applied, at the committed version — exactly
     /// what a later `LoadSnapshot` answer wants to carry.
     fn snapshot_offer(&self, committed: &[EventEnvelope<A::Event>]) -> Option<OfferSnapshot<S>> {
-        let policy = self.snapshots.policy()?;
         let hooks = self.hooks.as_ref()?;
         let committed_version = committed.last().map_or(self.version, |e| e.version);
-        if !policy.is_due(self.snapshots.base_version(), committed_version) {
+        if let Some(policy) = self.snapshots.policy() {
+            if !policy.is_due(self.snapshots.base_version(), committed_version) {
+                return None;
+            }
+        } else if !self.offer_always {
             return None;
         }
         // Materialize the post-commit state without disturbing
