@@ -25,6 +25,12 @@ pub mod store;
 use std::sync::Arc;
 
 use eventyr_core::error::StoreError;
+use sqlx::postgres::PgDatabaseError;
+
+/// PostgreSQL's SQLSTATE for a user-raised exception — the
+/// `RAISE EXCEPTION '...'` the migration's `append_events` uses to
+/// signal a version-conflict (its `hint` carries the actual version).
+const RAISE_EXCEPTION: &str = "P0001";
 
 pub use store::PgStore;
 
@@ -49,21 +55,20 @@ pub enum PgStoreError {
 }
 
 impl PgStoreError {
-    /// Map a raw sqlx error to [`StoreError`]: the advisory-lock
-    /// conflict is surfaced as a version conflict, a connection-level
-    /// failure as transient, anything else as fatal-by-construction.
+    /// Map a raw sqlx error to [`StoreError`]: the migration's
+    /// version-conflict is surfaced as a [`StoreError::Conflict`], a
+    /// connection-level failure as [`StoreError::Unavailable`], anything
+    /// else as fatal-by-construction.
     pub(crate) fn into_store(error: sqlx::Error) -> StoreError {
-        let as_row = |db: &dyn sqlx::error::DatabaseError| {
-            let text = db.message();
-            text.find("stream is at ").and_then(|i| {
-                text[i + "stream is at ".len()..]
-                    .split(|c: char| !c.is_ascii_digit())
-                    .next()
-                    .and_then(|d| d.parse().ok())
-            })
-        };
-        let db = error.as_database_error();
-        match db.and_then(as_row) {
+        // The function raises a version conflict as `USING HINT =
+        // <current-version>`; read the hint, not the message text.
+        let conflict_current = error
+            .as_database_error()
+            .and_then(|db| db.try_downcast_ref::<PgDatabaseError>())
+            .filter(|pg| pg.code() == RAISE_EXCEPTION)
+            .and_then(|pg| pg.hint())
+            .and_then(|hint| hint.trim().parse().ok());
+        match conflict_current {
             Some(current) => StoreError::Conflict {
                 current: eventyr_core::vocabulary::Version::new(current),
             },

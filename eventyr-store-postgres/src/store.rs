@@ -51,18 +51,6 @@ impl<E> PgStore<E> {
     }
 }
 
-impl<E> PgStore<E>
-where
-    E: serde::Serialize + serde::de::DeserializeOwned + EventName + Clone + Send + Sync,
-{
-    /// Apply the migrations (idempotent). The migration files live in
-    /// `eventyr-store-postgres/migrations`; the path is resolved from the
-    /// crate's manifest so this works from any working directory.
-    pub async fn migrate_with(pool: &PgPool) -> Result<(), PgStoreError> {
-        migrate(pool).await
-    }
-}
-
 /// Run the migrations against a pool.
 pub async fn migrate(pool: &PgPool) -> Result<(), PgStoreError> {
     let migrations = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
@@ -73,8 +61,13 @@ pub async fn migrate(pool: &PgPool) -> Result<(), PgStoreError> {
     Ok(())
 }
 
+/// The `events` columns every read shares — one place, so adding a
+/// column can't drift across the append/read/read-all queries.
+const EVENT_COLUMNS: &str =
+    "global_sequence, stream_id, stream_version, payload, metadata, created_at";
+
 /// One row of the events table, as read back. The `payload` column holds
-/// `{ name, payload }` (the stored event); `metadata` is the JSONB
+/// `{variant, args}` (externally-tagged serde) (the stored event); `metadata` is the JSONB
 /// envelope with the two ids.
 #[derive(sqlx::FromRow)]
 struct EventRow {
@@ -159,34 +152,33 @@ where
 
             let (kind, exact) = expectation_args(expected);
 
-            let n = events.len();
-            let mut names = Vec::with_capacity(n);
-            let mut payloads = Vec::with_capacity(n);
-            let mut causations = Vec::with_capacity(n);
-            let mut correlations = Vec::with_capacity(n);
+            // One source of truth per event, fanned out into the four
+            // arrays the function takes — the correlation across the four
+            // stays in the type, not in four lockstep pushes.
+            let mut names = Vec::with_capacity(events.len());
+            let mut payloads = Vec::with_capacity(events.len());
+            let mut causations = Vec::with_capacity(events.len());
+            let mut correlations = Vec::with_capacity(events.len());
             for new_event in events {
-                let metadata = new_event.metadata;
-                let name = new_event.event.event_name();
+                names.push(new_event.event.event_name().to_string());
                 payloads.push(serde_json::to_value(&new_event.event).map_err(PgStoreError::from)?);
-                names.push(name);
-                causations.push(metadata.causation_id);
-                correlations.push(metadata.correlation_id);
+                causations.push(new_event.metadata.causation_id);
+                correlations.push(new_event.metadata.correlation_id);
             }
 
-            let rows = sqlx::query_as::<_, EventRow>(
-                "SELECT global_sequence, stream_id, stream_version, payload, metadata, \
-                 created_at FROM append_events($1, $2, $3, $4, $5, $6, $7)",
-            )
-            .bind(kind)
-            .bind(exact)
-            .bind(stream_id.as_str())
-            .bind(&names[..])
-            .bind(&payloads[..])
-            .bind(&causations[..])
-            .bind(&correlations[..])
-            .fetch_all(&pool)
-            .await
-            .map_err(PgStoreError::into_store)?;
+            let query =
+                format!("SELECT {EVENT_COLUMNS} FROM append_events($1, $2, $3, $4, $5, $6, $7)");
+            let rows = sqlx::query_as::<_, EventRow>(&query)
+                .bind(kind)
+                .bind(exact)
+                .bind(stream_id.as_str())
+                .bind(&names[..])
+                .bind(&payloads[..])
+                .bind(&causations[..])
+                .bind(&correlations[..])
+                .fetch_all(&pool)
+                .await
+                .map_err(PgStoreError::into_store)?;
 
             rows.into_iter()
                 .map(EventEnvelope::try_from)
@@ -203,11 +195,11 @@ where
         let pool = self.pool.clone();
         let stream_id = stream_id.clone();
         Box::pin(async_stream::stream! {
-            let rows = sqlx::query_as::<_, EventRow>(
-                "SELECT global_sequence, stream_id, stream_version, payload, metadata, \
-                 created_at FROM events WHERE stream_id = $1 AND stream_version > $2 \
-                 ORDER BY stream_version",
-            )
+            let query = format!(
+                "SELECT {EVENT_COLUMNS} FROM events WHERE stream_id = $1 AND stream_version > $2 \
+                 ORDER BY stream_version"
+            );
+            let rows = sqlx::query_as::<_, EventRow>(&query)
             .bind(stream_id.as_str())
             .bind(from.as_u64().try_into().unwrap_or(i64::MAX))
             .fetch_all(&pool)
@@ -241,16 +233,16 @@ where
             const PAGE: i64 = 512;
             let mut cursor = from.as_u64().try_into().unwrap_or(i64::MAX);
             loop {
-                let rows = sqlx::query_as::<_, EventRow>(
-                    "SELECT global_sequence, stream_id, stream_version, payload, metadata, \
-                     created_at FROM events WHERE global_sequence > $1 \
-                     ORDER BY global_sequence LIMIT $2",
-                )
-                .bind(cursor)
-                .bind(PAGE)
-                .fetch_all(&pool)
-                .await
-                .map_err(PgStoreError::into_store);
+                let query = format!(
+                    "SELECT {EVENT_COLUMNS} FROM events WHERE global_sequence > $1 \
+                     ORDER BY global_sequence LIMIT $2"
+                );
+                let rows = sqlx::query_as::<_, EventRow>(&query)
+                    .bind(cursor)
+                    .bind(PAGE)
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(PgStoreError::into_store);
 
                 let rows = match rows {
                     Ok(rows) => rows,
