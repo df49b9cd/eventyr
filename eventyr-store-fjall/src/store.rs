@@ -13,6 +13,7 @@ use eventyr_core::envelope::{EventEnvelope, Metadata, NewEvent};
 use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
+use eventyr_store::notify::{CommitSignal, LocalCommitListener, LocalCommitSignal};
 use eventyr_store::store::{EventStore, QueryAppend, StreamsAll};
 
 use crate::FjallStoreError;
@@ -50,7 +51,8 @@ struct StoredRow<E> {
 
 /// An embedded [`EventStore`] and [`StreamsAll`] over fjall — and, for
 /// [`Tagged`] events, [`QueryAppend`] (0.7.1), answered by scanning the
-/// global log.
+/// global log. Its [`CommitSignal`] (0.7.2) wakes subscribers on every
+/// commit made through this store or its clones.
 ///
 /// Shareable and cloneable (it wraps a [`fjall::SingleWriterTxDatabase`]):
 /// clones point at the same keyspaces. All writes go through one
@@ -70,6 +72,8 @@ pub struct FjallStore<E> {
     meta: SingleWriterTxKeyspace,
     /// The write-side serialization point (see the type's docs).
     write_lock: Mutex<()>,
+    /// Raised after every commit (0.7.2); shared by clones.
+    signal: LocalCommitSignal,
     _event: std::marker::PhantomData<fn() -> E>,
 }
 
@@ -82,6 +86,7 @@ impl<E> Clone for FjallStore<E> {
             global: self.global.clone(),
             meta: self.meta.clone(),
             write_lock: Mutex::new(()),
+            signal: self.signal.clone(),
             _event: std::marker::PhantomData,
         }
     }
@@ -110,6 +115,7 @@ impl<E> FjallStore<E> {
             global: keyspace.keyspace(PARTITION_GLOBAL, KeyspaceCreateOptions::default)?,
             meta: keyspace.keyspace(PARTITION_META, KeyspaceCreateOptions::default)?,
             write_lock: Mutex::new(()),
+            signal: LocalCommitSignal::new(),
             keyspace,
             _event: std::marker::PhantomData,
         })
@@ -172,7 +178,15 @@ impl<E> FjallStore<E> {
         let mut tx = self.keyspace.write_tx();
         let committed = self.write_in(&mut tx, appends)?;
         tx.commit().map_err(engine)?;
+        self.notify_if_written(&committed);
         Ok(committed)
+    }
+
+    /// Raise the commit signal when the commit wrote any event.
+    fn notify_if_written(&self, committed: &[WrittenStream<E>]) {
+        if committed.iter().any(|(_, events)| !events.is_empty()) {
+            self.signal.notify();
+        }
     }
 
     /// The body of [`write_batch`](Self::write_batch), inside a write
@@ -504,10 +518,24 @@ where
                     .map(|a| (a.stream_id, a.expected, a.events)),
             )?;
             tx.commit().map_err(engine)?;
+            this.notify_if_written(&committed);
             Ok(committed
                 .into_iter()
                 .map(|(stream_id, events)| CommittedStream { stream_id, events })
                 .collect())
         }
+    }
+}
+
+impl<E> CommitSignal for FjallStore<E>
+where
+    E: Send,
+{
+    type Listener = LocalCommitListener;
+
+    fn subscribe(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Self::Listener, StoreError>> + Send {
+        self.signal.subscribe()
     }
 }

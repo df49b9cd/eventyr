@@ -8,6 +8,7 @@ use eventyr_core::envelope::{EventEnvelope, Metadata, NewEvent};
 use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
+use eventyr_store::notify::{CommitSignal, LocalCommitListener, LocalCommitSignal};
 use eventyr_store::store::{EventStore, QueryAppend, StreamsAll};
 use futures::Stream;
 use futures::stream::iter;
@@ -35,7 +36,10 @@ const EVENT_COLUMNS: &str =
 
 /// An embedded [`EventStore`] and [`StreamsAll`] over SQLite, via
 /// rusqlite — and, for [`Tagged`] events, [`QueryAppend`] (0.7.1),
-/// answered by scanning the log.
+/// answered by scanning the log. Its [`CommitSignal`] (0.7.2) wakes
+/// subscribers on commits made through this store or its clones;
+/// another connection writing the same file is seen at the next timed
+/// poll.
 ///
 /// Synchronous under one mutex: the port's future signatures resolve
 /// immediately, and a `Mutex<Connection>` serializes writers the way
@@ -49,6 +53,8 @@ const EVENT_COLUMNS: &str =
 /// one store handle to see all its writes).
 pub struct SqliteStore<E> {
     conn: Arc<Mutex<rusqlite::Connection>>,
+    /// Raised after every commit (0.7.2); shared by clones.
+    signal: LocalCommitSignal,
     _event: std::marker::PhantomData<fn() -> E>,
 }
 
@@ -56,6 +62,7 @@ impl<E> Clone for SqliteStore<E> {
     fn clone(&self) -> Self {
         Self {
             conn: Arc::clone(&self.conn),
+            signal: self.signal.clone(),
             _event: std::marker::PhantomData,
         }
     }
@@ -81,6 +88,7 @@ impl<E> SqliteStore<E> {
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            signal: LocalCommitSignal::new(),
             _event: std::marker::PhantomData,
         })
     }
@@ -90,6 +98,14 @@ impl<E> SqliteStore<E> {
     #[cfg(feature = "snapshots")]
     pub(crate) fn conn(&self) -> Arc<Mutex<rusqlite::Connection>> {
         Arc::clone(&self.conn)
+    }
+
+    /// Raise the commit signal when the commit wrote any event — after
+    /// the commit, so a woken reader sees it.
+    fn notify_if_written<T>(&self, committed: &[Vec<T>]) {
+        if committed.iter().any(|events| !events.is_empty()) {
+            self.signal.notify();
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
@@ -283,6 +299,7 @@ where
         let tx = conn.transaction().map_err(SqliteStoreError::into_store)?;
         let mut committed = append_within(&tx, &[(stream_id.clone(), expected, events)])?;
         tx.commit().map_err(SqliteStoreError::into_store)?;
+        self.notify_if_written(&committed);
         // One stream in the batch: the writes above are the caller's
         // single answer.
         Ok(committed.remove(0))
@@ -303,6 +320,7 @@ where
             .collect();
         let committed = append_within(&tx, &appends)?;
         tx.commit().map_err(SqliteStoreError::into_store)?;
+        self.notify_if_written(&committed);
         Ok(appends
             .into_iter()
             .zip(committed)
@@ -388,10 +406,24 @@ where
             .collect();
         let committed = append_within(&tx, &appends)?;
         tx.commit().map_err(SqliteStoreError::into_store)?;
+        self.notify_if_written(&committed);
         Ok(appends
             .into_iter()
             .zip(committed)
             .map(|((stream_id, _, _), events)| CommittedStream { stream_id, events })
             .collect())
+    }
+}
+
+impl<E> CommitSignal for SqliteStore<E>
+where
+    E: Send,
+{
+    type Listener = LocalCommitListener;
+
+    fn subscribe(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Self::Listener, StoreError>> + Send {
+        self.signal.subscribe()
     }
 }

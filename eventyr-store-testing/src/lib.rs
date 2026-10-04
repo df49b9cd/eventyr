@@ -35,12 +35,14 @@
 //! from the in-memory one.
 
 mod batch_store;
+mod commit_signal;
 mod event_store;
 mod query_append;
 mod snapshot_store;
 mod streams_all;
 
 pub use batch_store::event_store_batch_contract;
+pub use commit_signal::commit_signal_contract;
 pub use event_store::{ContractEvent, event_store_contract};
 pub use query_append::query_append_contract;
 pub use snapshot_store::snapshot_contract;

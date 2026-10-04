@@ -173,3 +173,13 @@ fn fjall_store_passes_the_query_append_contract() {
         store
     });
 }
+
+#[test]
+fn fjall_store_passes_the_commit_signal_contract() {
+    eventyr_store_testing::commit_signal_contract::<ContractEvent, _>(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FjallStore::<ContractEvent>::open(dir.path()).expect("open");
+        std::mem::forget(dir);
+        store
+    });
+}

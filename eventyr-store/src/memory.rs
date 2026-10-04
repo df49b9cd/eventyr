@@ -21,6 +21,7 @@ use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 
+use crate::notify::{CommitSignal, LocalCommitListener, LocalCommitSignal};
 use crate::store::{EventStore, QueryAppend, StreamsAll};
 
 struct Inner<E> {
@@ -136,6 +137,8 @@ impl<E: EventName + Tagged> Inner<E> {
 /// never across an await (there are none).
 pub struct InMemoryStore<E> {
     inner: Mutex<Inner<E>>,
+    /// Raised after every commit (0.7.2).
+    signal: LocalCommitSignal,
 }
 
 impl<E> InMemoryStore<E> {
@@ -143,6 +146,7 @@ impl<E> InMemoryStore<E> {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
+            signal: LocalCommitSignal::new(),
         }
     }
 }
@@ -161,6 +165,28 @@ impl<E> InMemoryStore<E> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    /// Raise the commit signal after a successful, non-empty write —
+    /// outside the lock, once the write is visible to reads.
+    fn committed<T>(&self, result: Result<T, StoreError>, wrote: bool) -> Result<T, StoreError> {
+        if result.is_ok() && wrote {
+            self.signal.notify();
+        }
+        result
+    }
+}
+
+impl<E> CommitSignal for InMemoryStore<E>
+where
+    E: Send,
+{
+    type Listener = LocalCommitListener;
+
+    fn subscribe(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Self::Listener, StoreError>> + Send {
+        self.signal.subscribe()
+    }
 }
 
 impl<E> EventStore for InMemoryStore<E>
@@ -175,10 +201,9 @@ where
         expected: ExpectedVersion,
         events: Vec<NewEvent<E>>,
     ) -> Result<Vec<EventEnvelope<E>>, StoreError> {
-        let mut inner = self.lock();
-        let stream_id = stream_id.clone();
-        let mut committed = inner.append_one(&stream_id, expected, events)?;
-        Ok(committed.split_off(0))
+        let wrote = !events.is_empty();
+        let result = self.lock().append_one(&stream_id.clone(), expected, events);
+        self.committed(result, wrote)
     }
 
     /// Append the whole batch under the one lock — trivially atomic:
@@ -188,7 +213,9 @@ where
         &self,
         appends: Vec<StreamAppend<E>>,
     ) -> Result<Vec<CommittedStream<E>>, StoreError> {
-        self.lock().append_all(appends)
+        let wrote = appends.iter().any(|append| !append.events.is_empty());
+        let result = self.lock().append_all(appends);
+        self.committed(result, wrote)
     }
 
     fn stream(
@@ -253,15 +280,19 @@ where
         appends: Vec<StreamAppend<E>>,
         condition: AppendCondition,
     ) -> Result<Vec<CommittedStream<E>>, StoreError> {
-        let mut inner = self.lock();
-        if let Some(latest) = inner
-            .matching(&condition.query, condition.after)
-            .map(|envelope| envelope.sequence)
-            .last()
-        {
-            return Err(StoreError::QueryConflict { sequence: latest });
-        }
-        inner.append_all(appends)
+        let wrote = appends.iter().any(|append| !append.events.is_empty());
+        let result = {
+            let mut inner = self.lock();
+            match inner
+                .matching(&condition.query, condition.after)
+                .map(|envelope| envelope.sequence)
+                .last()
+            {
+                Some(latest) => Err(StoreError::QueryConflict { sequence: latest }),
+                None => inner.append_all(appends),
+            }
+        };
+        self.committed(result, wrote)
     }
 }
 

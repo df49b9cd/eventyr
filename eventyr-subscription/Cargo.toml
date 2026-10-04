@@ -21,4 +21,4 @@ eventyr-store = { workspace = true }
 futures = { version = "0.3", default-features = false, features = ["alloc", "executor"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }

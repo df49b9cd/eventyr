@@ -106,6 +106,7 @@
 pub mod driver;
 pub mod memory;
 pub mod metrics;
+pub mod notify;
 pub mod repository;
 pub mod snapshot_store;
 pub mod store;
@@ -122,6 +123,9 @@ pub mod prelude {
     #[cfg(feature = "tracing")]
     pub use crate::metrics::TracingMetrics;
     pub use crate::metrics::{Metrics, NoopMetrics};
+    pub use crate::notify::{
+        CommitListener, CommitSignal, LocalCommitListener, LocalCommitSignal, NoSignal,
+    };
     pub use crate::repository::{AggregateRepository, ExecutionError, ExecutionOutcome};
     pub use crate::snapshot_store::{InMemorySnapshotStore, SnapshotStore};
     pub use crate::store::{
