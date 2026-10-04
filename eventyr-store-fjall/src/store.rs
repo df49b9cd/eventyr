@@ -182,8 +182,7 @@ impl<E> FjallStore<E> {
                 ),
                 None => 0,
             };
-            let matches =
-                eventyr_store::store::expected_version_matches(*expected, current);
+            let matches = eventyr_store::store::expected_version_matches(*expected, current);
             if !matches {
                 return Err(StoreError::Conflict {
                     stream_id: Some(stream_id.clone()),
@@ -315,8 +314,7 @@ where
         let this = self.clone();
         let stream_id = stream_id.clone();
         async move {
-            let mut committed =
-                this.write_batch(std::iter::once((stream_id, expected, events)))?;
+            let mut committed = this.write_batch(std::iter::once((stream_id, expected, events)))?;
             // One append in the batch: the write already committed; the
             // caller asked for the single stream's envelopes.
             debug_assert_eq!(committed.len(), 1);

@@ -1,105 +1,80 @@
 //! The saga runner: drive a [`SagaMachine`] per event, as a
 //! [`Projection`].
 //!
-//! Roadmap 0.6.1's "sagas as a machine" lands here, and the split is
-//! the design: the subscription runner owns *fetch/ack* (at-least-once
-//! per event, checkpointed — `SubscriptionMachine`), and the saga
-//! machine owns *react/dispatch* (the event's commands). A saga is a
-//! projection whose "apply" dispatches its commands against the write
-//! side; per event, before the ack, so a crash re-delivers the event
-//! and the saga's commands re-issue — idempotency of each command is
-//! the caller's to keep, exactly as for projections proper.
+//! The split is the design: the subscription runner owns fetch/ack
+//! (at-least-once per event, checkpointed), the saga machine owns the
+//! per-event reaction. A saga is a projection whose "apply" dispatches
+//! its commands against the write side — before the ack, so a crash
+//! re-delivers the event and re-issues its commands. Each command's
+//! idempotency is the caller's to keep, exactly as for projections.
 //!
-//! [`SagaProjection`] wraps a [`Saga`] and the dispatcher so the plain
-//! [`Projector`](crate::runner::Projector) runs a saga unchanged; the
-//! per-event work is [`drive_saga`], which feeds the driver the
-//! machine's `React`/`Dispatch` actions and reports
-//! [`SagaOutcome::Done`] only once every command committed.
+//! [`SagaProjection`] wraps a [`Saga`] and a dispatcher so the plain
+//! [`Projector`](crate::runner::Projector) runs a saga unchanged;
+//! [`drive_saga`] is the per-event driver underneath it.
+
+use core::future::Future;
 
 use eventyr_core::envelope::{EventEnvelope, Metadata};
 use eventyr_core::error::StoreError;
 use eventyr_core::saga::{Saga, SagaAction, SagaCommand, SagaInput, SagaMachine, SagaOutcome};
-use eventyr_core::vocabulary::StreamId;
 
 use crate::runner::Projection;
 
-/// The I/O the saga needs the write side for: run `command` against
-/// `target`'s stream (the aggregate the caller resolves), succeeding
-/// only once the command's events committed.
-///
-/// Implemented per call site — the saga names *what* and *whose*; how
-/// to reach the stream (a repository call, a batch machine, a test's
-/// in-memory store) is the user's. The `Metadata` is the interaction's
-/// causation: it traces back to the event that fired the saga, per the
-/// 0.5.2 boundary seam.
-pub struct SagaDispatch<C> {
-    /// The command to execute.
-    pub command: C,
-    /// The stream the command targets.
-    pub target: StreamId,
-    /// Causation/correlation the dispatch carries.
-    pub metadata: Metadata,
-}
-
 /// A [`Projection`] over a [`Saga`]: each event's reaction runs as one
-/// [`SagaMachine`] interaction, dispatching each command in order.
+/// [`SagaMachine`] interaction.
 ///
-/// `D` is the dispatcher the caller owns — it turns a
-/// [`SagaDispatch`] into the command's commit (per-stream optimistic
-/// concurrency included). The projection's error is the saga's:
-/// the first dispatch that fails fails the event, and the subscription
-/// runner's retry policy decides whether the event re-delivers.
+/// The dispatcher `D` is the caller's: it receives each
+/// [`SagaCommand`] — command, target stream, metadata — and runs it
+/// against the write side (a repository call, a batch machine).
+/// The first dispatch that fails fails the event, and the subscription
+/// runner's retry policy decides whether it re-delivers.
 pub struct SagaProjection<S, D> {
     saga: S,
     dispatcher: D,
+    metadata: Metadata,
 }
 
 impl<S, D> SagaProjection<S, D> {
-    /// A saga projection: `saga` reacts; `dispatcher` commits.
+    /// A saga projection: `saga` reacts, `dispatcher` commits.
     pub fn new(saga: S, dispatcher: D) -> Self {
-        Self { saga, dispatcher }
+        Self {
+            saga,
+            dispatcher,
+            metadata: Metadata::default(),
+        }
     }
 
-    /// The saga this projection drives.
-    pub fn saga(&self) -> &S {
-        &self.saga
+    /// Builder-style: metadata layered onto every command this projection
+    /// dispatches (see [`Metadata::overlay`]).
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = metadata;
+        self
     }
 }
 
 impl<S, D, Fut> Projection for SagaProjection<S, D>
 where
     S: Saga + Clone,
-    S::Event: Clone + Send + Sync,
-    S::Command: Clone + Send,
-    D: FnMut(SagaDispatch<S::Command>) -> Fut + Send,
-    Fut: core::future::Future<Output = Result<(), StoreError>> + Send,
+    S::Event: Send + Sync,
+    S::Command: Send,
+    D: FnMut(SagaCommand<S::Command>) -> Fut + Send,
+    Fut: Future<Output = Result<(), StoreError>> + Send,
 {
     type Event = S::Event;
     type Error = StoreError;
 
-    async fn apply(
-        &mut self,
-        event: &EventEnvelope<Self::Event>,
-    ) -> Result<(), Self::Error> {
-        let mut machine = SagaMachine::new(self.saga.clone())
-            .with_metadata(event.metadata.clone());
-        let outcome = drive_saga(&mut machine, event, &mut self.dispatcher).await;
-        match outcome {
+    async fn apply(&mut self, event: &EventEnvelope<Self::Event>) -> Result<(), Self::Error> {
+        let mut machine = SagaMachine::new(self.saga.clone()).with_metadata(self.metadata.clone());
+        match drive_saga(&mut machine, event, &mut self.dispatcher).await {
             SagaOutcome::Done => Ok(()),
             SagaOutcome::Failed(error) => Err(error),
         }
     }
 }
 
-/// The per-event driver: run `machine` over `event`, dispatching each
-/// command the saga emits through `dispatcher`.
-///
-/// The dispatch is the write-side step stripped to its signature:
-/// metadata-stamped commands, per the interaction, and the first
-/// committed outcome answers `Dispatched`. The saga's own order (each
-/// dispatch committed before the next) is the only at-least-once seam
-/// the interaction opens: a retry re-issues from the failed command,
-/// never resends an already-committed one.
+/// The per-event driver: start `machine` on `event` and run each
+/// dispatch through `dispatcher`, one at a time, until the machine is
+/// done.
 pub async fn drive_saga<S, D, Fut>(
     machine: &mut SagaMachine<S>,
     event: &EventEnvelope<S::Event>,
@@ -107,47 +82,87 @@ pub async fn drive_saga<S, D, Fut>(
 ) -> SagaOutcome
 where
     S: Saga,
-    S::Event: Clone,
-    D: FnMut(SagaDispatch<S::Command>) -> Fut,
-    Fut: core::future::Future<Output = Result<(), StoreError>>,
+    D: FnMut(SagaCommand<S::Command>) -> Fut,
+    Fut: Future<Output = Result<(), StoreError>>,
 {
-    let mut action = machine.start(event.clone());
-    // The interaction's stamp, read once: the saga's boundary answer is
-    // fixed at construction (with_metadata), so the dispatch overlay is
-    // a constant for the whole interaction.
-    let interaction = machine.metadata().clone();
+    let mut action = machine.start(event);
     loop {
         action = match action {
-            SagaAction::React { event } => {
-                let commands = machine
-                    .react(&event)
-                    .into_iter()
-                    .map(|mut command| {
-                        command.metadata =
-                            Metadata::overlay(&interaction, &event.metadata, &command.metadata);
-                        command
-                    })
-                    .collect();
-                machine.handle(SagaInput::Reacted { commands })
-            }
-            SagaAction::Dispatch { command } => {
-                let SagaCommand {
-                    command,
-                    target,
-                    metadata,
-                } = command;
-                match dispatcher(SagaDispatch {
-                    command,
-                    target,
-                    metadata,
-                })
-                .await
-                {
-                    Ok(()) => machine.handle(SagaInput::Dispatched),
-                    Err(error) => machine.handle(SagaInput::DispatchFailed(error)),
-                }
-            }
+            SagaAction::Dispatch { command } => match dispatcher(command).await {
+                Ok(()) => machine.handle(SagaInput::Dispatched),
+                Err(error) => machine.handle(SagaInput::DispatchFailed(error)),
+            },
             SagaAction::Done(outcome) => return outcome,
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eventyr_core::vocabulary::{Sequence, StreamId, Version};
+
+    /// Echoes each event's payload as one command to `ledger-<payload>`.
+    #[derive(Clone)]
+    struct Echo;
+
+    impl Saga for Echo {
+        type Event = u64;
+        type Command = u64;
+
+        fn react(&self, event: &EventEnvelope<u64>) -> Vec<(StreamId, u64)> {
+            vec![(
+                StreamId::from(format!("ledger-{}", event.event)),
+                event.event,
+            )]
+        }
+    }
+
+    fn event(payload: u64) -> EventEnvelope<u64> {
+        EventEnvelope {
+            sequence: Sequence::new(9),
+            stream_id: StreamId::from("order-1"),
+            version: Version::new(1),
+            event: payload,
+            metadata: Metadata::of_ids(Some("cause-event".into()), Some("corr-event".into())),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_projection_dispatches_to_the_named_stream_with_layered_metadata() {
+        let mut seen = Vec::new();
+        let mut projection = SagaProjection::new(Echo, |command: SagaCommand<u64>| {
+            seen.push((
+                command.target.as_str().to_owned(),
+                command.command,
+                command.metadata.causation_id.clone(),
+                command.metadata.correlation_id.clone(),
+            ));
+            async { Ok(()) }
+        })
+        .with_metadata(Metadata::of_ids(None, Some("corr-request".into())));
+
+        projection.apply(&event(5)).await.expect("dispatched");
+        drop(projection);
+        assert_eq!(
+            seen,
+            vec![(
+                "ledger-5".to_owned(),
+                5,
+                Some("cause-event".to_owned()),
+                Some("corr-request".to_owned()),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_dispatch_fails_the_projection() {
+        let mut projection = SagaProjection::new(Echo, |_: SagaCommand<u64>| async {
+            Err(StoreError::Unavailable)
+        });
+        assert!(matches!(
+            projection.apply(&event(1)).await,
+            Err(StoreError::Unavailable)
+        ));
     }
 }

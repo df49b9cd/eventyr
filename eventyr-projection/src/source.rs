@@ -13,7 +13,8 @@
 //! moves past it, and the operator fixes the upcaster or the data and
 //! rebuilds (see [`rebuild`](crate::rebuild)). A skip or dead-letter
 //! mode is deliberately absent: silently dropping a stored fact is data
-//! loss, and `eventyr-core`'s [`Upcaster`] contract forbids it.
+//! loss, and `eventyr-core`'s [`Upcaster`](eventyr_core::upcast::Upcaster)
+//! contract forbids it.
 
 use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
@@ -102,7 +103,7 @@ where
 /// [`UpcasterRegistry`] — the 0.5.1 read-side — instead of a chain.
 ///
 /// Each fetched [`RawEvent`] becomes a
-/// [`VersionedRaw`](eventyr_core::version_registry::VersionedRaw) — the
+/// [`VersionedRaw`] — the
 /// same `event_type` and payload, its `schema_version` — and the
 /// registry walks that type's ladder. The output is the raw bytes of the
 /// current schema version; the caller decodes from those bytes into the

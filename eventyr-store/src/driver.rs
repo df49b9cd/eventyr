@@ -85,14 +85,6 @@ where
             WriteAction::LoadSnapshot { .. } => {
                 machine.handle(WriteInput::SnapshotLoaded { snapshot: None })
             }
-            WriteAction::Primed { .. } => {
-                // A priming machine expects its cache answer from the
-                // caller the repository routes through here — the plain
-                // driver has no cache to consult.
-                machine.handle(WriteInput::Failed(StoreError::other(
-                    "Primed on a cache-off driver: drive this machine through the repository's cached route",
-                )))
-            }
             WriteAction::Append {
                 stream_id,
                 expected,
@@ -179,9 +171,6 @@ where
                 }
                 Err(error) => machine.handle(WriteInput::Failed(error)),
             },
-            WriteAction::Primed { .. } => machine.handle(WriteInput::Failed(StoreError::other(
-                "Primed on a cache-off driver: drive this machine through the repository's cached route",
-            ))),
             WriteAction::Append {
                 stream_id,
                 expected,
@@ -269,7 +258,7 @@ where
 ///   would only complicate the driver;
 /// - `AppendBatch` → [`append_batch`](EventStore::append_batch),
 ///   reporting [`Appended`](BatchInput::Appended), or mapping a
-///   [`StoreError::Conflict`](StoreError::Conflict) to
+///   [`StoreError::Conflict`] to
 ///   [`Conflict`](BatchInput::Conflict) and anything else to
 ///   [`Failed`](BatchInput::Failed);
 /// - `Done` → stop and return the outcome.
@@ -316,7 +305,10 @@ where
                     let loaded: Result<Vec<EventEnvelope<E>>, StoreError> =
                         store.stream(&stream_id, from).try_collect().await;
                     let input = match loaded {
-                        Ok(events) => BatchInput::Loaded { stream_id: stream_id.clone(), events },
+                        Ok(events) => BatchInput::Loaded {
+                            stream_id: stream_id.clone(),
+                            events,
+                        },
                         Err(error) => BatchInput::Failed(error),
                     };
                     match machine.handle(input) {
@@ -359,10 +351,9 @@ where
                                 // against the wrong stream's state.
                                 let stream = eventyr_core::error::named_conflict_stream(
                                     stream_id,
-                                    machine
-                                        .streams()
-                                        .first()
-                                        .expect("a conflict follows an append to a non-empty boundary"),
+                                    machine.streams().first().expect(
+                                        "a conflict follows an append to a non-empty boundary",
+                                    ),
                                 );
                                 machine.handle(BatchInput::Conflict { stream, current })
                             }
@@ -389,4 +380,3 @@ where
 {
     block_on(drive_write_batch(machine, store))
 }
-

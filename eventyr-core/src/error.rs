@@ -105,7 +105,7 @@ pub fn named_conflict_stream(stream_id: Option<StreamId>, fallback: &StreamId) -
 
 impl<E, S> From<StoreError> for WriteInput<E, S> {
     /// Every store failure travels through the machine as
-    /// [`Failed`](WriteInput::Failed) — except a [`Conflict`], which the
+    /// [`Failed`](WriteInput::Failed) — except a [`Conflict`](StoreError::Conflict), which the
     /// write protocol owns a retry path for
     /// ([`WriteInput::Conflict`]). This is the one place that mapping
     /// exists; a `StoreError` variant that is not retry-shaped lands in
@@ -117,7 +117,6 @@ impl<E, S> From<StoreError> for WriteInput<E, S> {
         }
     }
 }
-
 
 /// A driver violated the machine protocol: fed an input the current phase
 /// does not accept, or drove a finished machine.

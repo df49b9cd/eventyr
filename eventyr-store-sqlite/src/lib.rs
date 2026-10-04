@@ -1,7 +1,7 @@
 //! # eventyr-store-sqlite
 //!
-//! The SQLite [`EventStore`] — the roadmap-0.6.4 reference port: a
-//! second durable, embeddable database proving the [`eventyr-store-testing`]
+//! The SQLite [`EventStore`](eventyr_store::store::EventStore) — the roadmap-0.6.4 reference port: a
+//! second durable, embeddable database proving the `eventyr-store-testing`
 //! contract suite is implementable without a server and without an
 //! async runtime.
 //!
@@ -23,7 +23,6 @@
 
 #[cfg(feature = "snapshots")]
 mod snapshots;
-pub mod codec;
 mod store;
 
 use std::sync::Arc;

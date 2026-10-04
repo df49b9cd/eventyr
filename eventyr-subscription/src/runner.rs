@@ -13,7 +13,7 @@
 
 use core::future::Future;
 
-use eventyr_store::metrics::names::{PROJECTED_EVENTS, PROJECTION_LAG};
+use eventyr_store::metrics::names::{PROJECTED_EVENTS, PROJECTION_FETCH_SPAN};
 
 use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
@@ -151,16 +151,17 @@ where
         action = match action {
             SubscriptionAction::Fetch { from, limit } => {
                 let fetched = source.fetch(from, limit).await;
-                // Lag as a gauge: how far behind the store's tip the
-                // last fetch left us — zero once an empty batch says
-                // "caught up". Reported from the answer the machine is
-                // about to see.
+                // The sequence span this fetch covered: zero on a
+                // caught-up poll.
                 if let Ok(batch) = &fetched {
                     let last = batch
                         .events
                         .last()
                         .map_or(from.as_sequence().as_u64(), |e| e.sequence.as_u64());
-                    metrics.gauge(PROJECTION_LAG, last.saturating_sub(from.as_sequence().as_u64()));
+                    metrics.gauge(
+                        PROJECTION_FETCH_SPAN,
+                        last.saturating_sub(from.as_sequence().as_u64()),
+                    );
                 }
                 match fetched {
                     Ok(batch) => machine.handle(SubscriptionInput::Fetched { batch }),

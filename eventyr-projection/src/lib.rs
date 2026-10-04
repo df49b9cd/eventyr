@@ -20,7 +20,8 @@
 //!
 //! - [`chain::UpcasterChain`] selects an upcaster by
 //!   [`event_type`](eventyr_core::upcast::RawEvent::event_type). A miss
-//!   or a failed upcast is a loud [`UpcastError`], never a skipped
+//!   or a failed upcast is a loud
+//!   [`UpcastError`](eventyr_core::error::UpcastError), never a skipped
 //!   event — silently dropping a stored fact is data loss.
 //! - [`source::UpcastingSource`] adapts any raw
 //!   [`SubscriptionSource`](eventyr_subscription::source::SubscriptionSource)
@@ -134,9 +135,7 @@ pub mod prelude {
 
     pub use crate::chain::{ClosureUpcaster, UpcasterChain};
     pub use crate::rebuild::{RebuildPlan, SchemaCheckpointStore, SchemaVersion, checkpoint_key};
-    pub use crate::registry::{
-        RegistryError, UpcasterRegistry, VersionRung, VersionUpcaster,
-    };
+    pub use crate::registry::{RegistryError, UpcasterRegistry, VersionRung, VersionUpcaster};
     pub use crate::source::{UpcastingSource, VersionedSource};
     pub use crate::view::{InMemoryViewStore, View, ViewProjection, ViewRow, ViewStore};
     pub use eventyr_core::upcast::{RawEvent, Upcaster};

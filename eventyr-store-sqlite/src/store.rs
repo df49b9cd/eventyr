@@ -136,9 +136,13 @@ where
             StoreError::from(corrupt(format!("negative position in the log: {value}")))
         };
         Ok(EventEnvelope {
-            sequence: Sequence::new(u64::try_from(row.global_sequence).map_err(|_| invalid(row.global_sequence))?),
+            sequence: Sequence::new(
+                u64::try_from(row.global_sequence).map_err(|_| invalid(row.global_sequence))?,
+            ),
             stream_id: StreamId::from(row.stream_id),
-            version: Version::new(u64::try_from(row.stream_version).map_err(|_| invalid(row.stream_version))?),
+            version: Version::new(
+                u64::try_from(row.stream_version).map_err(|_| invalid(row.stream_version))?,
+            ),
             event,
             metadata: Metadata::of_ids(row.causation_id, row.correlation_id),
         })
@@ -176,7 +180,8 @@ where
         let mut written = Vec::with_capacity(events.len());
         for (index, new_event) in events.iter().enumerate() {
             let version = current.max(0) as u64 + index as u64 + 1;
-            let payload = serde_json::to_string(&new_event.event).map_err(SqliteStoreError::from)?;
+            let payload =
+                serde_json::to_string(&new_event.event).map_err(SqliteStoreError::from)?;
             tx.execute(
                 "INSERT INTO events (stream_id, stream_version, event_type, payload, causation_id, correlation_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -221,10 +226,7 @@ where
     ) -> Result<Vec<EventEnvelope<E>>, StoreError> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(SqliteStoreError::into_store)?;
-        let mut committed = append_within(
-            &tx,
-            &[(stream_id.clone(), expected, events)],
-        )?;
+        let mut committed = append_within(&tx, &[(stream_id.clone(), expected, events)])?;
         tx.commit().map_err(SqliteStoreError::into_store)?;
         // One stream in the batch: the writes above are the caller's
         // single answer.
@@ -267,16 +269,15 @@ where
             .prepare(&sql)
             .map_err(SqliteStoreError::into_store)
             .and_then(|mut stmt| {
-                stmt.query_map(rusqlite::params![stream_id.as_str(), from.as_u64() as i64], read_row)
-                    .map_err(SqliteStoreError::into_store)?
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .map_err(SqliteStoreError::into_store)
+                stmt.query_map(
+                    rusqlite::params![stream_id.as_str(), from.as_u64() as i64],
+                    read_row,
+                )
+                .map_err(SqliteStoreError::into_store)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(SqliteStoreError::into_store)
             })
-            .map(|rows| {
-                rows.into_iter()
-                    .map(EventEnvelope::try_from)
-                    .collect()
-            })
+            .map(|rows| rows.into_iter().map(EventEnvelope::try_from).collect())
             .unwrap_or_else(|error| vec![Err(error)]);
         iter(events)
     }
@@ -307,11 +308,7 @@ where
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(SqliteStoreError::into_store)
             })
-            .map(|rows| {
-                rows.into_iter()
-                    .map(EventEnvelope::try_from)
-                    .collect()
-            })
+            .map(|rows| rows.into_iter().map(EventEnvelope::try_from).collect())
             .unwrap_or_else(|error| vec![Err(error)]);
         iter(events)
     }

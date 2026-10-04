@@ -127,12 +127,11 @@ pub mod error;
 pub mod event_name;
 pub mod metrics;
 pub mod saga;
-pub mod schema;
-pub mod version_registry;
 pub mod snapshot;
 pub mod subscription;
 pub mod testing;
 pub mod upcast;
+pub mod version_registry;
 pub mod vocabulary;
 pub mod write;
 
@@ -149,11 +148,8 @@ pub mod prelude {
     pub use crate::event_name::EventName;
     pub use crate::metrics::{Metrics, NoopMetrics};
     pub use crate::saga::{Saga, SagaAction, SagaCommand, SagaInput, SagaMachine, SagaOutcome};
-    pub use crate::schema::Persistable;
-    pub use crate::version_registry::{EventSchemaVersion, VersionedRaw};
     pub use crate::snapshot::{
-        HasSnapshotState, InMemorySnapshotCache, OfferSnapshot, Snapshot, SnapshotCache,
-        SnapshotPolicy, WritePolicy,
+        HasSnapshotState, OfferSnapshot, Snapshot, SnapshotPolicy, WritePolicy,
     };
     pub use crate::subscription::{
         Batch, Checkpoint, SubscriptionAction, SubscriptionInput, SubscriptionMachine,
@@ -161,6 +157,7 @@ pub mod prelude {
     };
     pub use crate::testing::{Outcome, Scenario};
     pub use crate::upcast::{RawEvent, Upcaster};
+    pub use crate::version_registry::{EventSchemaVersion, VersionedRaw};
     pub use crate::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
     pub use crate::write::{RetryPolicy, WriteAction, WriteInput, WriteMachine, WriteOutcome};
 

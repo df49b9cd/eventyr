@@ -145,7 +145,6 @@ pub struct UpcasterRegistry {
     by_type: BTreeMap<String, BTreeMap<EventSchemaVersion, Box<dyn VersionUpcaster>>>,
 }
 
-
 impl UpcasterRegistry {
     /// An empty registry.
     pub fn new() -> Self {
@@ -310,8 +309,11 @@ mod tests {
     fn registry_with(event_type: &str, rungs: &[(u32, RungFn)]) -> UpcasterRegistry {
         let mut registry = UpcasterRegistry::new();
         for &(from, step) in rungs {
-            let (next, _previous) =
-                registry.with(event_type, EventSchemaVersion::new(from), VersionRung::new(step));
+            let (next, _previous) = registry.with(
+                event_type,
+                EventSchemaVersion::new(from),
+                VersionRung::new(step),
+            );
             registry = next;
         }
         registry
@@ -351,7 +353,6 @@ mod tests {
             b"tick"
         );
     }
-
 
     #[test]
     fn a_newer_stored_version_is_loud_never_dropped() {

@@ -9,14 +9,14 @@ use crate::version_registry::EventSchemaVersion;
 /// A stored event before upcasting: its type name, payload, and the
 /// schema version it was written at.
 ///
-/// The registry ([`crate::registry`]) reads `schema_version` to walk the
+/// The upcaster registry (`eventyr-projection`'s `registry`) reads `schema_version` to walk the
 /// event type's version ladder; a stored event that predates versioning
-/// carries [`SchemaVersion::V1`], the shape the code started with.
+/// carries [`EventSchemaVersion::V1`], the shape the code started with.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RawEvent {
     /// The stored event type name.
     pub event_type: String,
-    /// The schema version `payload` was written at. [`SchemaVersion::V1`]
+    /// The schema version `payload` was written at. [`EventSchemaVersion::V1`]
     /// for payloads that predate versioning.
     pub schema_version: EventSchemaVersion,
     /// The stored payload, as raw bytes.

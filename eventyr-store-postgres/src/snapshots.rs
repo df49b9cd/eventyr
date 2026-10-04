@@ -1,4 +1,5 @@
-//! The [`SnapshotStore`] implementation over the `snapshots` table
+//! The [`SnapshotStore`](eventyr_store::snapshot_store::SnapshotStore)
+//! implementation over the `snapshots` table
 //! (migration `0002_snapshots`), behind the `snapshots` feature.
 //!
 //! A [`PgSnapshotStore`] is its own handle, generic in the *state* type
@@ -28,7 +29,8 @@ struct SnapshotRow {
     payload: serde_json::Value,
 }
 
-/// The Postgres [`SnapshotStore`]: one row per stream, over the same
+/// The Postgres [`SnapshotStore`](eventyr_store::snapshot_store::SnapshotStore):
+/// one row per stream, over the same
 /// pool as the event log.
 ///
 /// Generic in the snapshot's state type, free of the event store's

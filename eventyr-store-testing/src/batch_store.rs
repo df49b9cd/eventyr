@@ -29,7 +29,11 @@ fn append<E: ContractEvent>(
     StreamAppend {
         stream_id: StreamId::from(stream),
         expected,
-        events: events.iter().copied().map(|v| NewEvent::new(E::from(v))).collect(),
+        events: events
+            .iter()
+            .copied()
+            .map(|v| NewEvent::new(E::from(v)))
+            .collect(),
     }
 }
 
@@ -165,15 +169,14 @@ where
         ],
     ))
     .expect("batch commits");
-    let all: Vec<_> = block_on(store.stream_all(Sequence::new(0)).try_collect::<Vec<_>>())
-        .expect("global read");
+    let all: Vec<_> =
+        block_on(store.stream_all(Sequence::new(0)).try_collect::<Vec<_>>()).expect("global read");
     // The batch's events land contiguously, in input order.
     assert_eq!(
         all.iter().map(|e| e.sequence).collect::<Vec<_>>(),
         vec![Sequence::new(1), Sequence::new(2), Sequence::new(3)]
     );
 }
-
 
 #[cfg(test)]
 mod tests {

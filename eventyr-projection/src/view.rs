@@ -222,7 +222,12 @@ impl<V: Clone + Send + Sync> ViewStore<V> for InMemoryViewStore<V> {
             .cloned())
     }
 
-    async fn save(&self, view_name: &str, view_id: &str, row: ViewRow<V>) -> Result<(), StoreError> {
+    async fn save(
+        &self,
+        view_name: &str,
+        view_id: &str,
+        row: ViewRow<V>,
+    ) -> Result<(), StoreError> {
         let mut guard = self
             .inner
             .lock()
@@ -269,7 +274,14 @@ mod tests {
         }
     }
 
-    fn projection(store: InMemoryViewStore<Balance>) -> ViewProjection<Balance, InMemoryViewStore<Balance>, impl Fn(&EventEnvelope<u64>) -> Option<String>, u64> {
+    fn projection(
+        store: InMemoryViewStore<Balance>,
+    ) -> ViewProjection<
+        Balance,
+        InMemoryViewStore<Balance>,
+        impl Fn(&EventEnvelope<u64>) -> Option<String>,
+        u64,
+    > {
         ViewProjection::new("balance", store, |event: &EventEnvelope<u64>| {
             Some(event.stream_id.as_str().to_owned())
         })
@@ -278,22 +290,32 @@ mod tests {
     #[tokio::test]
     async fn events_fold_into_rows_per_key() {
         let mut view = projection(InMemoryViewStore::new());
-        view.apply(&envelope(1, "account-1", 10)).await.expect("fold");
-        view.apply(&envelope(2, "account-2", 7)).await.expect("fold");
-        view.apply(&envelope(3, "account-1", 5)).await.expect("fold");
+        view.apply(&envelope(1, "account-1", 10))
+            .await
+            .expect("fold");
+        view.apply(&envelope(2, "account-2", 7))
+            .await
+            .expect("fold");
+        view.apply(&envelope(3, "account-1", 5))
+            .await
+            .expect("fold");
 
         let one = ProjectionRow::load(&view, "account-1").await.expect("load");
-        assert_eq!(one.0 .0, 15, "10 + 5 folded");
+        assert_eq!(one.0.0, 15, "10 + 5 folded");
         assert_eq!(one.1, Sequence::new(3));
     }
 
     #[tokio::test]
     async fn a_redelivered_event_is_absorbed() {
         let mut view = projection(InMemoryViewStore::new());
-        view.apply(&envelope(1, "account-1", 10)).await.expect("fold");
+        view.apply(&envelope(1, "account-1", 10))
+            .await
+            .expect("fold");
         // ApplyFailed boundary: the event redelivers under the same
         // sequence. The row's guard absorbs it.
-        view.apply(&envelope(1, "account-1", 10)).await.expect("replay");
+        view.apply(&envelope(1, "account-1", 10))
+            .await
+            .expect("replay");
 
         let (value, version) = ProjectionRow::load(&view, "account-1").await.expect("load");
         assert_eq!(value.0, 10, "replayed, not double-folded");
@@ -314,7 +336,9 @@ mod tests {
                     .then(|| event.stream_id.as_str().to_owned())
             },
         );
-        view.apply(&envelope(1, "gingerbread-1", 10)).await.expect("pass");
+        view.apply(&envelope(1, "gingerbread-1", 10))
+            .await
+            .expect("pass");
         assert!(ProjectionRow::load(&view, "gingerbread-1").await.is_none());
     }
 
@@ -323,7 +347,12 @@ mod tests {
 
     impl ProjectionRow {
         async fn load(
-            view: &ViewProjection<Balance, InMemoryViewStore<Balance>, impl Fn(&EventEnvelope<u64>) -> Option<String>, u64>,
+            view: &ViewProjection<
+                Balance,
+                InMemoryViewStore<Balance>,
+                impl Fn(&EventEnvelope<u64>) -> Option<String>,
+                u64,
+            >,
             key: &str,
         ) -> Option<(Balance, Sequence)> {
             view.store()

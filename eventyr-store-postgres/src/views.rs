@@ -79,12 +79,15 @@ where
         }))
     }
 
-    async fn save(&self, view_name: &str, view_id: &str, row: ViewRow<V>) -> Result<(), StoreError> {
+    async fn save(
+        &self,
+        view_name: &str,
+        view_id: &str,
+        row: ViewRow<V>,
+    ) -> Result<(), StoreError> {
         let payload = serde_json::to_value(&row.value).map_err(PgStoreError::from)?;
         let version = i64::try_from(row.version.as_u64()).map_err(|_| {
-            StoreError::from(PgStoreError::CorruptRow(
-                "view version beyond i64".into(),
-            ))
+            StoreError::from(PgStoreError::CorruptRow("view version beyond i64".into()))
         })?;
         // Newest wins, atomically: a replayed event's row lands behind
         // and affects zero rows.

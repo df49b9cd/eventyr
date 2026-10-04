@@ -133,7 +133,7 @@ pub trait Optional: Default {
     /// event folded after.
     type Event;
     /// Fold one event into an existing state (pure and total, like
-    /// [`Aggregate::apply`](Aggregate::apply)).
+    /// [`Aggregate::apply`]).
     fn apply(state: &mut Self, event: &Self::Event);
 
     /// Fold one event into an `Option<Self>` state: `None` becomes
@@ -145,4 +145,3 @@ pub trait Optional: Default {
         Self::apply(state, event);
     }
 }
-

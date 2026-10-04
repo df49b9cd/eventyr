@@ -29,7 +29,7 @@
 //! All of it is transaction-atomic: one `WriteTransaction` checks the
 //! head, writes every event into both keyspaces, advances the head,
 //! and commits — so appends are all-or-nothing exactly as
-//! [`EventStore::append`] promises, and `stream_all` never observes a
+//! [`EventStore::append`](eventyr_store::store::EventStore::append) promises, and `stream_all` never observes a
 //! partial batch.
 //!
 //! [`EventStore`]: eventyr_store::store::EventStore
@@ -42,7 +42,6 @@
 
 #![warn(missing_docs)]
 
-pub mod codec;
 #[cfg(feature = "snapshots")]
 pub mod snapshots;
 mod store;

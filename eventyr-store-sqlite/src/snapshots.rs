@@ -33,7 +33,9 @@ impl<S> SqliteSnapshotStore<S> {
     pub fn new<E>(store: &SqliteStore<E>) -> Result<Self, SqliteStoreError> {
         let conn = store.conn();
         conn.lock()
-            .map_err(|e| SqliteStoreError::CorruptRow(format!("snapshot open: lock poisoned: {e}")))?
+            .map_err(|e| {
+                SqliteStoreError::CorruptRow(format!("snapshot open: lock poisoned: {e}"))
+            })?
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS snapshots (
                     stream_id   TEXT    PRIMARY KEY,
@@ -56,7 +58,10 @@ where
     type State = S;
 
     async fn load(&self, stream_id: &StreamId) -> Result<Option<Snapshot<S>>, StoreError> {
-        let conn = self.conn.lock().map_err(|e| StoreError::other(format!("snapshot lock poisoned: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::other(format!("snapshot lock poisoned: {e}")))?;
         let mut stmt = conn
             .prepare("SELECT version, payload FROM snapshots WHERE stream_id = ?1")
             .map_err(SqliteStoreError::into_store)?;
@@ -66,7 +71,9 @@ where
             })
             .optional()
             .map_err(SqliteStoreError::into_store)?;
-        let Some((version, payload)) = row else { return Ok(None) };
+        let Some((version, payload)) = row else {
+            return Ok(None);
+        };
         let version = u64::try_from(version).map_err(|_| {
             StoreError::from(SqliteStoreError::CorruptRow(format!(
                 "negative snapshot version: {version}"
@@ -91,7 +98,10 @@ where
                 "snapshot version beyond i64".into(),
             ))
         })?;
-        let conn = self.conn.lock().map_err(|e| StoreError::other(format!("snapshot lock poisoned: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::other(format!("snapshot lock poisoned: {e}")))?;
         // Newest wins: a stale offer's UPDATE never matches, so the row
         // cannot regress.
         conn.execute(

@@ -4,11 +4,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use eventyr_core::batch::{
-    AggregateFold, BatchDecision, BatchMachine, Decide, Fold,
-};
+use eventyr_core::batch::{AggregateFold, BatchDecision, BatchMachine, Decide, Fold};
 use eventyr_core::prelude::*;
-use eventyr_core::testing::account::{Account, AccountCommand, AccountError, AccountEvent, AccountId, AccountState};
+use eventyr_core::testing::account::{
+    Account, AccountCommand, AccountError, AccountEvent, AccountId, AccountState,
+};
 use eventyr_store::prelude::*;
 use futures::TryStreamExt;
 
@@ -134,7 +134,10 @@ async fn a_transfer_commits_atomically_across_two_streams() {
         .expect("read");
     // from: opened, deposited 10, withdrawn 5.
     assert_eq!(from.len(), 3);
-    assert!(matches!(from[2].event, AccountEvent::Withdrawn { amount: 5 }));
+    assert!(matches!(
+        from[2].event,
+        AccountEvent::Withdrawn { amount: 5 }
+    ));
     // to: opened, deposited 5.
     assert_eq!(to.len(), 2);
     assert!(matches!(to[1].event, AccountEvent::Deposited { amount: 5 }));
