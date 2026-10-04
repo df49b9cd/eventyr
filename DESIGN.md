@@ -41,7 +41,7 @@ eventyr/                    # umbrella: re-exports core + prelude
 
 `Metadata.timestamp` is the one concession: `Option<OffsetDateTime>` exists only behind `eventyr-core`'s `time` feature (off in core, on in the umbrella) — without it the field is absent and timestamps travel as opaque metadata.
 
-Feature flags on the umbrella crate mirror the crates: `macros` (default), `store` (default), `postgres`, `projection`, `subscription`. This is the `eventcore`/`eventide` workspace pattern — it keeps the core dependency-free and lets users pay only for what they use.
+Feature flags on the umbrella crate mirror the crates: `macros` (default), `store` (default), `postgres`, `snapshots` (the Postgres snapshot store), `projection`, `subscription`. This is the `eventcore`/`eventide` workspace pattern — it keeps the core dependency-free and lets users pay only for what they use.
 
 ## 4. Core: domain & protocol vocabulary (eventyr-core)
 
@@ -338,9 +338,10 @@ Where machines live in Eventyr (this table is the single source for each machine
 
 | Machine | Input | Output (actions) | Protocol |
 |---|---|---|---|
-| `WriteMachine` | `Loaded`/`Appended`/`Conflict`/`Failed` | `LoadStream`/`Append`/`Done` | load→fold→decide→append, conflict retry |
+| `WriteMachine` | `Loaded`/`SnapshotLoaded`/`Appended`/`Conflict`/`Failed` | `LoadStream`/`LoadSnapshot`/`Append`/`Done` | load→fold→decide→append, conflict retry; with `with_snapshots`, snapshot-load then delta-load, monotonicity-guarded, and a fire-and-forget snapshot offer on `Committed` |
 | `ProjectorMachine` | `Batch`/`ApplyFailed`/`AckFailed` | `Apply`/`Ack`/`Sleep`/`Done` | at-least-once apply, checkpoint, resume |
-| `SnapshotMachine` (0.3) | `Loaded`/`Appended` | `LoadSnapshot`/`LoadDelta`/`Append` | snapshot + delta rebuild |
+
+Snapshots deliberately did **not** become their own machine: the §7 table's planned `SnapshotMachine` was folded into `WriteMachine::with_snapshots` as an opt-in preload, because the write protocol (load→decide→append→retry) is the same interaction either way — snapshot loading is just an initial skip-ahead in the same fold, and snapshot saving is a fire-and-forget offer on the commit outcome, not a new machine phase.
 
 Formally, the aggregate is itself a single-step state machine — `apply` *is* its transition function, `decide` its output function. Eventyr reserves the word *machine* for multi-step, driver-facing **interaction protocols** around the domain: many round-trips with the outside world, not one pure step. The distinction is step count, not formal kind.
 
@@ -399,7 +400,7 @@ The `UNIQUE` constraint's backing index serves the per-stream lookups; no separa
 
 - **0.1** — shipped. Core traits + protocol vocabulary, `WriteMachine` with transition tests, in-memory store, async + scripted drivers, repository wrapper, derive macros.
 - **0.2** — partially shipped: Postgres store + migrations (`eventyr-store-postgres`), upcasters (upcast vocabulary in core, chains and raw→typed sources in `eventyr-projection`), checkpointed subscriptions (`SubscriptionMachine`, the projector runner). Also shipped: `TestScenario` (`Scenario`/`Outcome` in `eventyr_core::testing`).
-- **0.3** — partially shipped: the projection read path (upcaster chains, schema-versioned rebuilds), `EventBus` trait (behind `eventyr-subscription`'s `bus` feature). Pending: snapshot support (opt-in, `SnapshotMachine`). Single-feed fan-out to N projections on one checkpoint, if ever built, is a combinator over the existing `SubscriptionMachine` (`Fanout` multiplexing the one `Apply` action to N idempotent members) — never a new machine, and deferred until a "must advance together" use case justifies it.
+- **0.3** — partially shipped: the projection read path (upcaster chains, schema-versioned rebuilds), `EventBus` trait (behind `eventyr-subscription`'s `bus` feature). Also shipped: snapshot support, opt-in per repository — `SnapshotPolicy`/`WritePolicy` and `WriteMachine::with_snapshots` in core (one `LoadSnapshot` action, delta `LoadStream`, the snapshot-version monotonicity guard in the fold, and the fire-and-forget `OfferSnapshot` on `WriteOutcome::Committed`), `SnapshotStore` + `InMemorySnapshotStore` and `AggregateRepository::with_snapshots` in `eventyr-store`, the `snapshots` table/persistence in `eventyr-store-postgres` behind its `snapshots` feature, mirrored by the umbrella's `snapshots` feature. Single-feed fan-out to N projections on one checkpoint, if ever built, is a combinator over the existing `SubscriptionMachine` (`Fanout` multiplexing the one `Apply` action to N idempotent members) — never a new machine, and deferred until a "must advance together" use case justifies it.
 - **0.4+** — multi-stream commands (eventcore-style), embedded stores (fjall/sled) + the blocking driver, contract-test crate.
 
 Multi-stream commands deliberately come *last*: they complicate the mental model, and Eventyr's identity is "small, composable, boring in the good way". Ship the single-stream core first; add `StreamResolver`-style dynamic boundaries once the core is proven.

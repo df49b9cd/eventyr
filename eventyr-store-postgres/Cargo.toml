@@ -15,6 +15,9 @@ default = []
 # Populates `Metadata::timestamp` from `created_at`. Turns on core's
 # `time` field and sqlx's `OffsetDateTime` decode.
 time = ["eventyr-core/time", "sqlx/time", "dep:time"]
+# The `SnapshotStore` implementation over the `snapshots` migration.
+# Off by default: stores that only want the event log pay nothing.
+snapshots = []
 
 [dependencies]
 eventyr-core = { workspace = true, features = ["serde"] }

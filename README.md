@@ -122,7 +122,7 @@ let repository = AggregateRepository::<Account, _>::new(
 // Open, then deposit: the second call folds the first's event.
 repository.execute(AccountId(1), AccountCommand::Open).await.expect("open");
 match repository.execute(AccountId(1), AccountCommand::Deposit { amount: 50 }).await {
-    Ok(ExecutionOutcome::Committed(events)) => assert_eq!(events.len(), 1),
+    Ok(ExecutionOutcome::Committed { committed: events, .. }) => assert_eq!(events.len(), 1),
     Ok(ExecutionOutcome::Noop) => panic!("a deposit decides an event"),
     Err(_) => panic!("the deposit must commit"),
 }

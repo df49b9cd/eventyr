@@ -94,7 +94,7 @@
 //!
 //! // The store commits; the machine is done.
 //! let action = machine.handle(WriteInput::Appended { committed: vec![] });
-//! let WriteAction::Done(WriteOutcome::Committed(_)) = action else {
+//! let WriteAction::Done(WriteOutcome::Committed { .. }) = action else {
 //!     unreachable!()
 //! };
 //! ```
@@ -124,6 +124,7 @@ pub mod aggregate;
 pub mod envelope;
 pub mod error;
 pub mod event_name;
+pub mod snapshot;
 pub mod subscription;
 pub mod testing;
 pub mod upcast;
@@ -137,6 +138,9 @@ pub mod prelude {
     pub use crate::envelope::{EventEnvelope, Metadata, NewEvent};
     pub use crate::error::{ProtocolError, StoreError, UpcastError};
     pub use crate::event_name::EventName;
+    pub use crate::snapshot::{
+        HasSnapshotState, OfferSnapshot, Snapshot, SnapshotPolicy, WritePolicy,
+    };
     pub use crate::subscription::{
         Batch, Checkpoint, SubscriptionAction, SubscriptionInput, SubscriptionMachine,
         SubscriptionOutcome, SubscriptionPolicy,

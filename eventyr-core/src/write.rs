@@ -9,27 +9,58 @@
 //! expectations — and never does I/O itself, so a retry bug reproduces
 //! in a unit test with a `Vec` of inputs (see
 //! [`drive_scripted`](crate::testing::drive_scripted)).
+//!
+//! Snapshots are opt-in via [`WriteMachine::with_snapshots`]. When off
+//! (the default snapshot channel `S = ()`), the protocol is exactly the
+//! pre-snapshot one: `start()` emits [`LoadStream`](WriteAction::LoadStream)
+//! and the outcome carries no snapshot. When on, `start()` emits
+//! [`LoadSnapshot`](WriteAction::LoadSnapshot), the driver answers with
+//! the newest stored snapshot (if any), the machine adopts its state,
+//! folds only the post-snapshot delta it then loads — the contiguity
+//! check is the snapshot-version monotonicity guard — and on commit,
+//! when the [`SnapshotPolicy`](crate::snapshot::SnapshotPolicy) fires,
+//! offers the driver a [`Snapshot`](crate::snapshot::Snapshot) on the
+//! [`Committed`](WriteOutcome::Committed) outcome. Fire-and-forget: the
+//! driver may persist it; persistence is not part of the protocol, and
+//! a skipped save never turns into a store failure.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::marker::PhantomData;
 
 use crate::aggregate::Aggregate;
 use crate::envelope::{EventEnvelope, NewEvent};
 use crate::error::{ProtocolError, StoreError};
+use crate::snapshot::{HasSnapshotState, OfferSnapshot, Snapshot, SnapshotPolicy};
 use crate::vocabulary::{ExpectedVersion, StreamId, Version};
 
 /// What the machine wants the driver to do.
 ///
 /// Actions are data, not calls: the driver interprets each variant,
 /// performs the I/O, and reports back with a [`WriteInput`].
+///
+/// `S` is the snapshot channel: `()` on a plain machine, `A::State` on
+/// one built by [`with_snapshots`](WriteMachine::with_snapshots).
+/// Splitting it off the aggregate keeps the snapshot-off path — types
+/// *and* bounds — exactly what it was before snapshots existed.
 #[derive(Clone, Debug)]
-pub enum WriteAction<E, Err> {
+pub enum WriteAction<E, Err, S = ()> {
     /// Read the stream from `from` (exclusive) to rebuild state.
     LoadStream {
         /// The stream to read.
         stream_id: StreamId,
         /// Exclusive lower bound on the event version.
         from: Version,
+    },
+    /// Read the newest persisted snapshot for the stream.
+    ///
+    /// The very first action of a snapshots-on machine. Answered by
+    /// [`SnapshotLoaded`](WriteInput::SnapshotLoaded): `None` when the
+    /// store has none, `Some` otherwise. A snapshot whose `stream_id`
+    /// does not match the machine's is a protocol violation.
+    LoadSnapshot {
+        /// The stream to read the snapshot for.
+        stream_id: StreamId,
     },
     /// Append events, guarded by the expected version.
     ///
@@ -44,18 +75,30 @@ pub enum WriteAction<E, Err> {
         events: Vec<NewEvent<E>>,
     },
     /// Terminal: the interaction's outcome.
-    Done(WriteOutcome<E, Err>),
+    Done(WriteOutcome<E, Err, S>),
 }
 
 /// What the driver reports back to the machine.
 #[derive(Clone, Debug)]
-pub enum WriteInput<E> {
+pub enum WriteInput<E, S = ()> {
     /// The stream read completed. Events must belong to the requested
     /// stream and continue the sequence contiguously from where the
-    /// machine last folded.
+    /// machine last folded — after a snapshot load that is the
+    /// snapshot's version, which makes the contiguity check double as
+    /// the snapshot-version monotonicity guard.
     Loaded {
         /// The events read, in stream order.
         events: Vec<EventEnvelope<E>>,
+    },
+    /// The snapshot read completed: the newest persisted snapshot for
+    /// the stream, or `None` when the store has none.
+    ///
+    /// Accepted only as the answer to
+    /// [`LoadSnapshot`](WriteAction::LoadSnapshot); anywhere else it is
+    /// a protocol violation.
+    SnapshotLoaded {
+        /// The snapshot the store has, if any.
+        snapshot: Option<Snapshot<S>>,
     },
     /// The append committed.
     Appended {
@@ -68,16 +111,31 @@ pub enum WriteInput<E> {
         /// The stream's actual version at append time.
         current: Version,
     },
-    /// A store operation failed.
+    /// A store operation failed — a stream read, an append, or a
+    /// snapshot read. (A snapshot read failing fails the interaction:
+    /// the store just told the machine its reads are broken.)
     Failed(StoreError),
 }
 
-/// The terminal outcome of a driven write machine.
+/// The terminal outcome of a driven write machine .
 #[derive(Clone, Debug)]
-pub enum WriteOutcome<E, Err> {
+pub enum WriteOutcome<E, Err, S = ()> {
     /// The events were committed; the envelopes are as the store
     /// recorded them.
-    Committed(Vec<EventEnvelope<E>>),
+    ///
+    /// `snapshot` is the fire-and-forget post-commit offer: `Some` when
+    /// the machine ran with snapshots on and the [`SnapshotPolicy`]
+    /// fired for this commit, `None` otherwise. Its state is the
+    /// folded state *including* the committed events, at the committed
+    /// version. Persisting it — or declining to — never changes the
+    /// committed outcome; snapshots are read-side shortcuts, not the
+    /// source of truth.
+    Committed {
+        /// The committed events as the store recorded them.
+        committed: Vec<EventEnvelope<E>>,
+        /// The post-commit snapshot offer, when the policy fired.
+        snapshot: Option<OfferSnapshot<S>>,
+    },
     /// The command decided no events; nothing was appended.
     Noop,
     /// The domain rejected the command.
@@ -115,6 +173,9 @@ impl Default for RetryPolicy {
 /// Which input the machine is waiting for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
+    /// Waiting for `SnapshotLoaded` — only on a snapshots-on machine,
+    /// only as its first phase.
+    LoadingSnapshot,
     /// Waiting for `Loaded`.
     Loading,
     /// Waiting for `Appended`/`Conflict`/`Failed`.
@@ -122,6 +183,48 @@ enum Phase {
     /// Terminal.
     Done,
 }
+
+/// Snapshot bookkeeping, generic in the state channel so an
+/// off-machine's snapshots are zero-sized.
+///
+/// The loaded snapshot's *state* is adopted into `folded` the moment
+/// the answer arrives; what the machine needs afterwards is only the
+/// baseline version the fold started from, for the cadence.
+#[derive(Clone, Copy, Debug)]
+enum Snapshots {
+    /// Snapshots are off: the pre-snapshot machine, byte-for-byte.
+    Off,
+    /// Snapshots are on. One `LoadSnapshot` per interaction: issued at
+    /// `start`, answered exactly once; conflict retries afterwards
+    /// reload only the event delta — never a second snapshot.
+    On {
+        /// The version the fold started from: the loaded snapshot's
+        /// version, or [`Version::EMPTY`] when the store had none.
+        base_version: Version,
+        /// The cadence policy the commit path consults.
+        policy: SnapshotPolicy,
+    },
+}
+
+impl Snapshots {
+    fn policy(&self) -> Option<SnapshotPolicy> {
+        match self {
+            Self::Off => None,
+            Self::On { policy, .. } => Some(*policy),
+        }
+    }
+
+    fn base_version(&self) -> Version {
+        match self {
+            Self::Off => Version::EMPTY,
+            Self::On { base_version, .. } => *base_version,
+        }
+    }
+}
+
+/// Fold committed events into a snapshot-channel state. Stored on the
+/// machine only when snapshots are on (where `S = A::State`).
+type FoldCommitted<A, S> = fn(&mut S, &[EventEnvelope<<A as Aggregate>::Event>]);
 
 /// The sans-IO machine behind command execution: load → fold → decide →
 /// append, with conflict retry.
@@ -132,52 +235,131 @@ enum Phase {
 /// reloads only the delta since the version it folded, re-folds, and
 /// re-decides against fresh state.
 ///
+/// `S` is the snapshot channel: `()` (the default) on a plain machine,
+/// `A::State` on one built by
+/// [`with_snapshots`](WriteMachine::with_snapshots). The machine stays
+/// fully generic over `S`: crossing from `A::State` to `S` is what the
+/// two hooks [`with_snapshots`](WriteMachine::with_snapshots) installs
+/// are for, so no `Clone` bound reaches the snapshot-off protocol.
+///
 /// Machines never panic on bad input: a driver that feeds the wrong
 /// input for the current phase, or drives a finished machine, gets
 /// [`Done`](WriteAction::Done) with
 /// [`Failed(StoreError::Other(ProtocolError))`](WriteOutcome::Failed).
-pub struct WriteMachine<A: Aggregate> {
+pub struct WriteMachine<A: Aggregate, S = ()> {
     stream_id: StreamId,
     command: A::Command,
     retry_policy: RetryPolicy,
+    snapshots: Snapshots,
     retries_used: u32,
     phase: Phase,
     folded: A::State,
+    /// The stream version the machine has folded up to — the loaded
+    /// snapshot's version first, then each folded event's. Monotone
+    /// across an interaction.
     version: Version,
+    /// Adopt the loaded snapshot's state as the fold's starting point.
+    /// Set only on a snapshots-on machine (there `S = A::State`, so the
+    /// hook is a plain move). `None` — unreachable — otherwise.
+    adopt_snapshot: Option<fn(&mut A::State, S)>,
+    /// Fold committed events into a snapshot-channel state, so the
+    /// post-commit offer carries the state *at* the committed version.
+    fold_committed: Option<FoldCommitted<A, S>>,
+    /// Clone the folded state into the snapshot channel, for the
+    /// post-commit offer. Same installation rule as `adopt_snapshot`.
+    materialize: Option<fn(&A::State) -> S>,
+    _channel: PhantomData<fn() -> S>,
 }
 
-impl<A: Aggregate> WriteMachine<A> {
+impl<A: Aggregate> WriteMachine<A, ()> {
     /// Begin an interaction: `id` identifies the aggregate instance,
     /// `command` is what to decide, `retry_policy` bounds conflict
-    /// retries.
+    /// retries. Snapshots are off — the protocol is exactly the
+    /// pre-snapshot one.
     pub fn new(id: A::Id, command: A::Command, retry_policy: RetryPolicy) -> Self {
         Self {
             stream_id: StreamId::for_aggregate::<A>(&id),
             command,
             retry_policy,
+            snapshots: Snapshots::Off,
             retries_used: 0,
             phase: Phase::Loading,
             folded: A::initial(&id),
             version: Version::EMPTY,
+            adopt_snapshot: None,
+            fold_committed: None,
+            materialize: None,
+            _channel: PhantomData,
         }
     }
+}
 
-    /// The first action: read the stream. Idempotent until the first
-    /// [`handle`](Self::handle).
-    pub fn start(&mut self) -> WriteAction<A::Event, A::Error> {
-        if self.phase != Phase::Loading {
-            return self.violation("start() on a machine that already progressed");
+impl<A> WriteMachine<A, A::State>
+where
+    A: HasSnapshotState,
+    A::State: Clone,
+{
+    /// Begin an interaction whose load may start from a stored snapshot
+    /// and whose commit may offer one.
+    ///
+    /// Same call shape as [`new`](WriteMachine::new), plus a
+    /// [`SnapshotPolicy`]. Bound on [`HasSnapshotState`]: an aggregate
+    /// opts into snapshots by having a `Clone`-able state — the write
+    /// protocol and its drivers stay free of snapshot concern
+    /// everywhere else.
+    pub fn with_snapshots(
+        id: A::Id,
+        command: A::Command,
+        retry_policy: RetryPolicy,
+        policy: SnapshotPolicy,
+    ) -> Self {
+        Self {
+            stream_id: StreamId::for_aggregate::<A>(&id),
+            command,
+            retry_policy,
+            snapshots: Snapshots::On {
+                base_version: Version::EMPTY,
+                policy,
+            },
+            retries_used: 0,
+            phase: Phase::LoadingSnapshot,
+            folded: A::initial(&id),
+            version: Version::EMPTY,
+            adopt_snapshot: Some(|folded, state| *folded = state),
+            fold_committed: Some(|state, committed| {
+                for envelope in committed {
+                    A::apply(state, &envelope.event);
+                }
+            }),
+            materialize: Some(Clone::clone),
+            _channel: PhantomData,
         }
-        WriteAction::LoadStream {
-            stream_id: self.stream_id.clone(),
-            from: self.version,
+    }
+}
+
+impl<A: Aggregate, S> WriteMachine<A, S> {
+    /// The first action: a snapshot read on a snapshots-on machine (the
+    /// driver answers with the newest stored snapshot, if any), else a
+    /// full stream read. Idempotent until the first
+    /// [`handle`](Self::handle).
+    pub fn start(&mut self) -> WriteAction<A::Event, A::Error, S> {
+        match self.phase {
+            Phase::LoadingSnapshot => WriteAction::LoadSnapshot {
+                stream_id: self.stream_id.clone(),
+            },
+            Phase::Loading => WriteAction::LoadStream {
+                stream_id: self.stream_id.clone(),
+                from: self.version,
+            },
+            _ => self.violation("start() on a machine that already progressed"),
         }
     }
 
     /// Consume a driver result, transition, and emit the next action.
-    pub fn handle(&mut self, input: WriteInput<A::Event>) -> WriteAction<A::Event, A::Error> {
+    pub fn handle(&mut self, input: WriteInput<A::Event, S>) -> WriteAction<A::Event, A::Error, S> {
         match input {
             WriteInput::Loaded { events } => self.on_loaded(events),
+            WriteInput::SnapshotLoaded { snapshot } => self.on_snapshot_loaded(snapshot),
             WriteInput::Appended { committed } => self.on_appended(committed),
             WriteInput::Conflict { current } => self.on_conflict(current),
             WriteInput::Failed(error) => self.on_failed(error),
@@ -189,7 +371,8 @@ impl<A: Aggregate> WriteMachine<A> {
         &self.stream_id
     }
 
-    /// The version folded so far.
+    /// The version folded so far (the loaded snapshot's version, plus
+    /// the events folded on top of it).
     pub fn version(&self) -> Version {
         self.version
     }
@@ -199,15 +382,62 @@ impl<A: Aggregate> WriteMachine<A> {
         self.phase == Phase::Done
     }
 
+    fn on_snapshot_loaded(
+        &mut self,
+        snapshot: Option<Snapshot<S>>,
+    ) -> WriteAction<A::Event, A::Error, S> {
+        if self.phase != Phase::LoadingSnapshot {
+            return self.violation("`SnapshotLoaded` outside the snapshot-loading phase");
+        }
+        let Snapshots::On { base_version, .. } = &mut self.snapshots else {
+            // Unreachable by construction (a snapshots-off machine never
+            // enters `LoadingSnapshot`); defended per machine rule 4.
+            return self.violation("`SnapshotLoaded` on a snapshots-off machine");
+        };
+        if let Some(snapshot) = snapshot {
+            if snapshot.stream_id != self.stream_id {
+                return self.violation("`SnapshotLoaded` delivered a snapshot for another stream");
+            }
+            // The monotonicity guard the protocol states: a snapshot
+            // claims to cover the stream up to `version`, so adopting
+            // it must never move the fold backwards. At this phase the
+            // fold is at `Version::EMPTY`, but the check is the stated
+            // invariant, not an optimization.
+            if snapshot.version < self.version {
+                return self.violation("`SnapshotLoaded` is older than the state already folded");
+            }
+            let adopt = self
+                .adopt_snapshot
+                .expect("a snapshots-on machine installs the adopt hook");
+            adopt(&mut self.folded, snapshot.state);
+            self.version = snapshot.version;
+            *base_version = snapshot.version;
+        }
+        self.phase = Phase::Loading;
+        // Fold only the post-snapshot delta: from the snapshot's version
+        // when one loaded, from the beginning otherwise.
+        WriteAction::LoadStream {
+            stream_id: self.stream_id.clone(),
+            from: self.version,
+        }
+    }
+
     fn on_loaded(
         &mut self,
         events: Vec<EventEnvelope<A::Event>>,
-    ) -> WriteAction<A::Event, A::Error> {
+    ) -> WriteAction<A::Event, A::Error, S> {
         if self.phase != Phase::Loading {
             return self.violation("`Loaded` outside the loading phase");
         }
-        // Validate while folding: the events must belong to this stream
-        // and continue the sequence contiguously from the folded version.
+        // Validate while folding: events must belong to this stream and
+        // continue the sequence contiguously from the folded version —
+        // which, after a snapshot load, *is* the snapshot's version.
+        // This is where the snapshot-version monotonicity guard bites:
+        // a snapshot ahead of the stream's tip makes the first delta
+        // event's version discontinuous (violation), and a store that
+        // simply has fewer events than the snapshot claims fails later
+        // at the append expectation — never as silently folded-over
+        // state: the machine only decides on folds it can defend.
         let mut expected = self.version.as_u64().saturating_add(1);
         for envelope in events {
             if envelope.stream_id != self.stream_id {
@@ -226,15 +456,46 @@ impl<A: Aggregate> WriteMachine<A> {
     fn on_appended(
         &mut self,
         committed: Vec<EventEnvelope<A::Event>>,
-    ) -> WriteAction<A::Event, A::Error> {
+    ) -> WriteAction<A::Event, A::Error, S> {
         if self.phase != Phase::Appending {
             return self.violation("`Appended` outside the appending phase");
         }
         self.phase = Phase::Done;
-        WriteAction::Done(WriteOutcome::Committed(committed))
+        let snapshot = self.snapshot_offer(&committed);
+        WriteAction::Done(WriteOutcome::Committed { committed, snapshot })
     }
 
-    fn on_conflict(&mut self, current: Version) -> WriteAction<A::Event, A::Error> {
+    /// Build the fire-and-forget post-commit snapshot offer.
+    ///
+    /// The cadence speaks in *progress since the base*: the policy
+    /// fires when the committed version moved `every` past the
+    /// version the fold started from (the loaded snapshot's version,
+    /// or `EMPTY`). The offered state is the folded state with the
+    /// committed events applied, at the committed version — exactly
+    /// what a later `LoadSnapshot` answer wants to carry.
+    fn snapshot_offer(&self, committed: &[EventEnvelope<A::Event>]) -> Option<OfferSnapshot<S>> {
+        let policy = self.snapshots.policy()?;
+        let materialize = self.materialize?;
+        let fold_committed = self.fold_committed?;
+        let committed_version = committed.last().map_or(self.version, |e| e.version);
+        if !policy.is_due(self.snapshots.base_version(), committed_version) {
+            return None;
+        }
+        // Materialize the post-commit state without disturbing
+        // `self.folded`: clone the pre-commit fold (via `materialize`)
+        // and apply the batch on top (via `fold_committed`). `A::apply`
+        // is pure and total, so this is exactly the state the commit
+        // produced.
+        let mut state = materialize(&self.folded);
+        fold_committed(&mut state, committed);
+        Some(OfferSnapshot(Snapshot {
+            stream_id: self.stream_id.clone(),
+            version: committed_version,
+            state,
+        }))
+    }
+
+    fn on_conflict(&mut self, current: Version) -> WriteAction<A::Event, A::Error, S> {
         if self.phase != Phase::Appending {
             return self.violation("`Conflict` outside the appending phase");
         }
@@ -244,7 +505,10 @@ impl<A: Aggregate> WriteMachine<A> {
         if self.retries_used < self.retry_policy.max_retries {
             self.retries_used += 1;
             self.phase = Phase::Loading;
-            // Reload only the delta since the version we folded.
+            // Reload only the delta since the version we folded — the
+            // same shape with or without snapshots: the base (if any)
+            // is already part of the fold; a second snapshot load would
+            // duplicate it and waste a round-trip.
             WriteAction::LoadStream {
                 stream_id: self.stream_id.clone(),
                 from: self.version,
@@ -255,7 +519,7 @@ impl<A: Aggregate> WriteMachine<A> {
         }
     }
 
-    fn on_failed(&mut self, error: StoreError) -> WriteAction<A::Event, A::Error> {
+    fn on_failed(&mut self, error: StoreError) -> WriteAction<A::Event, A::Error, S> {
         if self.phase == Phase::Done {
             return self.violation("`Failed` on a finished machine");
         }
@@ -263,7 +527,7 @@ impl<A: Aggregate> WriteMachine<A> {
         WriteAction::Done(WriteOutcome::Failed(error))
     }
 
-    fn decide_and_emit(&mut self) -> WriteAction<A::Event, A::Error> {
+    fn decide_and_emit(&mut self) -> WriteAction<A::Event, A::Error, S> {
         let decision = A::decide(&self.folded, &self.command);
         match decision {
             Ok(events) if events.is_empty() => {
@@ -290,7 +554,7 @@ impl<A: Aggregate> WriteMachine<A> {
         }
     }
 
-    fn violation(&mut self, message: &'static str) -> WriteAction<A::Event, A::Error> {
+    fn violation(&mut self, message: &'static str) -> WriteAction<A::Event, A::Error, S> {
         self.phase = Phase::Done;
         WriteAction::Done(WriteOutcome::Failed(StoreError::Other(Arc::new(
             ProtocolError::new(message),
@@ -303,10 +567,14 @@ mod tests {
     use super::*;
     use crate::envelope::{EventEnvelope, Metadata};
     use crate::error::ProtocolError;
-    use crate::testing::account::{Account, AccountCommand, AccountError, AccountEvent, AccountId};
+    use crate::snapshot::{Snapshot, SnapshotPolicy};
+    use crate::testing::account::{
+        Account, AccountCommand, AccountError, AccountEvent, AccountId, AccountState,
+    };
     use crate::testing::drive_scripted;
     use crate::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
     use alloc::string::String;
+    use core::num::NonZeroU64;
     use proptest::prelude::*;
 
     // -- helpers ---------------------------------------------------------
@@ -329,14 +597,34 @@ mod tests {
         WriteMachine::new(AccountId(7), command, RetryPolicy::default())
     }
 
-    fn is_protocol_violation(action: &WriteAction<AccountEvent, AccountError>) -> bool {
+    fn snap_machine(command: AccountCommand, every: u64) -> WriteMachine<Account, AccountState> {
+        WriteMachine::with_snapshots(
+            AccountId(7),
+            command,
+            RetryPolicy::default(),
+            SnapshotPolicy::new(NonZeroU64::new(every).unwrap()),
+        )
+    }
+
+    fn snapshot(version: u64, balance: u64) -> Snapshot<AccountState> {
+        Snapshot {
+            stream_id: stream(),
+            version: Version::new(version),
+            state: AccountState {
+                open: true,
+                balance,
+            },
+        }
+    }
+
+    fn is_protocol_violation<E, Err, S>(action: &WriteAction<E, Err, S>) -> bool {
         let WriteAction::Done(WriteOutcome::Failed(StoreError::Other(source))) = action else {
             return false;
         };
         source.downcast_ref::<ProtocolError>().is_some()
     }
 
-    // -- transitions -----------------------------------------------------
+    // -- transitions (snapshots off: the pre-snapshot protocol) ----------
 
     #[test]
     fn start_loads_the_whole_stream() {
@@ -387,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn appended_ends_in_committed() {
+    fn appended_ends_in_committed_without_a_snapshot_offer() {
         let mut m = machine(AccountCommand::Deposit { amount: 5 });
         m.start();
         m.handle(WriteInput::Loaded {
@@ -402,10 +690,15 @@ mod tests {
         let action = m.handle(WriteInput::Appended {
             committed: committed.clone(),
         });
-        let WriteAction::Done(WriteOutcome::Committed(events)) = action else {
+        let WriteAction::Done(WriteOutcome::Committed {
+            committed: events,
+            snapshot,
+        }) = action
+        else {
             panic!("expected a committed outcome")
         };
         assert_eq!(events, committed);
+        assert!(snapshot.is_none(), "snapshots off means no offer");
         assert!(m.is_done());
     }
 
@@ -557,7 +850,7 @@ mod tests {
         ));
     }
 
-    // -- protocol violations ----------------------------------------------
+    // -- protocol violations (snapshots off) ------------------------------
 
     #[test]
     fn driving_a_finished_machine_is_a_protocol_violation() {
@@ -662,8 +955,214 @@ mod tests {
         assert!(matches!(actions[1], WriteAction::Append { .. }));
         assert!(matches!(
             actions[2],
-            WriteAction::Done(WriteOutcome::Committed(_))
+            WriteAction::Done(WriteOutcome::Committed { .. })
         ));
+    }
+
+    // -- snapshots on -----------------------------------------------------
+
+    #[test]
+    fn with_snapshots_starts_with_a_snapshot_read() {
+        let mut m = snap_machine(AccountCommand::Deposit { amount: 5 }, 10);
+        assert!(matches!(
+            m.start(),
+            WriteAction::LoadSnapshot { ref stream_id } if stream_id.as_str() == "account-7"
+        ));
+    }
+
+    #[test]
+    fn no_snapshot_loads_the_full_stream_and_appends() {
+        let mut m = snap_machine(AccountCommand::Deposit { amount: 5 }, 10);
+        m.start();
+        let action = m.handle(WriteInput::SnapshotLoaded { snapshot: None });
+        assert!(matches!(
+            action,
+            WriteAction::LoadStream { from, .. } if from == Version::EMPTY
+        ));
+        let action = m.handle(WriteInput::Loaded {
+            events: vec![env(
+                1,
+                AccountEvent::Opened {
+                    owner: String::from("me"),
+                },
+            )],
+        });
+        assert!(matches!(action, WriteAction::Append { .. }));
+    }
+
+    #[test]
+    fn a_snapshot_shortens_the_stream_read_to_the_delta() {
+        let mut m = snap_machine(AccountCommand::Deposit { amount: 5 }, 10);
+        m.start();
+        let action = m.handle(WriteInput::SnapshotLoaded {
+            snapshot: Some(snapshot(40, 900)),
+        });
+        assert!(matches!(
+            action,
+            WriteAction::LoadStream { from, .. } if from == Version::new(40)
+        ));
+        assert_eq!(m.version(), Version::new(40));
+
+        // Fold the delta onto the snapshot's state: 900 + 7 = 907, and
+        // the decided deposit of 5 lands on top of it at append time.
+        let action = m.handle(WriteInput::Loaded {
+            events: vec![env(41, AccountEvent::Deposited { amount: 7 })],
+        });
+        let WriteAction::Append {
+            expected, events, ..
+        } = action
+        else {
+            panic!("expected an append action")
+        };
+        assert_eq!(expected, ExpectedVersion::Exact(Version::new(41)));
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn commit_offers_a_snapshot_when_the_policy_fires() {
+        let mut m = snap_machine(AccountCommand::Deposit { amount: 5 }, 2);
+        m.start();
+        m.handle(WriteInput::SnapshotLoaded {
+            snapshot: Some(snapshot(10, 100)),
+        });
+        m.handle(WriteInput::Loaded {
+            events: vec![env(11, AccountEvent::Deposited { amount: 50 })],
+        });
+        // Progress since base 10: folded one event (v11) + one committing
+        // (v12) = 2 ≥ every(2) → offer.
+        let action = m.handle(WriteInput::Appended {
+            committed: vec![env(12, AccountEvent::Deposited { amount: 5 })],
+        });
+        let WriteAction::Done(WriteOutcome::Committed {
+            snapshot: Some(offer),
+            ..
+        }) = action
+        else {
+            panic!("expected a committed outcome carrying a snapshot offer")
+        };
+        let offered = offer.into_inner();
+        assert_eq!(offered.version, Version::new(12));
+        assert_eq!(offered.stream_id, stream());
+        // The offered state is the snapshot's, with the folded delta and
+        // the committed event on top: 100 + 50 + 5.
+        assert_eq!(offered.state.balance, 155);
+        assert!(offered.state.open);
+    }
+
+    #[test]
+    fn commit_offers_no_snapshot_below_the_cadence() {
+        let mut m = snap_machine(AccountCommand::Deposit { amount: 5 }, 10);
+        m.start();
+        m.handle(WriteInput::SnapshotLoaded {
+            snapshot: Some(snapshot(10, 100)),
+        });
+        m.handle(WriteInput::Loaded {
+            events: vec![env(11, AccountEvent::Deposited { amount: 50 })],
+        });
+        let action = m.handle(WriteInput::Appended {
+            committed: vec![env(12, AccountEvent::Deposited { amount: 5 })],
+        });
+        let WriteAction::Done(WriteOutcome::Committed { snapshot, .. }) = action else {
+            panic!("expected a committed outcome")
+        };
+        assert!(snapshot.is_none(), "two versions of progress < every(10)");
+    }
+
+    #[test]
+    fn snapshot_policy_cadence_counts_from_the_base() {
+        let every3 = SnapshotPolicy::new(NonZeroU64::new(3).unwrap());
+        assert!(!every3.is_due(Version::new(10), Version::new(12)));
+        assert!(every3.is_due(Version::new(10), Version::new(13)));
+        // No base snapshot: base is EMPTY.
+        assert!(!every3.is_due(Version::EMPTY, Version::new(2)));
+        assert!(every3.is_due(Version::EMPTY, Version::new(3)));
+    }
+
+    #[test]
+    fn snapshot_for_another_stream_is_a_protocol_violation() {
+        let mut m = snap_machine(AccountCommand::Deposit { amount: 5 }, 10);
+        m.start();
+        let mut alien = snapshot(4, 100);
+        alien.stream_id = StreamId::from("account-999");
+        let action = m.handle(WriteInput::SnapshotLoaded {
+            snapshot: Some(alien),
+        });
+        assert!(is_protocol_violation(&action));
+    }
+
+    #[test]
+    fn snapshot_delta_must_continue_from_the_snapshot_version() {
+        // The monotonicity guard: a snapshot at v40 against a delta that
+        // starts at v41 is fine; a stale/replayed delta starting at v12,
+        // or one past the tip the snapshot claims, is a violation.
+        let mut m = snap_machine(AccountCommand::Deposit { amount: 5 }, 10);
+        m.start();
+        m.handle(WriteInput::SnapshotLoaded {
+            snapshot: Some(snapshot(40, 900)),
+        });
+        let action = m.handle(WriteInput::Loaded {
+            events: vec![env(12, AccountEvent::Deposited { amount: 1 })],
+        });
+        assert!(is_protocol_violation(&action));
+    }
+
+    #[test]
+    fn snapshot_loaded_on_a_snapshots_off_machine_is_a_protocol_violation() {
+        let mut m = machine(AccountCommand::Deposit { amount: 5 });
+        m.start();
+        let action = m.handle(WriteInput::<AccountEvent>::SnapshotLoaded { snapshot: None });
+        assert!(is_protocol_violation(&action));
+    }
+
+    #[test]
+    fn snapshot_loaded_after_the_load_phase_is_a_protocol_violation() {
+        let mut m = snap_machine(AccountCommand::Deposit { amount: 5 }, 10);
+        m.start();
+        m.handle(WriteInput::SnapshotLoaded { snapshot: None });
+        assert!(is_protocol_violation(
+            &m.handle(WriteInput::SnapshotLoaded { snapshot: None })
+        ));
+    }
+
+    #[test]
+    fn snapshot_read_failure_fails_the_interaction() {
+        let mut m = snap_machine(AccountCommand::Deposit { amount: 5 }, 10);
+        m.start();
+        let action = m.handle(WriteInput::Failed(StoreError::Unavailable));
+        assert!(matches!(
+            action,
+            WriteAction::Done(WriteOutcome::Failed(StoreError::Unavailable))
+        ));
+    }
+
+    #[test]
+    fn conflict_after_a_snapshot_reloads_the_delta_not_the_snapshot() {
+        let mut m = snap_machine(AccountCommand::Deposit { amount: 5 }, 10);
+        m.start();
+        m.handle(WriteInput::SnapshotLoaded {
+            snapshot: Some(snapshot(40, 900)),
+        });
+        m.handle(WriteInput::Loaded {
+            events: vec![env(41, AccountEvent::Deposited { amount: 7 })],
+        });
+        let action = m.handle(WriteInput::Conflict {
+            current: Version::new(43),
+        });
+        // The retry reloads the event delta from the folded version —
+        // never a second LoadSnapshot.
+        assert!(matches!(
+            action,
+            WriteAction::LoadStream { from, .. } if from == Version::new(41)
+        ));
+        // And the retry's fold lands on the snapshot's state: 900 + 7 +
+        // v42 + v43's deposits, then decides on top.
+        let action = m.handle(WriteInput::Loaded {
+            events: vec![
+                env(42, AccountEvent::Deposited { amount: 1 }),
+                env(43, AccountEvent::Deposited { amount: 2 }),
+            ],
+        });
+        assert!(matches!(action, WriteAction::Append { .. }));
     }
 
     // -- properties -------------------------------------------------------
@@ -690,10 +1189,37 @@ mod tests {
         .boxed()
     }
 
+    fn arb_snapshot_input() -> BoxedStrategy<WriteInput<AccountEvent, AccountState>> {
+        prop_oneof![
+            (1u64..8, 0u64..8).prop_map(|(start, len)| {
+                let events = (0..len)
+                    .map(|i| env(start + i, AccountEvent::Deposited { amount: 1 }))
+                    .collect();
+                WriteInput::Loaded { events }
+            }),
+            (0u64..8).prop_map(|len| {
+                let committed = (1..=len)
+                    .map(|v| env(v, AccountEvent::Deposited { amount: 1 }))
+                    .collect();
+                WriteInput::Appended { committed }
+            }),
+            (0u64..10).prop_map(|current| WriteInput::Conflict {
+                current: Version::new(current)
+            }),
+            Just(WriteInput::Failed(StoreError::Unavailable)),
+            (0u64..10, any::<bool>()).prop_map(|(version, some)| {
+                WriteInput::SnapshotLoaded {
+                    snapshot: some.then(|| snapshot(version, 0)),
+                }
+            }),
+        ]
+        .boxed()
+    }
+
     proptest! {
         /// The machine never panics on any input sequence, and once it
         /// is done it stays done: every action after the first `Done` is
-        /// a protocol-violation `Done`.
+        /// a protocol-violation `Done`. Snapshots off.
         #[test]
         fn never_panics_and_stays_done(script in prop::collection::vec(arb_write_input(), 0..16)) {
             let mut m = machine(AccountCommand::Deposit { amount: 5 });
@@ -706,5 +1232,28 @@ mod tests {
                 }
             }
         }
+
+        /// Same invariant with snapshots on: arbitrary input soup —
+        /// including snapshot answers at arbitrary points — never panics
+        /// and never un-dones the machine.
+        #[test]
+        fn snapshots_on_never_panics_and_stays_done(
+            script in prop::collection::vec(arb_snapshot_input(), 0..16)
+        ) {
+            let mut m = snap_machine(AccountCommand::Deposit { amount: 5 }, 3);
+            let mut actions: Vec<WriteAction<AccountEvent, AccountError, AccountState>> = Vec::new();
+            actions.push(m.start());
+            for input in script {
+                actions.push(m.handle(input));
+            }
+
+            prop_assert!(!actions.is_empty());
+            if let Some(i) = actions.iter().position(|a| matches!(a, WriteAction::Done(_))) {
+                for a in &actions[i + 1..] {
+                    prop_assert!(is_protocol_violation(a));
+                }
+            }
+        }
     }
 }
+

@@ -9,9 +9,11 @@
 use eventyr_core::aggregate::Aggregate;
 use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
+use eventyr_core::snapshot::{HasSnapshotState, OfferSnapshot, WritePolicy};
 use eventyr_core::write::{RetryPolicy, WriteMachine, WriteOutcome};
 
-use crate::driver::drive_write;
+use crate::driver::{drive_write, drive_write_with_snapshots};
+use crate::snapshot_store::SnapshotStore;
 use crate::store::EventStore;
 
 /// Why a command execution failed: the domain rejected it, or the store
@@ -54,10 +56,20 @@ impl<A: Aggregate> core::error::Error for ExecutionError<A> {
 
 /// The result of a successful command execution.
 #[derive(Debug)]
-pub enum ExecutionOutcome<E> {
+pub enum ExecutionOutcome<E, S = ()> {
     /// The events were committed; the envelopes are as the store
     /// recorded them.
-    Committed(Vec<EventEnvelope<E>>),
+    ///
+    /// `snapshot` is the machine's fire-and-forget post-commit offer:
+    /// `Some` when a snapshots-on repository's policy fired and the
+    /// driver persisted it (or accepted it for persistence), `None`
+    /// otherwise. Never affects the commit itself.
+    Committed {
+        /// The committed events as the store recorded them.
+        committed: Vec<EventEnvelope<E>>,
+        /// The snapshot the machine offered at commit, if any.
+        snapshot: Option<OfferSnapshot<S>>,
+    },
     /// The command decided no events; nothing was appended.
     Noop,
 }
@@ -65,34 +77,72 @@ pub enum ExecutionOutcome<E> {
 /// Executes commands against an aggregate's stream: load → fold →
 /// decide → append, with conflict retry.
 ///
-/// The repository owns no state beyond the store and the retry policy;
-/// every interaction gets a fresh machine, so a repository is freely
-/// shareable (`Arc`, concurrent `execute` calls) as long as the store
-/// is.
-pub struct AggregateRepository<A, S> {
+/// The repository owns no state beyond the store, the retry policy, and
+/// the optional snapshot policy; every interaction gets a fresh machine,
+/// so a repository is freely shareable (`Arc`, concurrent `execute`
+/// calls) as long as the stores are. `SS` is the snapshot-store channel:
+/// `()` (the default) on a plain repository, a [`SnapshotStore`]
+/// implementation on one built with
+/// [`with_snapshots`](AggregateRepository::with_snapshots).
+pub struct AggregateRepository<A, S, SS = ()> {
     store: S,
-    retry_policy: RetryPolicy,
+    snapshots: SS,
+    policy: WritePolicy,
     _aggregate: core::marker::PhantomData<fn(A)>,
 }
 
-impl<A, S> AggregateRepository<A, S>
+impl<A, S> AggregateRepository<A, S, ()>
 where
     A: Aggregate,
     S: EventStore<Event = A::Event>,
 {
     /// A repository over `store`, retrying conflicts per `retry_policy`.
+    /// Snapshots are off — the write protocol is exactly the
+    /// pre-snapshot one.
     pub fn new(store: S, retry_policy: RetryPolicy) -> Self {
         Self {
             store,
-            retry_policy,
+            snapshots: (),
+            policy: WritePolicy::retries(retry_policy),
             _aggregate: core::marker::PhantomData,
         }
     }
 
+    /// A repository over `store` whose whole write path — retry budget
+    /// and (like [`new`](AggregateRepository::new), absent) snapshot
+    /// cadence — comes from the combined
+    /// [`WritePolicy`](eventyr_core::snapshot::WritePolicy).
+    ///
+    /// Snapshot cadence on a snapshots-off repository is a no-op (`with_snapshots`
+    /// reads the same field); build from a policy already carrying one
+    /// only if the repository is about to be turned on.
+    pub fn from_policy(store: S, policy: WritePolicy) -> Self {
+        Self {
+            store,
+            snapshots: (),
+            policy,
+            _aggregate: core::marker::PhantomData,
+        }
+    }
+}
+
+/// The half of the API every repository has, snapshots or not: the
+/// store accessor and, on the snapshot-off half, plain `execute`.
+impl<A, S, SS> AggregateRepository<A, S, SS>
+where
+    A: Aggregate,
+    S: EventStore<Event = A::Event>,
+{
     /// The store this repository reads and writes — for projections and
     /// queries that share the same event log.
     pub fn store(&self) -> &S {
         &self.store
+    }
+
+    /// The snapshot store this repository reads and persists through
+    /// — `()` on a snapshots-off repository.
+    pub fn snapshots(&self) -> &SS {
+        &self.snapshots
     }
 
     /// Execute `command` against the aggregate instance `id`.
@@ -103,18 +153,131 @@ where
     /// until the retry budget is spent.
     ///
     /// Events are appended with empty metadata. Correlation and
-    /// causation ids are not yet reachable through this path — a
-    /// metadata-aware variant arrives with 0.2; until then, hand-drive
-    /// the [`WriteMachine`] to
-    /// enrich events.
+    /// causation ids are not yet reachable through this path; until
+    /// then, hand-drive the [`WriteMachine`] to enrich events.
+    ///
+    /// This is the snapshot-off path: on a snapshots-on repository,
+    /// `execute_with_snapshots` runs the full snapshot protocol. The
+    /// behavior here is identical whether or not the repository was
+    /// built with [`with_snapshots`](AggregateRepository::with_snapshots)
+    /// — snapshots are a read-side fast path, never a change to the
+    /// write contract.
     pub async fn execute(
         &self,
         id: A::Id,
         command: A::Command,
     ) -> Result<ExecutionOutcome<A::Event>, ExecutionError<A>> {
-        let mut machine = WriteMachine::<A>::new(id, command, self.retry_policy);
+        let mut machine = WriteMachine::<A>::new(id, command, self.policy.retry);
         match drive_write(&mut machine, &self.store).await {
-            WriteOutcome::Committed(events) => Ok(ExecutionOutcome::Committed(events)),
+            WriteOutcome::Committed { committed, .. } => Ok(ExecutionOutcome::Committed {
+                committed,
+                snapshot: None,
+            }),
+            WriteOutcome::Noop => Ok(ExecutionOutcome::Noop),
+            WriteOutcome::Rejected(error) => Err(ExecutionError::Domain(error)),
+            WriteOutcome::Failed(error) => Err(ExecutionError::Store(error)),
+        }
+    }
+}
+
+impl<A, S> AggregateRepository<A, S, ()>
+where
+    A: HasSnapshotState,
+    A::State: Clone + Send,
+    S: EventStore<Event = A::Event>,
+{
+    /// Turn snapshots on: the same repository, plus the snapshot store
+    /// (to read the newest snapshot from at load time, and to persist
+    /// the post-commit offer into) and the cadence policy for it.
+    ///
+    /// The policy is the whole tuning surface: the machine offers a
+    /// snapshot when a commit moves the stream at least `every`
+    /// versions past the version the fold started from. Persistence is
+    /// fire-and-forget — a failed save logs nothing and changes
+    /// nothing; the next load simply folds a longer delta.
+    pub fn with_snapshots<SS>(
+        self,
+        snapshots: SS,
+        policy: eventyr_core::snapshot::SnapshotPolicy,
+    ) -> AggregateRepository<A, S, SS>
+    where
+        SS: SnapshotStore<State = A::State>,
+    {
+        AggregateRepository {
+            store: self.store,
+            snapshots,
+            policy: WritePolicy {
+                retry: self.policy.retry,
+                snapshot: Some(policy),
+            },
+            _aggregate: core::marker::PhantomData,
+        }
+    }
+
+    /// Turn snapshots on with the whole write-side tuning at once:
+    /// `policy.retry` bounds conflict retries, `policy.snapshot` must
+    /// carry the cadence (a `None` snapshot policy on a snapshots-on
+    /// repository is a caller bug — the machine would have nothing to
+    /// fire on).
+    pub fn with_snapshots_policy<SS>(
+        self,
+        snapshots: SS,
+        policy: WritePolicy,
+    ) -> AggregateRepository<A, S, SS>
+    where
+        SS: SnapshotStore<State = A::State>,
+    {
+        assert!(
+            policy.snapshot.is_some(),
+            "with_snapshots_policy requires policy.snapshot to be Some"
+        );
+        AggregateRepository {
+            store: self.store,
+            snapshots,
+            policy,
+            _aggregate: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<A, S, SS> AggregateRepository<A, S, SS>
+where
+    A: HasSnapshotState,
+    A::State: Clone + Send,
+    S: EventStore<Event = A::Event>,
+    SS: SnapshotStore<State = A::State>,
+{
+    /// Execute `command` against the aggregate instance `id` under the
+    /// snapshot protocol.
+    ///
+    /// The load starts from the newest persisted snapshot when one
+    /// exists (folding only the delta after it); a policy-firing
+    /// commit's offer is persisted through the [`SnapshotStore`]
+    /// before the outcome returns. The fire-and-forget contract
+    /// stands: a failed save is dropped, and the committed outcome the
+    /// caller sees is never affected by it.
+    ///
+    /// Bonded on `SS: SnapshotStore` so the type system rules out a
+    /// snapshots-off repository calling it.
+    pub async fn execute_with_snapshots(
+        &self,
+        id: A::Id,
+        command: A::Command,
+    ) -> Result<ExecutionOutcome<A::Event, A::State>, ExecutionError<A>> {
+        let policy = self
+            .policy
+            .snapshot
+            .expect("with_snapshots sets the policy before this method is reachable");
+        let mut machine = WriteMachine::<A, A::State>::with_snapshots(
+            id,
+            command,
+            self.policy.retry,
+            policy,
+        );
+        match drive_write_with_snapshots(&mut machine, &self.store, &self.snapshots).await {
+            WriteOutcome::Committed { committed, snapshot } => {
+                Ok(ExecutionOutcome::Committed { committed, snapshot })
+            }
             WriteOutcome::Noop => Ok(ExecutionOutcome::Noop),
             WriteOutcome::Rejected(error) => Err(ExecutionError::Domain(error)),
             WriteOutcome::Failed(error) => Err(ExecutionError::Store(error)),

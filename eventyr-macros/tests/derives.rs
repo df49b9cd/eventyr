@@ -141,7 +141,7 @@ fn the_derived_aggregate_drives_the_write_machine() {
     let action = machine.handle(WriteInput::Appended { committed: vec![] });
     assert!(matches!(
         action,
-        WriteAction::Done(WriteOutcome::Committed(_))
+        WriteAction::Done(WriteOutcome::Committed { .. })
     ));
 }
 

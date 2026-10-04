@@ -50,3 +50,9 @@ pub use eventyr_subscription as subscription;
 /// `eventyr-projection` behind the `projection` feature.
 #[cfg(feature = "projection")]
 pub use eventyr_projection as projection;
+
+/// The Postgres store: the durable `EventStore`/`StreamsAll` — and,
+/// behind its `snapshots` feature (pulled in by this crate's
+/// `snapshots` feature), the `SnapshotStore` — over Postgres.
+#[cfg(feature = "postgres")]
+pub use eventyr_store_postgres as postgres;

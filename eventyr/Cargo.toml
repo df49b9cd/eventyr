@@ -25,10 +25,14 @@ bus = ["subscription", "eventyr-subscription/bus"]
 # Re-exports the read-path layer: upcaster chains, raw→typed sources,
 # schema-versioned rebuilds.
 projection = ["subscription", "dep:eventyr-projection"]
+# The Postgres store, with its snapshot persistence enabled.
+postgres = ["store", "dep:eventyr-store-postgres"]
+snapshots = ["postgres", "eventyr-store-postgres/snapshots"]
 
 [dependencies]
 eventyr-core = { workspace = true }
 eventyr-store = { workspace = true, optional = true }
+eventyr-store-postgres = { workspace = true, optional = true }
 eventyr-subscription = { workspace = true, optional = true }
 eventyr-projection = { workspace = true, optional = true }
 

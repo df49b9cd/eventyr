@@ -22,6 +22,8 @@
 //! payloads stay selectable by an upcaster.
 
 pub mod store;
+#[cfg(feature = "snapshots")]
+pub mod snapshots;
 
 use std::sync::Arc;
 

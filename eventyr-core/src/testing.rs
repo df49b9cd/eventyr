@@ -317,7 +317,7 @@ pub mod account {
     }
 
     /// The account's folded state.
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     pub struct AccountState {
         /// Whether the account exists.
         pub open: bool,

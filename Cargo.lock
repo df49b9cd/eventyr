@@ -281,6 +281,7 @@ dependencies = [
  "eventyr-core",
  "eventyr-projection",
  "eventyr-store",
+ "eventyr-store-postgres",
  "eventyr-subscription",
  "tokio",
 ]

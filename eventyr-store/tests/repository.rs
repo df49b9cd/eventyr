@@ -54,7 +54,7 @@ async fn open_deposit_withdraw_roundtrip() {
         .execute(id.clone(), AccountCommand::Withdraw { amount: 120 })
         .await
         .expect("withdraw");
-    let ExecutionOutcome::Committed(events) = outcome else {
+    let ExecutionOutcome::Committed { committed: events, .. } = outcome else {
         panic!("expected a commit")
     };
     assert_eq!(events.len(), 1);
@@ -223,7 +223,7 @@ async fn conflict_retry_commits_against_fresh_state() {
     let action = machine.handle(WriteInput::Appended { committed });
     assert!(matches!(
         action,
-        WriteAction::Done(WriteOutcome::Committed(_))
+        WriteAction::Done(WriteOutcome::Committed { .. })
     ));
 
     // Both deposits are on the stream: v2 (the competitor) and v3 (ours).
