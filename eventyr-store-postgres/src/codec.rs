@@ -14,7 +14,9 @@ use eventyr_core::error::StoreError;
 use eventyr_core::schema::Persistable;
 use eventyr_core::upcast::RawEvent;
 use eventyr_core::version_registry::EventSchemaVersion;
-use eventyr_store::schema::SchemaCodec;
+use eventyr_store::schema::{DecodeEvent, SchemaCodec};
+
+use crate::PgStoreError;
 
 /// The row shape the Postgres events table holds: the stored type name,
 /// the schema version the payload was written at, and the JSONB body.
@@ -67,5 +69,23 @@ where
             payload: serde_json::to_vec(payload)
                 .expect("a stored JSONB payload re-encodes to JSON"),
         }
+    }
+}
+
+impl<E> DecodeEvent for JsonCodec<E>
+where
+    E: Persistable + serde::Serialize + serde::de::DeserializeOwned,
+{
+    /// Decode the record back to the typed event at its *stored*
+    /// version. A payload that does not decode is a corrupt row,
+    /// surfaced through the store's own error type — never unwrapped,
+    /// never silently skipped.
+    fn decode(record: &Self::Record) -> Result<Self::Event, StoreError> {
+        let (_event_type, _schema_version, payload) = record;
+        serde_json::from_value(payload.clone()).map_err(|error| {
+            StoreError::from(PgStoreError::CorruptRow(format!(
+                "the stored payload does not decode: {error}"
+            )))
+        })
     }
 }
