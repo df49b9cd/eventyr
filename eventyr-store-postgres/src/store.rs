@@ -302,6 +302,12 @@ async fn query_page<'c>(
 
 const QUERY_PAGE: i64 = 512;
 
+/// The advisory lock every append holds from drawing its global
+/// sequence until it commits (migration 0006): sequences become visible
+/// in order, so `stream_all` never shows a later one before an earlier
+/// one that will still commit. Must match the key in `append_events`.
+const COMMIT_ORDER_LOCK: i64 = 7_300_160_413_598_463_541;
+
 impl<E> EventStore for PgStore<E>
 where
     E: serde::Serialize + serde::de::DeserializeOwned + EventName + Clone + Send + Sync,
@@ -487,17 +493,16 @@ where
     }
 
     /// One transaction: the appended streams' advisory locks (sorted,
-    /// as `append_batch` takes them), then `LOCK TABLE events IN SHARE
-    /// ROW EXCLUSIVE MODE` — which waits out every in-flight insert and
-    /// blocks new ones until commit — then the condition check, then the
-    /// writes.
+    /// as `append_batch` takes them), then the commit-order lock
+    /// (migration 0006), then the condition check, then the writes.
     ///
-    /// The table lock makes the check-then-write atomic against *every*
-    /// writer, including plain appends that know nothing of tags; the
-    /// price is that conditional appends serialize with all writes.
-    /// Stream locks come first so the lock order matches the other
-    /// write paths (stream locks, then the insert's table lock) and no
-    /// two writers can deadlock.
+    /// Every append holds the commit-order lock from drawing its
+    /// sequence until it commits, so once this transaction holds it, no
+    /// matching event is in flight: the check sees every committed event,
+    /// and nothing can commit between the check and the write. Without
+    /// it, a READ COMMITTED check reads past an uncommitted matching row
+    /// and oversells. The lock order (stream locks, then the commit-order
+    /// lock) is the one every append takes, so no two writers deadlock.
     fn append_if(
         &self,
         appends: Vec<StreamAppend<E>>,
@@ -510,7 +515,8 @@ where
             let mut tx = conn.begin().await.map_err(PgStoreError::into_store)?;
 
             lock_streams(&mut tx, &appends).await?;
-            sqlx::query("LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE")
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(COMMIT_ORDER_LOCK)
                 .execute(&mut *tx)
                 .await
                 .map_err(PgStoreError::into_store)?;

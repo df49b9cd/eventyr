@@ -347,3 +347,85 @@ fn a_conditional_append_waits_out_an_in_flight_writer() {
         }
     });
 }
+
+/// `StreamsAll`'s visibility rule against a real Postgres: a later
+/// sequence must not become visible before an earlier one that will
+/// still commit.
+///
+/// A raw transaction appends (drawing the next sequence) and stays
+/// open; a second append to another stream must wait for it rather
+/// than commit the later sequence first. If it committed first, a
+/// projector polling in between would checkpoint past the open
+/// transaction's event and never deliver it.
+#[test]
+#[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
+fn a_later_sequence_never_commits_before_an_earlier_one() {
+    use eventyr_core::envelope::NewEvent;
+    use eventyr_core::vocabulary::{ExpectedVersion, Sequence};
+    use eventyr_store::store::{EventStore, StreamsAll};
+    use futures::TryStreamExt;
+
+    let url = std::env::var("EVENTYR_TEST_PG_URL")
+        .expect("EVENTYR_TEST_PG_URL must point at a real Postgres");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let store: PgStore<ContractEvent> = fresh_store_async(&url, 4).await;
+
+        let mut first = store.pool().begin().await.expect("begin");
+        sqlx::query(
+            "SELECT * FROM append_events(0::smallint, 0, 'stream-a', ARRAY['Payload'], \
+             ARRAY['{\"Payload\": {\"value\": 1}}'::jsonb], \
+             ARRAY[NULL]::text[], ARRAY[NULL]::text[])",
+        )
+        .execute(&mut *first)
+        .await
+        .expect("the first append draws its sequence");
+
+        let second = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .append(
+                        &StreamId::from("stream-b"),
+                        ExpectedVersion::Any,
+                        vec![NewEvent::new(ContractEvent::from(2))],
+                    )
+                    .await
+            })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let visible: Vec<_> = store
+            .stream_all(Sequence::START)
+            .try_collect()
+            .await
+            .expect("read");
+        assert!(
+            visible.is_empty(),
+            "a later sequence became visible while an earlier one was in flight: {:?}",
+            visible.iter().map(|e| e.sequence).collect::<Vec<_>>()
+        );
+        assert!(!second.is_finished(), "the second append did not wait");
+
+        first.commit().await.expect("commit");
+        second
+            .await
+            .expect("task")
+            .expect("the second append commits");
+        let sequences: Vec<_> = store
+            .stream_all(Sequence::START)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("read")
+            .into_iter()
+            .map(|e| (e.stream_id.as_str().to_owned(), e.sequence.as_u64()))
+            .collect();
+        assert_eq!(sequences[0].0, "stream-a");
+        assert_eq!(sequences[1].0, "stream-b");
+        assert!(sequences[0].1 < sequences[1].1);
+    });
+}
