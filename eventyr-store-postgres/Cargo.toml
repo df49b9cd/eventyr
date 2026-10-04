@@ -10,5 +10,30 @@ keywords = ["event-sourcing", "postgres", "sqlx"]
 [lints]
 workspace = true
 
-# Dependencies arrive with the crate itself (0.2): eventyr-core for the
-# vocabulary, eventyr-store for the EventStore port, sqlx for Postgres.
+[features]
+default = []
+# Populates `Metadata::timestamp` from `created_at`. Turns on core's
+# `time` field and sqlx's `OffsetDateTime` decode.
+time = ["eventyr-core/time", "sqlx/time", "dep:time"]
+
+[dependencies]
+eventyr-core = { workspace = true, features = ["serde"] }
+eventyr-store = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "json",
+    "migrate",
+    "macros",
+] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+thiserror = { version = "2", default-features = false }
+async-stream = { version = "0.3", default-features = false }
+futures = { version = "0.3", default-features = false, features = ["alloc", "std"] }
+time = { version = "0.3", default-features = false, optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+uuid = { version = "1", features = ["v4"] }
+eventyr-store = { workspace = true }

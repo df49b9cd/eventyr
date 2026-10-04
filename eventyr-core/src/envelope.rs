@@ -10,6 +10,7 @@ use crate::vocabulary::{Sequence, StreamId, Version};
 /// metadata) from the domain event itself, keeping domain enums clean and
 /// serde payloads stable.
 #[derive(Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EventEnvelope<E> {
     /// The global, store-assigned, monotonic position.
     pub sequence: Sequence,
@@ -25,6 +26,7 @@ pub struct EventEnvelope<E> {
 
 /// Correlation and causation metadata.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Metadata {
     /// The id of the command (or event) that caused this event.
     pub causation_id: Option<String>,
@@ -42,6 +44,7 @@ pub struct Metadata {
 /// [`EventEnvelope`]s come back in
 /// [`Appended`](crate::write::WriteInput::Appended).
 #[derive(Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NewEvent<E> {
     /// The domain event.
     pub event: E,

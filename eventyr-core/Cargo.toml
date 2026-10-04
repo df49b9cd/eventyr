@@ -19,9 +19,13 @@ time = ["dep:time"]
 # one dependency a derive user needs. Off by default: the core stays
 # dependency-free unless you ask for the sugar.
 macros = ["dep:eventyr-macros"]
+# Derives Serialize/Deserialize on the value types (the vocabulary, the
+# envelopes, the metadata) — the serde glue a store needs. Off by default.
+serde = ["dep:serde", "time?/serde"]
 
 [dependencies]
 eventyr-macros = { workspace = true, optional = true }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
 time = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]

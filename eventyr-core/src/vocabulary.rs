@@ -15,6 +15,8 @@ use crate::aggregate::Aggregate;
 /// The single place the id→stream mapping exists is
 /// [`for_aggregate`](StreamId::for_aggregate).
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct StreamId(String);
 
 impl StreamId {
@@ -41,9 +43,17 @@ impl From<&str> for StreamId {
     }
 }
 
+impl From<String> for StreamId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
 /// The position of an event within its stream. 1-based: the first event of
 /// a stream is at `Version(1)`.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct Version(u64);
 
 impl Version {
@@ -72,6 +82,8 @@ impl fmt::Display for Version {
 
 /// A position in the global, store-assigned, monotonic event sequence.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct Sequence(u64);
 
 impl Sequence {
