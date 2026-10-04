@@ -179,6 +179,7 @@ mod tests {
     fn raw(event_type: &str, payload: &str) -> RawEvent {
         RawEvent {
             event_type: event_type.into(),
+            schema_version: eventyr_core::version_registry::EventSchemaVersion::V1,
             payload: payload.as_bytes().to_vec(),
         }
     }

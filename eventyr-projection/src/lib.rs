@@ -71,6 +71,7 @@
 //!         ExpectedVersion::Empty,
 //!         vec![NewEvent::new(RawEvent {
 //!             event_type: "AmountV1".into(),
+//!             schema_version: EventSchemaVersion::V1,
 //!             payload: b"10".to_vec(),
 //!         })],
 //!     )

@@ -67,6 +67,7 @@ fn parse_amount_chain() -> UpcasterChain<u64> {
 fn raw(event_type: &str, payload: &str) -> NewEvent<RawEvent> {
     NewEvent::new(RawEvent {
         event_type: event_type.into(),
+        schema_version: eventyr_core::version_registry::EventSchemaVersion::V1,
         payload: payload.as_bytes().to_vec(),
     })
 }
@@ -133,10 +134,12 @@ async fn a_poison_payload_wedges_the_projection_and_the_checkpoint_stays_put() {
         events: vec![
             RawEvent {
                 event_type: "AmountV1".into(),
+                schema_version: eventyr_core::version_registry::EventSchemaVersion::V1,
                 payload: b"10".to_vec(),
             },
             RawEvent {
                 event_type: "AmountV1".into(),
+                schema_version: eventyr_core::version_registry::EventSchemaVersion::V1,
                 payload: b"poison".to_vec(),
             },
         ],

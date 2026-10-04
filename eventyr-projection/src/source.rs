@@ -19,6 +19,7 @@ use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
 use eventyr_core::subscription::{Batch, Checkpoint};
 use eventyr_core::upcast::RawEvent;
+use eventyr_core::version_registry::UpcasterRegistry;
 use eventyr_subscription::source::SubscriptionSource;
 
 use crate::chain::UpcasterChain;
@@ -95,3 +96,94 @@ where
 // `Arc<UpcastingSource>` implement `SubscriptionSource` through
 // `eventyr-subscription`'s own blanket delegation impls for `&S` and
 // `Arc<S>` — no per-adapter delegation needed here.
+
+/// The versioned sibling of [`UpcastingSource`]: runs an
+/// [`UpcasterRegistry`] — the 0.5.1 read-side — instead of a chain.
+///
+/// Each fetched [`RawEvent`] becomes a
+/// [`VersionedRaw`](eventyr_core::version_registry::VersionedRaw) — the
+/// same `event_type` and payload, its `schema_version` — and the
+/// registry walks that type's ladder. The output is the raw bytes of the
+/// current schema version; the caller decodes from those bytes into the
+/// current `E`. Nothing about the protocol changes: a failure still
+/// becomes a store error inside the existing `Fetch`, loud and final.
+pub struct VersionedSource<S> {
+    inner: S,
+    registry: UpcasterRegistry,
+}
+
+impl<S> VersionedSource<S> {
+    /// Wrap the raw `inner` source, upcasting through `registry`.
+    pub fn new(inner: S, registry: UpcasterRegistry) -> Self {
+        Self { inner, registry }
+    }
+
+    /// Unwrap the raw source.
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+}
+
+impl<S> VersionedSource<S>
+where
+    S: SubscriptionSource<Event = RawEvent>,
+{
+    /// Fetch from the raw source and run each envelope's event through
+    /// the registry's ladder — the whole body, factored so the
+    /// reference/`Arc` delegations share it.
+    async fn fetch_versioned(
+        &self,
+        from: Checkpoint,
+        max: usize,
+    ) -> Result<Batch<RawEvent>, StoreError> {
+        let batch = self.inner.fetch(from, max).await?;
+        let mut events = Vec::with_capacity(batch.events.len());
+        for envelope in batch.events {
+            // Loud, never skip: a poison payload aborts the fetch, the
+            // batch is never applied, and the checkpoint never advances
+            // past the offending event.
+            let raw = envelope.event;
+            let payload = self
+                .registry
+                .upcast(eventyr_core::version_registry::VersionedRaw {
+                    event_type: raw.event_type.clone(),
+                    version: raw.schema_version,
+                    payload: raw.payload,
+                })
+                .map_err(|error| {
+                    StoreError::other(format!(
+                        "upcasting sequence {}: {error}",
+                        envelope.sequence.as_u64(),
+                    ))
+                })?;
+            events.push(EventEnvelope {
+                sequence: envelope.sequence,
+                stream_id: envelope.stream_id,
+                version: envelope.version,
+                event: RawEvent {
+                    event_type: raw.event_type,
+                    schema_version: raw.schema_version,
+                    payload,
+                },
+                metadata: envelope.metadata,
+            });
+        }
+        Ok(Batch::new(events, batch.upper))
+    }
+}
+
+impl<S> SubscriptionSource for VersionedSource<S>
+where
+    S: SubscriptionSource<Event = RawEvent>,
+{
+    type Event = RawEvent;
+
+    async fn fetch(&self, from: Checkpoint, max: usize) -> Result<Batch<Self::Event>, StoreError> {
+        self.fetch_versioned(from, max).await
+    }
+}
+
+// Sources are shared like every other port: `&VersionedSource` and
+// `Arc<VersionedSource>` implement `SubscriptionSource` through
+// `eventyr-subscription`'s blanket delegation impls, the same as
+// `UpcastingSource`.

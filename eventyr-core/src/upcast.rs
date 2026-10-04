@@ -4,14 +4,35 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::error::UpcastError;
+use crate::version_registry::EventSchemaVersion;
 
-/// A stored event before upcasting: its type name and raw payload.
+/// A stored event before upcasting: its type name, payload, and the
+/// schema version it was written at.
+///
+/// The registry ([`crate::registry`]) reads `schema_version` to walk the
+/// event type's version ladder; a stored event that predates versioning
+/// carries [`SchemaVersion::V1`], the shape the code started with.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RawEvent {
     /// The stored event type name.
     pub event_type: String,
+    /// The schema version `payload` was written at. [`SchemaVersion::V1`]
+    /// for payloads that predate versioning.
+    pub schema_version: EventSchemaVersion,
     /// The stored payload, as raw bytes.
     pub payload: Vec<u8>,
+}
+
+impl RawEvent {
+    /// A `V1` event: the shape the code started with, before any
+    /// upcaster.
+    pub fn v1(event_type: impl Into<String>, payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            event_type: event_type.into(),
+            schema_version: EventSchemaVersion::V1,
+            payload: payload.into(),
+        }
+    }
 }
 
 /// Transforms one historical event shape into the current one.
@@ -43,6 +64,7 @@ mod tests {
             })?;
         upcaster.upcast(RawEvent {
             event_type: raw.event_type.clone(),
+            schema_version: raw.schema_version,
             payload: raw.payload.clone(),
         })
     }
@@ -70,6 +92,7 @@ mod tests {
         let upcasters: &[(&str, &dyn Upcaster<u64>)] = &[("AmountV1", &ParseAmount)];
         let raw = RawEvent {
             event_type: "AmountV1".into(),
+            schema_version: crate::version_registry::EventSchemaVersion::V1,
             payload: b"42".to_vec(),
         };
         assert_eq!(select(upcasters, &raw).expect("parses"), 42);
@@ -80,6 +103,7 @@ mod tests {
         let upcasters: &[(&str, &dyn Upcaster<u64>)] = &[("AmountV1", &ParseAmount)];
         let raw = RawEvent {
             event_type: "AmountV1".into(),
+            schema_version: crate::version_registry::EventSchemaVersion::V1,
             payload: b"not a number".to_vec(),
         };
         let error = select(upcasters, &raw).expect_err("a bad payload is data loss, not a skip");
@@ -91,6 +115,7 @@ mod tests {
         let upcasters: &[(&str, &dyn Upcaster<u64>)] = &[("AmountV1", &ParseAmount)];
         let raw = RawEvent {
             event_type: "AmountV0".into(),
+            schema_version: crate::version_registry::EventSchemaVersion::V1,
             payload: b"42".to_vec(),
         };
         let error = select(upcasters, &raw).expect_err("no upcaster selected");
