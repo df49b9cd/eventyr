@@ -152,7 +152,8 @@ pub mod prelude {
     pub use crate::schema::Persistable;
     pub use crate::version_registry::{EventSchemaVersion, VersionedRaw};
     pub use crate::snapshot::{
-        HasSnapshotState, OfferSnapshot, Snapshot, SnapshotPolicy, WritePolicy,
+        HasSnapshotState, InMemorySnapshotCache, OfferSnapshot, Snapshot, SnapshotCache,
+        SnapshotPolicy, WritePolicy,
     };
     pub use crate::subscription::{
         Batch, Checkpoint, SubscriptionAction, SubscriptionInput, SubscriptionMachine,

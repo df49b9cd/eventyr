@@ -12,8 +12,7 @@
 //! The two consumers a store shares: the write path encodes an event
 //! into a record before append, and the read path decodes it into a
 //! [`RawEvent`]/`UpcastingSource` feed or, with a matching
-//! [`crate::schema::DeserializeSchema`], straight back into the typed
-//! event for a projection.
+//! [`DecodeEvent`], straight back into the typed event for a projection.
 
 use eventyr_core::error::StoreError;
 use eventyr_core::schema::Persistable;
@@ -37,22 +36,22 @@ pub trait SchemaCodec {
     fn identify(record: &Self::Record) -> RawEvent;
 }
 
-/// A store's codec that can decode its own records back into the typed
-/// event. Implemented by codecs whose record is self-describing
-/// (Postgres's JSONB columns — type, version, and payload in one row —
-/// or fjall blobs); a raw byte stream cannot say which `E` it decodes
-/// to on its own.
+/// A codec that decodes its own records back into the typed event.
 ///
-/// This is where "decode back into the typed event" lives, apart from
-/// [`identify`](SchemaCodec::identify): the read path that *might
-/// upcast* calls `identify`, sees a `RawEvent`, and pushes it through
-/// the registry; the read path that *is already current* calls
-/// `decode` and skips the ladder.
-pub trait DecodeEvent<C: SchemaCodec> {
-    /// Decode a persisted record back into the typed event. The
-    /// codec selects on the record's stored identity; a mismatch is a
-    /// serialization error, never a guess.
-    fn decode(record: &C::Record, codec: &C) -> Result<Self, StoreError>
-    where
-        Self: Sized;
+/// Implemented on the codec, not the event: the trait extends
+/// [`SchemaCodec`] with the return leg. Implemented by codecs whose
+/// record is self-describing (Postgres's JSONB columns — type, version,
+/// and payload in one row — or fjall's serialized blob); a raw byte
+/// stream without framing cannot decode on its own.
+///
+/// The decode answers "the event as *stored*" — at the record's stored
+/// version. Upcasting a renamed or older shape is the registry's job,
+/// not this trait's: a read path that might upcast calls
+/// [`identify`](SchemaCodec::identify) and walks the ladder, a read
+/// path that knows the record is current calls `decode` and skips it.
+pub trait DecodeEvent: SchemaCodec {
+    /// Decode a persisted record back into the typed event. A payload
+    /// that fails to decode is a corrupt row, surfaced as a
+    /// [`StoreError`] — never unwrapped, never guessed.
+    fn decode(record: &Self::Record) -> Result<Self::Event, StoreError>;
 }

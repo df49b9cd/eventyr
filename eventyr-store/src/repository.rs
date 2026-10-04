@@ -11,6 +11,7 @@ use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
 use eventyr_core::snapshot::{HasSnapshotState, OfferSnapshot, WritePolicy};
 use eventyr_core::write::{RetryPolicy, WriteMachine, WriteOutcome};
+use futures::TryStreamExt;
 
 use crate::driver::{drive_write, drive_write_with_snapshots};
 use crate::snapshot_store::SnapshotStore;
@@ -301,6 +302,130 @@ where
             WriteOutcome::Noop => Ok(ExecutionOutcome::Noop),
             WriteOutcome::Rejected(error) => Err(ExecutionError::Domain(error)),
             WriteOutcome::Failed(error) => Err(ExecutionError::Store(error)),
+        }
+    }
+}
+use eventyr_core::snapshot::{Snapshot, SnapshotCache};
+
+/// A repository that holds the last-committed snapshot of each stream
+/// in-process (roadmap 0.6.5): next command starts from the cached
+/// state instead of re-folding the stream.
+///
+/// The cache is a snapshot the repository promotes: a miss runs the
+/// ordinary write protocol; a hit's state seeds the fold, and the
+/// append's optimistic-concurrency expectation still guards the write
+/// — a stale cache lands me as a conflict, never as a corrupt fold.
+/// Every commit's snapshot re-primes the cache, so the next interaction
+/// over this stream starts from it.
+pub struct CachedRepository<A, S, C>
+where
+    A: Aggregate,
+{
+    store: S,
+    cache: C,
+    retry_policy: RetryPolicy,
+    _aggregate: core::marker::PhantomData<fn(A)>,
+}
+
+impl<A, S, C> CachedRepository<A, S, C>
+where
+    A: HasSnapshotState,
+    A::State: Clone + Send,
+    S: EventStore<Event = A::Event>,
+    C: SnapshotCache<A::State>,
+{
+    /// A cached repository over `store`, sharing `cache` across
+    /// interactions.
+    pub fn new(store: S, cache: C, retry_policy: RetryPolicy) -> Self {
+        Self {
+            store,
+            cache,
+            retry_policy,
+            _aggregate: core::marker::PhantomData,
+        }
+    }
+
+    /// Execute `command` against `id`, priming the fold from the cache.
+    pub async fn execute_cached(
+        &mut self,
+        id: A::Id,
+        command: A::Command,
+    ) -> Result<ExecutionOutcome<A::Event, A::State>, ExecutionError<A>> {
+        let mut machine = WriteMachine::<A, A::State>::with_cache(id, command, self.retry_policy);
+        let action = machine.start();
+        let eventyr_core::write::WriteAction::Primed { stream_id } = action else {
+            unreachable!("a cache-primed machine opens on Primed");
+        };
+        let stream_id = stream_id.clone();
+        // Seed: the cache's latest prime, or the state the machine
+        // starts from (a cache miss is a miss, not a guess about `Id`).
+        let seed = match self.cache.lookup(&stream_id) {
+            Some(snapshot) => snapshot,
+            None => Snapshot {
+                stream_id: stream_id.clone(),
+                version: eventyr_core::vocabulary::Version::EMPTY,
+                state: machine.initial_state().clone(),
+            },
+        };
+        let action = machine.handle(eventyr_core::write::WriteInput::Cached { snapshot: seed });
+        let outcome = self.drive_from(action, &mut machine).await;
+        match outcome {
+            WriteOutcome::Committed { committed, snapshot } => {
+                if let Some(offer) = &snapshot {
+                    self.cache.prime(offer.clone().into_inner());
+                }
+                Ok(ExecutionOutcome::Committed { committed, snapshot })
+            }
+            // A command that decided nothing still moves the cache: the
+            // fold the decision ran against is itself the freshest state.
+            WriteOutcome::Noop => {
+                self.cache.prime(Snapshot {
+                    stream_id,
+                    version: machine.version(),
+                    state: machine.initial_state().clone(),
+                });
+                Ok(ExecutionOutcome::Noop)
+            }
+            WriteOutcome::Rejected(error) => Err(ExecutionError::Domain(error)),
+            WriteOutcome::Failed(error) => Err(ExecutionError::Store(error)),
+        }
+    }
+
+    /// Finish the interaction after its priming answer: the async
+    /// driver over the store.
+    async fn drive_from(
+        &self,
+        action: eventyr_core::write::WriteAction<A::Event, A::Error, A::State>,
+        machine: &mut WriteMachine<A, A::State>,
+    ) -> WriteOutcome<A::Event, A::Error, A::State> {
+        let mut action = action;
+        loop {
+            use eventyr_core::write::WriteInput;
+            action = match action {
+                eventyr_core::write::WriteAction::LoadStream { stream_id, from } => {
+                    let loaded: Result<Vec<EventEnvelope<A::Event>>, _> =
+                        self.store.stream(&stream_id, from).try_collect().await;
+                    machine.handle(match loaded {
+                        Ok(events) => WriteInput::Loaded { events },
+                        Err(error) => WriteInput::Failed(error),
+                    })
+                }
+                eventyr_core::write::WriteAction::Append {
+                    stream_id,
+                    expected,
+                    events,
+                } => match self.store.append(&stream_id, expected, events).await {
+                    Ok(committed) => machine.handle(WriteInput::Appended { committed }),
+                    Err(error) => machine.handle(error.into()),
+                },
+                eventyr_core::write::WriteAction::LoadSnapshot { .. }
+                | eventyr_core::write::WriteAction::Primed { .. } => machine.handle(
+                    WriteInput::Failed(StoreError::other(
+                        "the cached path only loads and appends; it never re-reads a snapshot",
+                    )),
+                ),
+                eventyr_core::write::WriteAction::Done(outcome) => return outcome,
+            };
         }
     }
 }

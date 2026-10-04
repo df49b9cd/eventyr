@@ -85,6 +85,14 @@ where
             WriteAction::LoadSnapshot { .. } => {
                 machine.handle(WriteInput::SnapshotLoaded { snapshot: None })
             }
+            WriteAction::Primed { .. } => {
+                // A priming machine expects its cache answer from the
+                // caller the repository routes through here — the plain
+                // driver has no cache to consult.
+                machine.handle(WriteInput::Failed(StoreError::other(
+                    "Primed on a cache-off driver: drive this machine through the repository's cached route",
+                )))
+            }
             WriteAction::Append {
                 stream_id,
                 expected,
@@ -171,6 +179,9 @@ where
                 }
                 Err(error) => machine.handle(WriteInput::Failed(error)),
             },
+            WriteAction::Primed { .. } => machine.handle(WriteInput::Failed(StoreError::other(
+                "Primed on a cache-off driver: drive this machine through the repository's cached route",
+            ))),
             WriteAction::Append {
                 stream_id,
                 expected,

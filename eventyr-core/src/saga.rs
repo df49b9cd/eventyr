@@ -85,28 +85,6 @@ pub struct SagaCommand<C> {
     pub metadata: Metadata,
 }
 
-impl<C> SagaCommand<C> {
-    /// Overlay metadata onto this command: fields set on `interaction`
-    /// (the 0.5.2 boundary stamp) win over the event's own ids, which
-    /// win over whatever the reaction set. Called by the driver at
-    /// dispatch time; the saga's own `metadata` is the least-authoritative
-    /// layer.
-    pub fn overlay_metadata(&mut self, interaction: Metadata, event: Metadata) {
-        self.metadata = Metadata {
-            causation_id: interaction
-                .causation_id
-                .or(event.causation_id)
-                .or(self.metadata.causation_id.clone()),
-            correlation_id: interaction
-                .correlation_id
-                .or(event.correlation_id)
-                .or(self.metadata.correlation_id.clone()),
-            #[cfg(feature = "time")]
-            timestamp: interaction.timestamp.or(event.timestamp),
-        };
-    }
-}
-
 /// What the machine wants the driver to do.
 ///
 /// Actions are data, not calls: the driver interprets each variant,

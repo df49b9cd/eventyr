@@ -54,6 +54,29 @@ impl Metadata {
             ..Self::default()
         }
     }
+
+    /// Compose three layers, least-authoritative first: set fields on
+    /// `interaction` win over the event's own ids, which win over `own`
+    /// (the record a write *in progress* carries). This is the saga
+    /// pipeline's seam: the boundary answers the request, the event
+    /// answers the causal chain, the command's own stamp is the first
+    /// draft.
+    pub fn overlay(interaction: &Metadata, event: &Metadata, own: &Metadata) -> Self {
+        Self {
+            causation_id: interaction
+                .causation_id
+                .clone()
+                .or_else(|| event.causation_id.clone())
+                .or_else(|| own.causation_id.clone()),
+            correlation_id: interaction
+                .correlation_id
+                .clone()
+                .or_else(|| event.correlation_id.clone())
+                .or_else(|| own.correlation_id.clone()),
+            #[cfg(feature = "time")]
+            timestamp: interaction.timestamp.or(event.timestamp).or(own.timestamp),
+        }
+    }
 }
 
 /// An event the machine asks the driver to append.

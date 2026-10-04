@@ -42,6 +42,7 @@
 
 #![warn(missing_docs)]
 
+pub mod codec;
 #[cfg(feature = "snapshots")]
 pub mod snapshots;
 mod store;
