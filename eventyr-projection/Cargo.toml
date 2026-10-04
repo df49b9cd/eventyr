@@ -1,14 +1,19 @@
 [package]
 name = "eventyr-projection"
-description = "Projection runner and checkpointing for eventyr."
+description = "Read-path correctness for eventyr: upcaster chains, raw-to-typed sources, schema-versioned rebuilds."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-keywords = ["event-sourcing", "projection", "cqrs"]
+keywords = ["event-sourcing", "projection", "cqrs", "upcasting"]
 
 [lints]
 workspace = true
 
 [dependencies]
-eventyr-core = { workspace = true }
+eventyr-core = { workspace = true, features = ["std"] }
+eventyr-subscription = { workspace = true }
+
+[dev-dependencies]
+eventyr-store = { workspace = true }
+tokio = { version = "1", features = ["rt", "macros", "time"] }

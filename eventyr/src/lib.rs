@@ -12,11 +12,12 @@
 //! [`drive_write`](store::prelude::drive_write) driver, and the
 //! [`AggregateRepository`](store::prelude::AggregateRepository). The
 //! `subscription` feature re-exports the catch-up subscription side as
-//! [`subscription`]. The workspace also ships `eventyr-store-postgres`
-//! (the durable `EventStore`/`StreamsAll` over Postgres) and
-//! `eventyr-projection` (projection helpers) as standalone crates; the
-//! umbrella pulls them in as their own features over time — see the
-//! design document for the roadmap.
+//! [`subscription`]; the `projection` feature re-exports the read-path
+//! layer (upcaster chains, raw→typed sources, schema-versioned
+//! rebuilds) as [`projection`]. The workspace also ships
+//! `eventyr-store-postgres` (the durable `EventStore`/`StreamsAll` over
+//! Postgres) as a standalone crate; the umbrella pulls it in as its own
+//! feature over time — see the design document for the roadmap.
 //!
 //! ```
 //! use eventyr::prelude::*;
@@ -38,3 +39,9 @@ pub use eventyr_store as store;
 /// `eventyr-subscription` behind the `subscription` feature.
 #[cfg(feature = "subscription")]
 pub use eventyr_subscription as subscription;
+
+/// The read-path layer: upcaster chains, the raw→typed source adapter,
+/// and schema-versioned rebuilds — re-exported from
+/// `eventyr-projection` behind the `projection` feature.
+#[cfg(feature = "projection")]
+pub use eventyr_projection as projection;

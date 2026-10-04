@@ -22,8 +22,12 @@ store = ["dep:eventyr-store"]
 subscription = ["store", "dep:eventyr-subscription"]
 # The §2 EventBus / §6 Subscription trait (live-push seam, 0.3).
 bus = ["subscription", "eventyr-subscription/bus"]
+# Re-exports the read-path layer: upcaster chains, raw→typed sources,
+# schema-versioned rebuilds.
+projection = ["subscription", "dep:eventyr-projection"]
 
 [dependencies]
 eventyr-core = { workspace = true }
 eventyr-store = { workspace = true, optional = true }
 eventyr-subscription = { workspace = true, optional = true }
+eventyr-projection = { workspace = true, optional = true }

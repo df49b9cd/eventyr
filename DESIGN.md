@@ -33,7 +33,7 @@ eventyr/                    # umbrella: re-exports core + prelude
 ├── eventyr-store/          # async EventStore/StreamsAll traits, in-memory impl, drivers, repository
 ├── eventyr-macros/         # #[derive(Aggregate)] etc. (proc-macro crate)
 ├── eventyr-store-postgres/ # sqlx-based store, migrations
-├── eventyr-projection/     # Projector runner shell, checkpointing
+├── eventyr-projection/     # read path: upcaster chains, raw→typed sources, schema-versioned rebuilds
 └── eventyr-subscription/   # catch-up subscriptions, event bus trait
 ```
 
@@ -297,7 +297,7 @@ where
 
 This is `katha`'s `make_handler` / `sourcerer`'s `GenericRepository` / `eventcore`'s executor — all converged on the same protocol — but with the protocol *extracted* into a testable machine instead of an async loop.
 
-## 6. Projections & subscriptions (eventyr-projection, eventyr-subscription)
+## 6. Projections & subscriptions (eventyr-subscription, eventyr-projection)
 
 ```rust
 pub trait Projection {
@@ -398,8 +398,8 @@ The `UNIQUE` constraint's backing index serves the per-stream lookups; no separa
 ## 12. Roadmap
 
 - **0.1** — core traits + protocol vocabulary, `WriteMachine` with transition tests, in-memory store, async + scripted drivers, repository wrapper, derive macros.
-- **0.2** — Postgres store + migrations, upcasters, checkpointed subscriptions (`ProjectorMachine`), `TestScenario` (`given(events).when(command).then(events)`).
-- **0.3** — projection runner, snapshot support (opt-in, `SnapshotMachine`), `EventBus` trait.
+- **0.2** — Postgres store + migrations, upcasters, checkpointed subscriptions (`SubscriptionMachine`), `TestScenario` (`given(events).when(command).then(events)`).
+- **0.3** — the projection read path (upcaster chains, schema-versioned rebuilds), snapshot support (opt-in, `SnapshotMachine`), `EventBus` trait. Single-feed fan-out to N projections on one checkpoint, if ever built, is a combinator over the existing `SubscriptionMachine` (`Fanout` multiplexing the one `Apply` action to N idempotent members) — never a new machine, and deferred until a "must advance together" use case justifies it.
 - **0.4+** — multi-stream commands (eventcore-style), embedded stores (fjall/sled) + the blocking driver, contract-test crate.
 
 Multi-stream commands deliberately come *last*: they complicate the mental model, and Eventyr's identity is "small, composable, boring in the good way". Ship the single-stream core first; add `StreamResolver`-style dynamic boundaries once the core is proven.

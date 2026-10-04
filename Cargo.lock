@@ -279,6 +279,7 @@ name = "eventyr"
 version = "0.1.0"
 dependencies = [
  "eventyr-core",
+ "eventyr-projection",
  "eventyr-store",
  "eventyr-subscription",
 ]
@@ -310,6 +311,9 @@ name = "eventyr-projection"
 version = "0.1.0"
 dependencies = [
  "eventyr-core",
+ "eventyr-store",
+ "eventyr-subscription",
+ "tokio",
 ]
 
 [[package]]

@@ -22,6 +22,7 @@ eventyr-macros = { path = "eventyr-macros", version = "0.1.0" }
 eventyr-store = { path = "eventyr-store", version = "0.1.0" }
 eventyr-store-postgres = { path = "eventyr-store-postgres", version = "0.1.0" }
 eventyr-subscription = { path = "eventyr-subscription", version = "0.1.0" }
+eventyr-projection = { path = "eventyr-projection", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
