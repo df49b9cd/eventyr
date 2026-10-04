@@ -42,6 +42,40 @@ pub trait Projection: Send {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
+/// One [`Projection`] over many: applies each event to every member, in
+/// order, before the ack moves.
+///
+/// A rejection from any member rejects the batch, so the runner backs
+/// off and redelivers the batch to every member — the at-least-once
+/// contract applies to the fan-out as one projection.
+pub struct Fanout<P> {
+    projections: Vec<P>,
+}
+
+impl<P> Fanout<P> {
+    /// A fan-out applying each event to every member of `projections`,
+    /// in order.
+    pub fn new(projections: Vec<P>) -> Self {
+        Self { projections }
+    }
+}
+
+impl<P> Projection for Fanout<P>
+where
+    P: Projection,
+    P::Event: Sync,
+{
+    type Event = P::Event;
+    type Error = P::Error;
+
+    async fn apply(&mut self, event: &EventEnvelope<Self::Event>) -> Result<(), Self::Error> {
+        for projection in &mut self.projections {
+            projection.apply(event).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Drives `machine` against a source, a checkpoint store, and a
 /// projection until it finishes, reporting its terminal outcome.
 ///
@@ -108,6 +142,35 @@ where
             SubscriptionAction::Done(outcome) => return outcome,
         };
     }
+}
+
+/// The blocking [`drive_projector`]: drives `machine` to its outcome
+/// without an async runtime, parking the thread through every `sleep`.
+pub fn drive_projector_blocking<E, S, C, P, F, Fut>(
+    machine: &mut SubscriptionMachine<E>,
+    name: &str,
+    source: &S,
+    checkpoints: &C,
+    projection: P,
+    sleep: F,
+) -> SubscriptionOutcome
+where
+    S: SubscriptionSource<Event = E>,
+    C: CheckpointStore,
+    P: Projection<Event = E>,
+    P::Error: core::fmt::Display,
+    F: FnMut(core::time::Duration) -> Fut,
+    Fut: Future<Output = ()>,
+    E: Clone + Send,
+{
+    futures::executor::block_on(drive_projector(
+        machine,
+        name,
+        source,
+        checkpoints,
+        projection,
+        sleep,
+    ))
 }
 
 /// A bundled projector: `source` + `checkpoints` + `projection` + a

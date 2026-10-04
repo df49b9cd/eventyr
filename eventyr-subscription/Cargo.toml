@@ -18,7 +18,7 @@ bus = []
 [dependencies]
 eventyr-core = { workspace = true, features = ["std"] }
 eventyr-store = { workspace = true }
-futures = { version = "0.3", default-features = false, features = ["alloc"] }
+futures = { version = "0.3", default-features = false, features = ["alloc", "executor"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time"] }
