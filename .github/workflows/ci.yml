@@ -49,4 +49,4 @@ jobs:
       # The Postgres-backed suites are `#[ignore]`d for casual `cargo
       # test`; the service above makes the URL real, so run them here.
       - name: Postgres integration tests
-        run: cargo test -p eventyr-store-postgres --features snapshots -- --ignored
+        run: cargo test -p eventyr-store-postgres --features snapshots -- --ignored --include-ignored

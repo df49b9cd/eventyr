@@ -25,6 +25,7 @@
 pub mod snapshots;
 pub mod codec;
 pub mod store;
+pub mod views;
 
 use std::sync::Arc;
 

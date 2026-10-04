@@ -455,6 +455,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "eventyr-core",
+ "eventyr-projection",
  "eventyr-store",
  "eventyr-store-testing",
  "futures",
