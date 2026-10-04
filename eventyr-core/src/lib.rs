@@ -127,6 +127,7 @@ pub mod error;
 pub mod event_name;
 pub mod metrics;
 pub mod saga;
+pub mod schema;
 pub mod version_registry;
 pub mod snapshot;
 pub mod subscription;
@@ -148,6 +149,7 @@ pub mod prelude {
     pub use crate::event_name::EventName;
     pub use crate::metrics::{Metrics, NoopMetrics};
     pub use crate::saga::{Saga, SagaAction, SagaCommand, SagaInput, SagaMachine, SagaOutcome};
+    pub use crate::schema::Persistable;
     pub use crate::version_registry::{EventSchemaVersion, VersionedRaw};
     pub use crate::snapshot::{
         HasSnapshotState, OfferSnapshot, Snapshot, SnapshotPolicy, WritePolicy,

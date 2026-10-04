@@ -23,6 +23,7 @@
 
 #[cfg(feature = "snapshots")]
 pub mod snapshots;
+pub mod codec;
 pub mod store;
 
 use std::sync::Arc;

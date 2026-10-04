@@ -107,6 +107,7 @@ pub mod driver;
 pub mod memory;
 pub mod metrics;
 pub mod repository;
+pub mod schema;
 pub mod snapshot_store;
 pub mod store;
 
