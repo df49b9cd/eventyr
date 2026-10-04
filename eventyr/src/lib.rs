@@ -12,13 +12,18 @@
 //! [`drive_write`](store::prelude::drive_write) driver, and the
 //! [`AggregateRepository`](store::prelude::AggregateRepository). The
 //! `subscription` feature re-exports the catch-up subscription side as
-//! [`subscription`]; the `projection` feature re-exports the read-path
+//! [`subscription`]; the `bus` feature adds the `EventBus` live-push
+//! trait on top of it; the `projection` feature re-exports the read-path
 //! layer (upcaster chains, raw→typed sources, schema-versioned
-//! rebuilds) as [`projection`]. The workspace also ships
+//! rebuilds) as `projection`. The workspace ships
 //! `eventyr-store-postgres` (the durable `EventStore`/`StreamsAll` over
 //! Postgres) as a standalone crate; the umbrella pulls it in as its own
 //! feature over time — see the design document for the roadmap.
 //!
+//! ## A taste
+//!
+#![doc = include_str!("../../README.md")]
+#![doc = ""]
 //! ```
 //! use eventyr::prelude::*;
 //!

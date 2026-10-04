@@ -2,44 +2,145 @@
 
 Event sourcing for Rust — pure machines, thin drivers.
 
-> **Status: pre-0.1.** `eventyr-core` (the `Aggregate` trait, the protocol
-> vocabulary, and the `WriteMachine` with its transition tests), the store
-> side (`EventStore`, drivers, repository), and `eventyr-macros`
-> (`#[derive(Aggregate)]`, `#[derive(EventName)]`) are implemented. See
-> [DESIGN.md](DESIGN.md) for the full design.
+A library of small, composable traits, not a framework. The domain is two
+pure functions (`decide`/`apply`); every multi-step interaction — the
+load → fold → decide → append write path, projection checkpointing with
+at-least-once delivery — is a sans-IO state machine that consumes results
+and emits actions as data. Drivers perform the I/O. The same machine runs
+under tokio, blocking code, or a scripted test harness with zero mocks.
+See [DESIGN.md](DESIGN.md) for the full design.
 
-Eventyr is a library of small, composable traits — not a framework. The domain
-is two pure functions; multi-step protocols (the write path, projection
-checkpointing) are sans-IO state machines that consume results and emit
-actions; drivers perform the I/O. The same machine runs under tokio, blocking
-code, or a deterministic test harness.
+Non-goals worth naming: not a runtime or actor framework, no HTTP or
+transport, no baked-in bus integrations (`EventBus` stays a
+user-implementable trait), no ORM, no DDD toolkit.
 
 ## Crates
 
-| Crate | Contents |
-|---|---|
-| `eventyr` | Umbrella: re-exports core + store, plus a prelude |
-| `eventyr-core` | `Aggregate`, protocol vocabulary, `WriteMachine` — `no_std + alloc`, zero deps |
-| `eventyr-store` | `EventStore`/`StreamsAll` traits, in-memory store, drivers, repository |
-| `eventyr-macros` | `#[derive(Aggregate)]`, `#[derive(EventName)]` — convention wiring, sugar not API |
-| `eventyr-store-postgres` | sqlx-based store *(planned)* |
-| `eventyr-projection` | Projector runner, checkpointing *(planned)* |
-| `eventyr-subscription` | Catch-up subscriptions, event bus trait *(planned)* |
+| Crate | Contents | Status |
+|---|---|---|
+| `eventyr` | Umbrella: re-exports core plus, behind features, the store/subscription/projection sides, and a prelude | shipped |
+| `eventyr-core` | `Aggregate`, protocol vocabulary (`StreamId`/`Version`/`Sequence`/`ExpectedVersion`/`StoreError`/envelope/`Metadata`), `WriteMachine`, `SubscriptionMachine`, upcast vocabulary (`Upcaster`/`RawEvent`/`UpcastError`) — `no_std + alloc`, zero deps | shipped |
+| `eventyr-store` | `EventStore`/`StreamsAll` ports, `InMemoryStore`, `drive_write` driver, `AggregateRepository`, prelude | shipped |
+| `eventyr-macros` | `#[derive(Aggregate)]`, `#[derive(EventName)]` — convention wiring, sugar not API | shipped |
+| `eventyr-store-postgres` | sqlx-based `EventStore`/`StreamsAll` (`PgStore`, `append_events` PL/pgSQL, DESIGN §9's single-table sketch made real) — a standalone crate, not an umbrella feature yet | shipped |
+| `eventyr-projection` | Read-path correctness layer: `UpcasterChain`/`ClosureUpcaster`, `UpcastingSource` (raw→typed), `RebuildPlan`/`SchemaVersion`/`checkpoint_key` | shipped |
+| `eventyr-subscription` | Catch-up runner: `Projection` trait, `Projector`/`drive_projector`, `CheckpointStore`/`InMemoryCheckpointStore`, `StoreSubscription`; `EventBus` trait behind its `bus` feature | shipped |
+
+Postgres persistence is a standalone crate today; the umbrella pulls it in
+as its own feature over time.
+
+## Umbrella features
+
+| Feature | Default | Enables |
+|---|---|---|
+| `time` | yes | `Metadata::timestamp` |
+| `macros` | yes | `#[derive(Aggregate)]`, `#[derive(EventName)]` via the prelude |
+| `store` | yes | `eventyr::store` — ports, `InMemoryStore`, `drive_write`, `AggregateRepository` |
+| `subscription` | no | `eventyr::subscription` — `Projection`, `Projector`, checkpoint store |
+| `bus` | no | `subscription` + the `EventBus` live-push trait |
+| `projection` | no | `subscription` + `eventyr::projection` — upcaster chains, rebuilds |
 
 ## A taste
 
-```rust
-use eventyr::prelude::*;
+Define an aggregate as two pure functions, then open and deposit through
+the repository — the machine behind it is pure; the `InMemoryStore` here
+keeps the example self-contained:
 
-// Drive the write machine by hand — no store, no async, no I/O.
-let mut machine = WriteMachine::<MyAggregate>::new(
-    MyAggregateId(7),
-    MyCommand::DoIt,
+```rust
+use std::fmt;
+use eventyr::prelude::*;
+use eventyr::store::prelude::*;
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct AccountId(u64);
+impl fmt::Display for AccountId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+enum AccountEvent { Opened, Deposited { amount: u64 } }
+
+#[derive(Clone, Debug)]
+enum AccountCommand { Open, Deposit { amount: u64 } }
+
+#[derive(Debug, PartialEq)]
+enum AccountError { AlreadyOpen, NotOpen }
+impl fmt::Display for AccountError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            AccountError::AlreadyOpen => "account is already open",
+            AccountError::NotOpen => "account is not open",
+        })
+    }
+}
+
+#[derive(Debug)]
+struct AccountState { open: bool, balance: u64 }
+
+struct Account;
+
+impl Aggregate for Account {
+    const NAME: &'static str = "account";
+    type Id = AccountId;
+    type State = AccountState;
+    type Event = AccountEvent;
+    type Command = AccountCommand;
+    type Error = AccountError;
+
+    fn initial(_id: &Self::Id) -> Self::State {
+        AccountState { open: false, balance: 0 }
+    }
+
+    fn apply(state: &mut Self::State, event: &Self::Event) {
+        match event {
+            AccountEvent::Opened => { state.open = true; state.balance = 0; }
+            AccountEvent::Deposited { amount } => state.balance += amount,
+        }
+    }
+
+    fn decide(state: &Self::State, command: &Self::Command)
+        -> Result<Vec<Self::Event>, Self::Error> {
+        match command {
+            AccountCommand::Open if state.open => Err(AccountError::AlreadyOpen),
+            AccountCommand::Open => Ok(vec![AccountEvent::Opened]),
+            AccountCommand::Deposit { .. } if !state.open => Err(AccountError::NotOpen),
+            AccountCommand::Deposit { amount } =>
+                Ok(vec![AccountEvent::Deposited { amount: *amount }]),
+        }
+    }
+}
+
+# async fn demo() {
+let store = InMemoryStore::new();
+let repository = AggregateRepository::<Account, _>::new(
+    store,
     RetryPolicy::default(),
 );
 
-match machine.start() {
-    WriteAction::LoadStream { stream_id, from } => { /* read the stream */ }
-    _ => unreachable!(),
+// Open, then deposit: the second call folds the first's event.
+repository.execute(AccountId(1), AccountCommand::Open).await.expect("open");
+match repository.execute(AccountId(1), AccountCommand::Deposit { amount: 50 }).await {
+    Ok(ExecutionOutcome::Committed(events)) => assert_eq!(events.len(), 1),
+    Ok(ExecutionOutcome::Noop) => panic!("a deposit decides an event"),
+    Err(_) => panic!("the deposit must commit"),
 }
+# }
+# fn main() {
+#     tokio::runtime::Builder::new_current_thread()
+#         .enable_all()
+#         .build()
+#         .expect("runtime")
+#         .block_on(demo());
+# }
 ```
+
+## Design
+
+The design document is the constitution of this workspace:
+
+- [DESIGN.md](DESIGN.md) — the full design
+- [§4.5 · the write machine](DESIGN.md#45-the-write-machine--sans-io-core-of-the-repository) — the machine/driver split, the flagship explanation
+- [§7 · machine modeling rules](DESIGN.md#7-machine-modeling-rules-sans-io-discipline) — the sans-IO discipline and the machine table
+- [§12 · roadmap](DESIGN.md#12-roadmap) — what is shipped, what is pending

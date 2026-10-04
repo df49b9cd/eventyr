@@ -397,9 +397,9 @@ The `UNIQUE` constraint's backing index serves the per-stream lookups; no separa
 
 ## 12. Roadmap
 
-- **0.1** — core traits + protocol vocabulary, `WriteMachine` with transition tests, in-memory store, async + scripted drivers, repository wrapper, derive macros.
-- **0.2** — Postgres store + migrations, upcasters, checkpointed subscriptions (`SubscriptionMachine`), `TestScenario` (`given(events).when(command).then(events)`).
-- **0.3** — the projection read path (upcaster chains, schema-versioned rebuilds), snapshot support (opt-in, `SnapshotMachine`), `EventBus` trait. Single-feed fan-out to N projections on one checkpoint, if ever built, is a combinator over the existing `SubscriptionMachine` (`Fanout` multiplexing the one `Apply` action to N idempotent members) — never a new machine, and deferred until a "must advance together" use case justifies it.
+- **0.1** — shipped. Core traits + protocol vocabulary, `WriteMachine` with transition tests, in-memory store, async + scripted drivers, repository wrapper, derive macros.
+- **0.2** — partially shipped: Postgres store + migrations (`eventyr-store-postgres`), upcasters (upcast vocabulary in core, chains and raw→typed sources in `eventyr-projection`), checkpointed subscriptions (`SubscriptionMachine`, the projector runner). Pending: `TestScenario` (`given(events).when(command).then(events)`).
+- **0.3** — partially shipped: the projection read path (upcaster chains, schema-versioned rebuilds), `EventBus` trait (behind `eventyr-subscription`'s `bus` feature). Pending: snapshot support (opt-in, `SnapshotMachine`). Single-feed fan-out to N projections on one checkpoint, if ever built, is a combinator over the existing `SubscriptionMachine` (`Fanout` multiplexing the one `Apply` action to N idempotent members) — never a new machine, and deferred until a "must advance together" use case justifies it.
 - **0.4+** — multi-stream commands (eventcore-style), embedded stores (fjall/sled) + the blocking driver, contract-test crate.
 
 Multi-stream commands deliberately come *last*: they complicate the mental model, and Eventyr's identity is "small, composable, boring in the good way". Ship the single-stream core first; add `StreamResolver`-style dynamic boundaries once the core is proven.

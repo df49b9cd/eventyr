@@ -31,3 +31,7 @@ eventyr-core = { workspace = true }
 eventyr-store = { workspace = true, optional = true }
 eventyr-subscription = { workspace = true, optional = true }
 eventyr-projection = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Drives the README "A taste" doctest (included via `include_str!`).
+tokio = { version = "1", features = ["rt"] }

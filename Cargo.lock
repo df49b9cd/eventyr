@@ -282,6 +282,7 @@ dependencies = [
  "eventyr-projection",
  "eventyr-store",
  "eventyr-subscription",
+ "tokio",
 ]
 
 [[package]]
