@@ -135,7 +135,7 @@ pub mod write;
 pub mod prelude {
     //! The common vocabulary: import everything and define an aggregate.
 
-    pub use crate::aggregate::{Aggregate, AggregateId};
+    pub use crate::aggregate::{Aggregate, AggregateId, Optional};
     pub use crate::batch::{
         AggregateFold, BatchAction, BatchDecision, BatchInput, BatchMachine, BatchOutcome,
         CommittedStream, Decide, Fold, NoFold, StreamAppend,

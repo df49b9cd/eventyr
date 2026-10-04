@@ -71,3 +71,78 @@ pub trait Aggregate {
         command: &Self::Command,
     ) -> Result<Vec<Self::Event>, Self::Error>;
 }
+
+/// Lift an aggregate's state into [`Option`]: `None` is "does not exist
+/// yet".
+///
+/// Event-sourced aggregates whose instances come into being through an
+/// event (an account on `Opened`, an order on `Placed`) have no honest
+/// state before it: the natural `State` is `Option<T>`, with
+/// `initial` returning `None`. [`Optional`] is the helper for that
+/// shape — implement it for the *inner* state type and use
+/// [`apply_state`](Optional::apply_state) as the aggregate's `apply`:
+/// absent until the first event creates it, then plain delegation.
+///
+/// `initial` and `decide` are the aggregate's own: whether a command may
+/// run against `None` ("only `Open` on a missing account") is the
+/// domain's question, not the adapter's.
+///
+/// ```rust
+/// use eventyr_core::aggregate::{Aggregate, Optional};
+/// # use core::fmt;
+/// # #[derive(Clone, PartialEq, Eq, Hash, Debug)]
+/// # struct WidgetId(u64);
+/// # impl fmt::Display for WidgetId { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.0) } }
+///
+/// #[derive(Default)]
+/// struct WidgetState { count: u64 }
+///
+/// #[derive(Debug)]
+/// enum WidgetEvent { Added }
+/// # #[derive(Debug)] enum WidgetCommand { Add }
+/// # #[derive(Debug)] enum WidgetError {}
+/// # impl fmt::Display for WidgetError { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { Ok(()) } }
+///
+/// impl Optional for WidgetState {
+///     type Event = WidgetEvent;
+///     fn apply(state: &mut Self, event: &WidgetEvent) {
+///         match event { WidgetEvent::Added => state.count += 1 }
+///     }
+/// }
+///
+/// struct Widget;
+/// impl Aggregate for Widget {
+///     const NAME: &'static str = "widget";
+///     type Id = WidgetId;
+///     type State = Option<WidgetState>; // "no widget yet"
+///     type Event = WidgetEvent;
+///     type Command = WidgetCommand;
+///     type Error = WidgetError;
+///     fn initial(_id: &WidgetId) -> Option<WidgetState> { None }
+///     fn apply(state: &mut Option<WidgetState>, event: &WidgetEvent) {
+///         Optional::apply_state(state, event); // the bridge
+///     }
+///     fn decide(state: &Option<WidgetState>, command: &WidgetCommand)
+///         -> Result<Vec<WidgetEvent>, WidgetError> {
+///         match command { WidgetCommand::Add => Ok(vec![WidgetEvent::Added]) }
+///     }
+/// }
+/// ```
+pub trait Optional: Default {
+    /// The domain event that brings the state into being, and every
+    /// event folded after.
+    type Event;
+    /// Fold one event into an existing state (pure and total, like
+    /// [`Aggregate::apply`](Aggregate::apply)).
+    fn apply(state: &mut Self, event: &Self::Event);
+
+    /// Fold one event into an `Option<Self>` state: `None` becomes
+    /// `Some(Self::default())` before delegating to
+    /// [`apply`](Optional::apply). This is the body an `Aggregate`
+    /// impl's `apply` writes.
+    fn apply_state(state: &mut Option<Self>, event: &Self::Event) {
+        let state = state.get_or_insert_with(Self::default);
+        Self::apply(state, event);
+    }
+}
+
