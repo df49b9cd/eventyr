@@ -111,6 +111,7 @@ type AppendArgs = (
     Vec<serde_json::Value>,
     Vec<Option<String>>,
     Vec<Option<String>>,
+    Vec<Option<String>>,
 );
 
 fn append_args<E: serde::Serialize + EventName>(
@@ -122,13 +123,15 @@ fn append_args<E: serde::Serialize + EventName>(
     let mut payloads = Vec::with_capacity(events.len());
     let mut causations = Vec::with_capacity(events.len());
     let mut correlations = Vec::with_capacity(events.len());
+    let mut keys = Vec::with_capacity(events.len());
     for new_event in events {
         names.push(new_event.event.event_name().to_string());
         payloads.push(serde_json::to_value(&new_event.event).map_err(PgStoreError::from)?);
         causations.push(new_event.metadata.causation_id);
         correlations.push(new_event.metadata.correlation_id);
+        keys.push(new_event.metadata.idempotency_key);
     }
-    Ok((kind, exact, names, payloads, causations, correlations))
+    Ok((kind, exact, names, payloads, causations, correlations, keys))
 }
 
 /// Run one `append_events` call against `conn` within an open
@@ -138,9 +141,9 @@ async fn append_events_tx(
     stream_id: &str,
     args: AppendArgs,
 ) -> Result<Vec<EventRow>, sqlx::Error> {
-    let (kind, exact, names, payloads, causations, correlations) = args;
+    let (kind, exact, names, payloads, causations, correlations, keys) = args;
     let query = sqlx::AssertSqlSafe(format!(
-        "SELECT {EVENT_COLUMNS} FROM append_events($1, $2, $3, $4, $5, $6, $7)"
+        "SELECT {EVENT_COLUMNS} FROM append_events($1, $2, $3, $4, $5, $6, $7, $8)"
     ));
     sqlx::query_as::<_, EventRow>(query)
         .bind(kind)
@@ -150,6 +153,7 @@ async fn append_events_tx(
         .bind(&payloads[..])
         .bind(&causations[..])
         .bind(&correlations[..])
+        .bind(&keys[..])
         .fetch_all(conn)
         .await
 }
@@ -174,6 +178,9 @@ struct EventRow {
 struct StoredMetadata {
     causation_id: Option<String>,
     correlation_id: Option<String>,
+    /// 0.7.5; rows written before it have none.
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 impl<E> TryFrom<EventRow> for EventEnvelope<E>
@@ -200,7 +207,10 @@ where
             |value: i64| PgStoreError::CorruptRow(format!("negative position in the log: {value}"));
         // The two ids ride the `metadata` column; the timestamp is
         // `created_at`, set only when this crate's `time` feature is on.
-        let metadata = Metadata::of_ids(metadata.causation_id, metadata.correlation_id);
+        let metadata = Metadata {
+            idempotency_key: metadata.idempotency_key,
+            ..Metadata::of_ids(metadata.causation_id, metadata.correlation_id)
+        };
         #[cfg(feature = "time")]
         let metadata = Metadata {
             timestamp: Some(row.created_at),

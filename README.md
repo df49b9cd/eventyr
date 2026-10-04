@@ -19,7 +19,7 @@ user-implementable trait), no ORM, no DDD toolkit.
 | Crate | Contents | Status |
 |---|---|---|
 | `eventyr` | Umbrella: re-exports core plus, behind features, the store/subscription/projection sides, and a prelude | shipped |
-| `eventyr-core` | `Aggregate`, protocol vocabulary (`StreamId`/`Version`/`Sequence`/`ExpectedVersion`/`StoreError`/envelope/`Metadata`), `WriteMachine`, `BatchMachine`, `BoundaryMachine` (dynamic consistency boundaries: `Tag`/`Tagged`/`Query`/`Decision`), `SubscriptionMachine`, upcast vocabulary (`Upcaster`/`RawEvent`/`UpcastError`) — `no_std + alloc`, zero deps | shipped |
+| `eventyr-core` | `Aggregate`, protocol vocabulary (`StreamId`/`Version`/`Sequence`/`ExpectedVersion`/`StoreError`/envelope/`Metadata`), `WriteMachine`, `BatchMachine`, `BoundaryMachine` (dynamic consistency boundaries: `Tag`/`Tagged`/`Query`/`Decision`), idempotent commands via `Metadata::idempotency_key`, `SubscriptionMachine`, upcast vocabulary (`Upcaster`/`RawEvent`/`UpcastError`) — `no_std + alloc`, zero deps | shipped |
 | `eventyr-store` | `EventStore`/`StreamsAll` ports, the opt-in `QueryAppend` and `CommitSignal` ports, `InMemoryStore`, `drive_write` driver, `AggregateRepository`, prelude | shipped |
 | `eventyr-macros` | `#[derive(Aggregate)]`, `#[derive(EventName)]` — convention wiring, sugar not API | shipped |
 | `eventyr-store-postgres` | sqlx-based `EventStore`/`StreamsAll` (`PgStore`, `append_events` PL/pgSQL, DESIGN §9's single-table sketch made real) — a standalone crate, not an umbrella feature yet | shipped |
@@ -127,7 +127,7 @@ let repository = AggregateRepository::<Account, _>::new(
 repository.execute(AccountId(1), AccountCommand::Open).await.expect("open");
 match repository.execute(AccountId(1), AccountCommand::Deposit { amount: 50 }).await {
     Ok(ExecutionOutcome::Committed { committed: events, .. }) => assert_eq!(events.len(), 1),
-    Ok(ExecutionOutcome::Noop) => panic!("a deposit decides an event"),
+    Ok(_) => panic!("a deposit decides an event"),
     Err(_) => panic!("the deposit must commit"),
 }
 # }

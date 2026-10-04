@@ -305,7 +305,7 @@ fn a_conditional_append_waits_out_an_in_flight_writer() {
         sqlx::query(
             "SELECT * FROM append_events(0::smallint, 0, 'student-s9', ARRAY['Enrolled'], \
              ARRAY['{\"Enrolled\": {\"course\": \"c1\", \"student\": \"s9\"}}'::jsonb], \
-             ARRAY[NULL]::text[], ARRAY[NULL]::text[])",
+             ARRAY[NULL]::text[], ARRAY[NULL]::text[], ARRAY[NULL]::text[])",
         )
         .execute(&mut *rival)
         .await
@@ -379,7 +379,7 @@ fn a_later_sequence_never_commits_before_an_earlier_one() {
         sqlx::query(
             "SELECT * FROM append_events(0::smallint, 0, 'stream-a', ARRAY['Payload'], \
              ARRAY['{\"Payload\": {\"value\": 1}}'::jsonb], \
-             ARRAY[NULL]::text[], ARRAY[NULL]::text[])",
+             ARRAY[NULL]::text[], ARRAY[NULL]::text[], ARRAY[NULL]::text[])",
         )
         .execute(&mut *first)
         .await

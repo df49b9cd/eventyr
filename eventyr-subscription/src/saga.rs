@@ -110,6 +110,10 @@ mod tests {
         type Event = u64;
         type Command = u64;
 
+        fn name(&self) -> &str {
+            "echo"
+        }
+
         fn react(&self, event: &EventEnvelope<u64>) -> Vec<(StreamId, u64)> {
             vec![(
                 StreamId::from(format!("ledger-{}", event.event)),

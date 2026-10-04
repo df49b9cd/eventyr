@@ -32,6 +32,12 @@ pub struct Metadata {
     pub causation_id: Option<String>,
     /// The id grouping one interaction's events across aggregates.
     pub correlation_id: Option<String>,
+    /// The key of the command that produced this event (0.7.5). A write
+    /// carrying a key whose events are already in the target stream is
+    /// not decided again — the machine returns the earlier commit. See
+    /// [`WriteOutcome::AlreadyCommitted`](crate::write::WriteOutcome::AlreadyCommitted).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub idempotency_key: Option<String>,
     /// When the event was committed. Only present behind the `time`
     /// feature.
     #[cfg(feature = "time")]
@@ -55,12 +61,23 @@ impl Metadata {
         }
     }
 
+    /// Builder-style: the idempotency key of the command these events
+    /// come from (0.7.5).
+    pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
+        self.idempotency_key = Some(key.into());
+        self
+    }
+
     /// Compose three layers, least-authoritative first: set fields on
     /// `interaction` win over the event's own ids, which win over `own`
     /// (the record a write *in progress* carries). This is the saga
     /// pipeline's seam: the boundary answers the request, the event
     /// answers the causal chain, the command's own stamp is the first
     /// draft.
+    ///
+    /// The idempotency key is never taken from `event`: it names the
+    /// command that produced the event, and a command issued in reaction
+    /// to it is a different command.
     pub fn overlay(interaction: &Metadata, event: &Metadata, own: &Metadata) -> Self {
         Self {
             causation_id: interaction
@@ -73,6 +90,10 @@ impl Metadata {
                 .clone()
                 .or_else(|| event.correlation_id.clone())
                 .or_else(|| own.correlation_id.clone()),
+            idempotency_key: interaction
+                .idempotency_key
+                .clone()
+                .or_else(|| own.idempotency_key.clone()),
             #[cfg(feature = "time")]
             timestamp: interaction.timestamp.or(event.timestamp).or(own.timestamp),
         }

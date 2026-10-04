@@ -371,6 +371,17 @@ pub enum BoundaryOutcome<E, Err> {
         /// One entry per requested append, as the store recorded it.
         committed: Vec<CommittedStream<E>>,
     },
+    /// The decision carried an idempotency key (0.7.5) and the events
+    /// its query reads include an earlier commit with that key: nothing
+    /// was decided or appended. `committed` is the earlier commit's
+    /// events the query selected — only those: a boundary decision sees
+    /// nothing outside its query, so the key is honoured only when the
+    /// decision's events fall inside it (decisions that read what they
+    /// write, the usual DCB shape, always do).
+    AlreadyCommitted {
+        /// The earlier commit's events the query selected.
+        committed: Vec<EventEnvelope<E>>,
+    },
     /// The decision produced no events; nothing was appended.
     Noop,
     /// The domain rejected the decision.
@@ -411,6 +422,8 @@ pub struct BoundaryMachine<D: Decision> {
     /// re-decide that follows.
     acknowledged: Sequence,
     metadata: Metadata,
+    /// Read events carrying the interaction's idempotency key (0.7.5).
+    earlier: Vec<EventEnvelope<D::Event>>,
 }
 
 impl<D: Decision> BoundaryMachine<D> {
@@ -428,6 +441,7 @@ impl<D: Decision> BoundaryMachine<D> {
             read_position: Sequence::START,
             acknowledged: Sequence::START,
             metadata: Metadata::default(),
+            earlier: Vec::new(),
         }
     }
 
@@ -500,6 +514,20 @@ impl<D: Decision> BoundaryMachine<D> {
             self.decision.apply(&mut self.state, &envelope.event);
         }
         self.read_position = position;
+        if self.metadata.idempotency_key.is_some() {
+            let key = &self.metadata.idempotency_key;
+            self.earlier.extend(
+                events
+                    .into_iter()
+                    .filter(|envelope| &envelope.metadata.idempotency_key == key),
+            );
+            if !self.earlier.is_empty() {
+                self.phase = Phase::Done;
+                return BoundaryAction::Done(BoundaryOutcome::AlreadyCommitted {
+                    committed: core::mem::take(&mut self.earlier),
+                });
+            }
+        }
         self.decide_and_emit()
     }
 
@@ -1028,6 +1056,37 @@ mod tests {
             panic!("expected an append");
         };
         assert_eq!(appends[0].events[0].metadata, metadata);
+    }
+
+    #[test]
+    fn a_replayed_key_inside_the_query_returns_the_earlier_commit() {
+        let mut m = machine().with_metadata(Metadata::default().with_idempotency_key("enroll-1"));
+        m.start();
+        let mut earlier = envelope(3, enrolled("c1", "s1"));
+        earlier.metadata = Metadata::default().with_idempotency_key("enroll-1");
+        let action = m.handle(BoundaryInput::Read {
+            events: vec![envelope(1, defined(2)), earlier],
+        });
+        let BoundaryAction::Done(BoundaryOutcome::AlreadyCommitted { committed }) = action else {
+            panic!("expected AlreadyCommitted, got {action:?}");
+        };
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].sequence, Sequence::new(3));
+    }
+
+    #[test]
+    fn a_keyed_decision_with_no_earlier_commit_decides() {
+        let mut m = machine().with_metadata(Metadata::default().with_idempotency_key("enroll-1"));
+        m.start();
+        let BoundaryAction::Append { appends, .. } = m.handle(BoundaryInput::Read {
+            events: vec![envelope(1, defined(2))],
+        }) else {
+            panic!("append");
+        };
+        assert_eq!(
+            appends[0].events[0].metadata.idempotency_key.as_deref(),
+            Some("enroll-1")
+        );
     }
 
     #[test]

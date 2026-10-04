@@ -621,3 +621,136 @@ async fn a_filtered_projector_checkpoints_past_skipped_events() {
         "and it was persisted"
     );
 }
+
+/// 0.7.5 end to end: a saga's event is redelivered after its commands
+/// were dispatched but before the ack (the checkpoint write fails), so
+/// the saga re-issues the command. The command's idempotency key makes
+/// the second dispatch return the first commit: the account is debited
+/// once.
+#[tokio::test]
+async fn a_redelivered_saga_event_dispatches_its_command_once() {
+    use eventyr_core::saga::{Saga, SagaCommand};
+    use eventyr_core::testing::account::{Account, AccountCommand, AccountEvent, AccountId};
+    use eventyr_core::write::RetryPolicy;
+    use eventyr_store::repository::{AggregateRepository, ExecutionOutcome};
+
+    /// Every deposit on account 2 withdraws 1 from account 1.
+    #[derive(Clone)]
+    struct Fee;
+    impl Saga for Fee {
+        type Event = AccountEvent;
+        type Command = AccountCommand;
+        fn name(&self) -> &str {
+            "fee"
+        }
+        fn react(&self, event: &EventEnvelope<AccountEvent>) -> Vec<(StreamId, AccountCommand)> {
+            let fee_payer = StreamId::for_aggregate::<Account>(&AccountId(1));
+            match event.event {
+                AccountEvent::Deposited { .. } if event.stream_id != fee_payer => {
+                    vec![(fee_payer, AccountCommand::Withdraw { amount: 1 })]
+                }
+                _ => vec![],
+            }
+        }
+    }
+
+    /// Fails the first `store` — the crash between dispatch and ack.
+    struct FlakyCheckpoints {
+        inner: InMemoryCheckpointStore,
+        failed: std::sync::atomic::AtomicBool,
+    }
+    impl CheckpointStore for FlakyCheckpoints {
+        async fn load(&self, name: &str) -> Result<Checkpoint, StoreError> {
+            self.inner.load(name).await
+        }
+        async fn store(&self, name: &str, checkpoint: Checkpoint) -> Result<(), StoreError> {
+            if !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Unavailable);
+            }
+            self.inner.store(name, checkpoint).await
+        }
+    }
+
+    let store = Arc::new(InMemoryStore::<AccountEvent>::new());
+    let repo = Arc::new(AggregateRepository::<Account, _>::new(
+        Arc::clone(&store),
+        RetryPolicy::default(),
+    ));
+    for id in [1, 2] {
+        repo.execute(AccountId(id), AccountCommand::Open { owner: "me".into() })
+            .await
+            .expect("open");
+    }
+    repo.execute(AccountId(1), AccountCommand::Deposit { amount: 10 })
+        .await
+        .expect("fund the payer");
+    repo.execute(AccountId(2), AccountCommand::Deposit { amount: 50 })
+        .await
+        .expect("the deposit that triggers the fee");
+    let head = futures::TryStreamExt::try_collect::<Vec<_>>(
+        eventyr_store::store::StreamsAll::stream_all(&*store, Sequence::START),
+    )
+    .await
+    .expect("read")
+    .len() as u64;
+
+    let dispatched = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = {
+        let repo = Arc::clone(&repo);
+        let dispatched = Arc::clone(&dispatched);
+        move |command: SagaCommand<AccountCommand>| {
+            let repo = Arc::clone(&repo);
+            let dispatched = Arc::clone(&dispatched);
+            async move {
+                let outcome = repo
+                    .execute_with_metadata(AccountId(1), command.command, command.metadata)
+                    .await
+                    .map_err(|e| StoreError::other(e.to_string()))?;
+                dispatched
+                    .lock()
+                    .expect("poisoned")
+                    .push(matches!(outcome, ExecutionOutcome::Committed { .. }));
+                Ok(())
+            }
+        }
+    };
+
+    let outcome = Projector::new(
+        "fee",
+        StoreSubscription::new(Arc::clone(&store)),
+        FlakyCheckpoints {
+            inner: InMemoryCheckpointStore::new(),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        },
+        SagaProjection::new(Fee, dispatcher),
+    )
+    .with_policy(
+        SubscriptionPolicy::new(64, std::time::Duration::ZERO, std::time::Duration::ZERO)
+            .stop_at_catch_up(),
+    )
+    .run(|_| future::ready(()))
+    .await
+    .expect("run");
+
+    // The fee command was dispatched twice (the redelivery), but only
+    // the first dispatch committed.
+    assert_eq!(*dispatched.lock().expect("poisoned"), vec![true, false]);
+    let payer: Vec<_> = futures::TryStreamExt::try_collect::<Vec<_>>(EventStore::stream(
+        &*store,
+        &StreamId::for_aggregate::<Account>(&AccountId(1)),
+        Version::EMPTY,
+    ))
+    .await
+    .expect("read");
+    let withdrawals = payer
+        .iter()
+        .filter(|e| matches!(e.event, AccountEvent::Withdrawn { .. }))
+        .count();
+    assert_eq!(withdrawals, 1, "the fee was charged once");
+    // Caught up through everything, including the fee's own withdrawal.
+    assert!(matches!(
+        outcome,
+        SubscriptionOutcome::CaughtUp { checkpoint }
+            if checkpoint == Checkpoint::new(Sequence::new(head + 1))
+    ));
+}

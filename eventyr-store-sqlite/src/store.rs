@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS events (
     payload         TEXT    NOT NULL,
     causation_id    TEXT,
     correlation_id  TEXT,
+    idempotency_key TEXT,
     created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE (stream_id, stream_version)
 );
@@ -31,8 +32,8 @@ CREATE TABLE IF NOT EXISTS events (
 
 /// The `events` columns every read shares — one place, so adding a
 /// column can't drift across the append/read/read-all queries.
-const EVENT_COLUMNS: &str =
-    "global_sequence, stream_id, stream_version, payload, causation_id, correlation_id";
+const EVENT_COLUMNS: &str = "global_sequence, stream_id, stream_version, payload, causation_id, \
+     correlation_id, idempotency_key";
 
 /// An embedded [`EventStore`] and [`StreamsAll`] over SQLite, via
 /// rusqlite — and, for [`Tagged`] events, [`QueryAppend`] (0.7.1),
@@ -91,6 +92,15 @@ impl<E> SqliteStore<E> {
     /// tables stand on. Run on the same connection the app reads with.
     pub fn from_connection(conn: rusqlite::Connection) -> Result<Self, SqliteStoreError> {
         conn.execute_batch(SCHEMA)?;
+        // Databases created before 0.7.5 lack the column.
+        let has_key: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('events') WHERE name = 'idempotency_key'",
+            [],
+            |row| row.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !has_key {
+            conn.execute_batch("ALTER TABLE events ADD COLUMN idempotency_key TEXT")?;
+        }
         #[cfg(feature = "views")]
         conn.execute_batch(crate::views::VIEWS_SCHEMA)?;
         Ok(Self {
@@ -168,6 +178,7 @@ struct EventRow {
     payload: String,
     causation_id: Option<String>,
     correlation_id: Option<String>,
+    idempotency_key: Option<String>,
 }
 
 fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
@@ -178,6 +189,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
         payload: row.get(3)?,
         causation_id: row.get(4)?,
         correlation_id: row.get(5)?,
+        idempotency_key: row.get(6)?,
     })
 }
 
@@ -203,7 +215,10 @@ where
                 u64::try_from(row.stream_version).map_err(|_| invalid(row.stream_version))?,
             ),
             event,
-            metadata: Metadata::of_ids(row.causation_id, row.correlation_id),
+            metadata: Metadata {
+                idempotency_key: row.idempotency_key,
+                ..Metadata::of_ids(row.causation_id, row.correlation_id)
+            },
         })
     }
 }
@@ -242,8 +257,8 @@ where
             let payload =
                 serde_json::to_string(&new_event.event).map_err(SqliteStoreError::from)?;
             tx.execute(
-                "INSERT INTO events (stream_id, stream_version, event_type, payload, causation_id, correlation_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO events (stream_id, stream_version, event_type, payload, causation_id, \
+                 correlation_id, idempotency_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     stream_id.as_str(),
                     version as i64,
@@ -251,6 +266,7 @@ where
                     payload,
                     new_event.metadata.causation_id,
                     new_event.metadata.correlation_id,
+                    new_event.metadata.idempotency_key,
                 ],
             )
             .map_err(SqliteStoreError::into_store)?;
@@ -260,10 +276,13 @@ where
                 stream_id: stream_id.clone(),
                 version: Version::new(version),
                 event: new_event.event.clone(),
-                metadata: Metadata::of_ids(
-                    new_event.metadata.causation_id.clone(),
-                    new_event.metadata.correlation_id.clone(),
-                ),
+                metadata: Metadata {
+                    idempotency_key: new_event.metadata.idempotency_key.clone(),
+                    ..Metadata::of_ids(
+                        new_event.metadata.causation_id.clone(),
+                        new_event.metadata.correlation_id.clone(),
+                    )
+                },
             });
         }
         committed.push(written);

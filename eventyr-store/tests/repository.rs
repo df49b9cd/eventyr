@@ -420,3 +420,96 @@ async fn a_driver_reports_append_metrics() {
     // The deposit committed: the driver counted the one event it appended.
     assert_eq!(metrics.0.lock().unwrap().as_slice(), &[1]);
 }
+
+// -- idempotency keys (0.7.5) ---------------------------------------------
+
+fn key(key: &str) -> eventyr_core::envelope::Metadata {
+    eventyr_core::envelope::Metadata::default().with_idempotency_key(key)
+}
+
+#[tokio::test]
+async fn a_replayed_key_commits_once_and_returns_the_earlier_commit() {
+    let repo = repository();
+    let id = AccountId(1);
+    repo.execute(id.clone(), AccountCommand::Open { owner: "me".into() })
+        .await
+        .expect("open");
+
+    let first = repo
+        .execute_with_metadata(
+            id.clone(),
+            AccountCommand::Deposit { amount: 10 },
+            key("pay-1"),
+        )
+        .await
+        .expect("first");
+    let ExecutionOutcome::Committed { committed, .. } = first else {
+        panic!("the first run commits");
+    };
+
+    let again = repo
+        .execute_with_metadata(
+            id.clone(),
+            AccountCommand::Deposit { amount: 10 },
+            key("pay-1"),
+        )
+        .await
+        .expect("replay");
+    let ExecutionOutcome::AlreadyCommitted { committed: earlier } = again else {
+        panic!("the replay returns the earlier commit");
+    };
+    assert_eq!(earlier, committed);
+    assert_eq!(
+        stream_of(repo.store(), 1).await.len(),
+        2,
+        "open + one deposit"
+    );
+
+    // Another key is another command.
+    repo.execute_with_metadata(id, AccountCommand::Deposit { amount: 10 }, key("pay-2"))
+        .await
+        .expect("second payment");
+    assert_eq!(stream_of(repo.store(), 1).await.len(), 3);
+}
+
+/// Racing duplicates of one keyed command: exactly one commits, every
+/// other run is caught — on its first read or on its conflict retry —
+/// and returns that commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_duplicates_of_a_keyed_command_commit_once() {
+    let repo = Arc::new(AggregateRepository::<Account, _>::new(
+        Arc::new(InMemoryStore::new()),
+        RetryPolicy::new(16),
+    ));
+    repo.execute(AccountId(1), AccountCommand::Open { owner: "me".into() })
+        .await
+        .expect("open");
+
+    let tasks: Vec<_> = (0..16)
+        .map(|_| {
+            let repo = Arc::clone(&repo);
+            tokio::spawn(async move {
+                repo.execute_with_metadata(
+                    AccountId(1),
+                    AccountCommand::Deposit { amount: 10 },
+                    key("pay-1"),
+                )
+                .await
+            })
+        })
+        .collect();
+    let mut committed = 0;
+    for task in tasks {
+        match task.await.expect("task").expect("execute") {
+            ExecutionOutcome::Committed { .. } => committed += 1,
+            ExecutionOutcome::AlreadyCommitted { .. } => {}
+            ExecutionOutcome::Noop => panic!("a deposit decides an event"),
+        }
+    }
+    assert_eq!(committed, 1);
+    assert_eq!(
+        stream_of(repo.store(), 1).await.len(),
+        2,
+        "open + one deposit"
+    );
+}

@@ -123,7 +123,7 @@ async fn a_rolled_back_append_does_not_notify() {
     let mut tx = store.pool().begin().await.expect("begin");
     sqlx::query(
         "SELECT * FROM append_events(0::smallint, 0, 's-1', ARRAY['Happened'], \
-         ARRAY['{\"Happened\": {\"value\": 1}}'::jsonb], ARRAY[NULL]::text[], ARRAY[NULL]::text[])",
+         ARRAY['{\"Happened\": {\"value\": 1}}'::jsonb], ARRAY[NULL]::text[], ARRAY[NULL]::text[], ARRAY[NULL]::text[])",
     )
     .execute(&mut *tx)
     .await

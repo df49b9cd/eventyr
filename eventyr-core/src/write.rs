@@ -136,6 +136,14 @@ pub enum WriteOutcome<E, Err, S = ()> {
         /// The post-commit snapshot offer, when the policy fired.
         snapshot: Option<OfferSnapshot<S>>,
     },
+    /// The command carried an idempotency key (0.7.5) and the stream
+    /// already holds the events of an earlier commit with that key:
+    /// nothing was decided or appended. `committed` is that earlier
+    /// commit, as stored.
+    AlreadyCommitted {
+        /// The events the earlier commit with this key appended.
+        committed: Vec<EventEnvelope<E>>,
+    },
     /// The command decided no events; nothing was appended.
     Noop,
     /// The domain rejected the command.
@@ -301,6 +309,9 @@ pub struct WriteMachine<A: Aggregate, S = ()> {
     /// Set only on a snapshots-on machine (there `S = A::State`, so the
     /// hook is a plain move). `None` — unreachable — otherwise.
     hooks: Option<SnapshotHooks<A, S>>,
+    /// Loaded events carrying this interaction's idempotency key: the
+    /// earlier commit, when the command has run before (0.7.5).
+    earlier: Vec<EventEnvelope<A::Event>>,
     _channel: PhantomData<fn() -> S>,
 }
 
@@ -321,6 +332,7 @@ impl<A: Aggregate> WriteMachine<A, ()> {
             folded: A::initial(&id),
             version: Version::EMPTY,
             hooks: None,
+            earlier: Vec::new(),
             _channel: PhantomData,
         }
     }
@@ -367,6 +379,7 @@ where
                 },
                 materialize: Clone::clone,
             }),
+            earlier: Vec::new(),
             _channel: PhantomData,
         }
     }
@@ -377,7 +390,15 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
     /// driver answers with the newest stored snapshot, if any), else a
     /// full stream read. Idempotent until the first
     /// [`handle`](Self::handle).
+    ///
+    /// A keyed interaction (0.7.5) skips the snapshot and loads the whole
+    /// stream: an earlier commit with the key may lie before the
+    /// snapshot, where a delta load would never see it. The commit may
+    /// still offer a snapshot.
     pub fn start(&mut self) -> WriteAction<A::Event, A::Error, S> {
+        if self.phase == Phase::LoadingSnapshot && self.metadata.idempotency_key.is_some() {
+            self.phase = Phase::Loading;
+        }
         match self.phase {
             Phase::LoadingSnapshot => WriteAction::LoadSnapshot {
                 stream_id: self.stream_id.clone(),
@@ -500,6 +521,21 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
             expected = expected.saturating_add(1);
             A::apply(&mut self.folded, &envelope.event);
             self.version = envelope.version;
+            if self.metadata.idempotency_key.is_some()
+                && envelope.metadata.idempotency_key == self.metadata.idempotency_key
+            {
+                self.earlier.push(envelope);
+            }
+        }
+        if !self.earlier.is_empty() {
+            // The command has committed before: return that commit
+            // instead of deciding it again. On a conflict retry this is
+            // how a concurrent duplicate is caught — the reloaded delta
+            // carries its events.
+            self.phase = Phase::Done;
+            return WriteAction::Done(WriteOutcome::AlreadyCommitted {
+                committed: core::mem::take(&mut self.earlier),
+            });
         }
         self.decide_and_emit()
     }
@@ -1324,6 +1360,140 @@ mod tests {
             }),
         ]
         .boxed()
+    }
+
+    // -- idempotency keys (0.7.5) -----------------------------------------
+
+    fn keyed(key: &str, version: u64, event: AccountEvent) -> EventEnvelope<AccountEvent> {
+        EventEnvelope {
+            metadata: Metadata::default().with_idempotency_key(key),
+            ..env(version, event)
+        }
+    }
+
+    fn opened() -> AccountEvent {
+        AccountEvent::Opened {
+            owner: String::from("me"),
+        }
+    }
+
+    fn keyed_machine(key: &str, command: AccountCommand) -> WriteMachine<Account> {
+        machine(command).with_metadata(Metadata::default().with_idempotency_key(key))
+    }
+
+    #[test]
+    fn a_keyed_command_stamps_its_key_on_every_event() {
+        let mut m = keyed_machine("cmd-1", AccountCommand::Deposit { amount: 5 });
+        m.start();
+        let WriteAction::Append { events, .. } = m.handle(WriteInput::Loaded {
+            events: vec![env(1, opened())],
+        }) else {
+            panic!("append");
+        };
+        assert_eq!(events[0].metadata.idempotency_key.as_deref(), Some("cmd-1"));
+    }
+
+    #[test]
+    fn a_replayed_key_returns_the_earlier_commit_without_deciding() {
+        // The command already ran: its deposit is in the stream. Run
+        // again it would deposit twice; with the key it decides nothing.
+        let mut m = keyed_machine("cmd-1", AccountCommand::Deposit { amount: 5 });
+        m.start();
+        let action = m.handle(WriteInput::Loaded {
+            events: vec![
+                env(1, opened()),
+                keyed("cmd-1", 2, AccountEvent::Deposited { amount: 5 }),
+                env(3, AccountEvent::Deposited { amount: 1 }),
+            ],
+        });
+        let WriteAction::Done(WriteOutcome::AlreadyCommitted { committed }) = action else {
+            panic!("expected AlreadyCommitted, got {action:?}");
+        };
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].version, Version::new(2));
+    }
+
+    #[test]
+    fn a_key_rejected_before_is_decided_again() {
+        // Rejections append nothing, so they leave no trace to match:
+        // the command is decided against the current state, which may
+        // now accept it.
+        let mut m = keyed_machine("cmd-1", AccountCommand::Withdraw { amount: 5 });
+        m.start();
+        let action = m.handle(WriteInput::Loaded {
+            events: vec![
+                env(1, opened()),
+                env(2, AccountEvent::Deposited { amount: 9 }),
+            ],
+        });
+        assert!(matches!(action, WriteAction::Append { .. }));
+    }
+
+    #[test]
+    fn a_concurrent_duplicate_is_caught_on_the_conflict_retry() {
+        let mut m = keyed_machine("cmd-1", AccountCommand::Deposit { amount: 5 });
+        m.start();
+        m.handle(WriteInput::Loaded {
+            events: vec![env(1, opened())],
+        });
+        // A twin of this command committed first.
+        let reload = m.handle(WriteInput::Conflict {
+            current: Version::new(2),
+        });
+        assert!(matches!(reload, WriteAction::LoadStream { from, .. } if from == Version::new(1)));
+        let action = m.handle(WriteInput::Loaded {
+            events: vec![keyed("cmd-1", 2, AccountEvent::Deposited { amount: 5 })],
+        });
+        assert!(matches!(
+            action,
+            WriteAction::Done(WriteOutcome::AlreadyCommitted { .. })
+        ));
+    }
+
+    #[test]
+    fn other_keys_and_unkeyed_events_do_not_match() {
+        let mut m = keyed_machine("cmd-1", AccountCommand::Deposit { amount: 5 });
+        m.start();
+        let action = m.handle(WriteInput::Loaded {
+            events: vec![
+                env(1, opened()),
+                keyed("cmd-2", 2, AccountEvent::Deposited { amount: 5 }),
+            ],
+        });
+        assert!(matches!(action, WriteAction::Append { .. }));
+
+        // An unkeyed command never matches anything.
+        let mut m = machine(AccountCommand::Deposit { amount: 5 });
+        m.start();
+        let action = m.handle(WriteInput::Loaded {
+            events: vec![
+                env(1, opened()),
+                keyed("cmd-1", 2, AccountEvent::Deposited { amount: 5 }),
+            ],
+        });
+        assert!(matches!(action, WriteAction::Append { .. }));
+    }
+
+    #[test]
+    fn a_keyed_snapshots_on_machine_loads_the_whole_stream() {
+        // The earlier commit may predate the newest snapshot, where a
+        // delta load would never see it.
+        let mut m = snap_machine(AccountCommand::Deposit { amount: 5 }, 1)
+            .with_metadata(Metadata::default().with_idempotency_key("cmd-1"));
+        assert!(matches!(
+            m.start(),
+            WriteAction::LoadStream { from, .. } if from == Version::EMPTY
+        ));
+        let action = m.handle(WriteInput::Loaded {
+            events: vec![
+                env(1, opened()),
+                keyed("cmd-1", 2, AccountEvent::Deposited { amount: 5 }),
+            ],
+        });
+        assert!(matches!(
+            action,
+            WriteAction::Done(WriteOutcome::AlreadyCommitted { .. })
+        ));
     }
 
     proptest! {
