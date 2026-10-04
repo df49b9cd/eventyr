@@ -403,6 +403,8 @@ The `UNIQUE` constraint's backing index serves the per-stream lookups; no separa
 - **0.3** — partially shipped: the projection read path (upcaster chains, schema-versioned rebuilds), `EventBus` trait (behind `eventyr-subscription`'s `bus` feature). Also shipped: snapshot support, opt-in per repository — `SnapshotPolicy`/`WritePolicy` and `WriteMachine::with_snapshots` in core (one `LoadSnapshot` action, delta `LoadStream`, the snapshot-version monotonicity guard in the fold, and the fire-and-forget `OfferSnapshot` on `WriteOutcome::Committed`), `SnapshotStore` + `InMemorySnapshotStore` and `AggregateRepository::with_snapshots` in `eventyr-store`, the `snapshots` table/persistence in `eventyr-store-postgres` behind its `snapshots` feature, mirrored by the umbrella's `snapshots` feature. Single-feed fan-out to N projections on one checkpoint, if ever built, is a combinator over the existing `SubscriptionMachine` (`Fanout` multiplexing the one `Apply` action to N idempotent members) — never a new machine, and deferred until a "must advance together" use case justifies it.
 - **0.4** — shipped: the blocking write driver (`drive_write_blocking` / `drive_write_with_snapshots_blocking` in `eventyr-store`, `drive_projector_blocking` in `eventyr-subscription`), the contract-test crate (`eventyr-store-testing`: `event_store_contract`, `streams_all_contract`, `snapshot_contract`, `event_store_batch_contract` — the eventcore-testing idea as a callable suite, self-tested against the in-memory store and wired to gate the Postgres and fjall stores), the embedded store (`eventyr-store-fjall`: fjall-backed `EventStore`/`StreamsAll`/`SnapshotStore`, serde in the store, no runtime needed to drive), and multi-stream commands (eventcore-style, below).
 
+- **0.5** — the hardening release: no new subsystem, four width pieces — (1) the upcaster registry (0.2/0.3's upcast seam made real and verifiable on the read path), (2) metadata/correlation made load-bearing at the driver boundary, (3) a `Metrics` port + `tracing` instrumentation for stores and projectors, (4) one worked end-to-end example domain. See below.
+
 ### 0.4 multi-stream commands — the shape
 
 Multi-stream commands deliberately come *last*: they complicate the mental model, and Eventyr's identity is "small, composable, boring in the good way". The single-stream core shipped first; the batch extension is a *combinator over* it, not a new runtime.
@@ -413,3 +415,29 @@ A command's **consistency boundary** — the set of streams it reads and writes 
 - **The port** — `EventStore::append_batch`: every append or none, each guarded by its own `ExpectedVersion`. Stores that cannot commit atomically across streams use the `append_batch_fallback` helper, which handles the degenerate cases (empty / single-stream) and fails the rest with an honest `Unsupported`-style error. The in-memory store (one lock), the fjall store (one write transaction), and Postgres (one transaction, per-stream advisory locks taken in sorted order — no deadlock) all implement it for real; the `event_store_batch_contract` gates them.
 
 Cross-stream invariants live in the `Decide` (it sees every folded state); routing lives in the `BatchDecision` (each event names its target stream). The boundary being fixed at construction is what keeps both total.
+
+### 0.5 — the hardening release
+
+No new subsystem; four width pieces, in order.
+
+### 0.5.1 Upcaster registry — versioning made real on the read path
+
+0.2 shipped upcast *vocabulary* (`RawEvent`, `Upcaster`) and chains (`eventyr-projection::chain`), and 0.3 shipped the read path over them — but nothing yet *runs* an upcaster against a stored event at read time, and nothing *verifies* a chain is well-formed at startup. 0.5 closes that loop: an **upcaster registry** — the set of upcasters a store/projection knows, indexed by `(event_type, schema_version)` — that both Postgres reads and projection sources consult, and that fails loudly at startup on a broken chain (a gap in versions, a cycle, a name collision). cqrs-es calls these upcasters; esrs calls the whole seam `Schema`. Eventyr keeps §4.4's discipline: upcasting is *data transformation toward the current schema*, decided per event type, never a code migration of stored payloads.
+
+The registry is a plain value, not a machine (one lookup per event is one step — §7 keeps machines for multi-step protocols). It is honest where the chain can't be: `OrphanedType` (a stored event no upcaster selects), `DanglingVersion` (a v2 upcaster with no v1 base), `AmbiguousTarget` (two upcasters writing the same current type). All surface at registration as errors, never as silently-dropped events at read.
+
+### 0.5.2 Metadata & correlation — the observability seam
+
+§4.2/§4.3 carry `Metadata { causation_id, correlation_id, timestamp }` end to end, but nothing *produces* them: today the caller grafts ids onto `NewEvent`s by hand. 0.5 adds the read-side/writer-side seam that makes them load-bearing: a `RequestContext` (or `Correlation` vocabulary type) the repository/driver stamps onto every event of an interaction — correlation id of the request, causation id of the event that prompted it — so a whole saga traces one id without the domain carrying it. This is `sourcery`'s envelope-carried metadata done on purpose: ids are protocol vocabulary, produced at the driver boundary, never smuggled into `decide`.
+
+### 0.5.3 Runtime metrics & lifecycle hooks — the operations story
+
+§2 rules out baked-in transports but not *telemetry*. The store buses and the projector runner need `tracing` spans and counters at the protocol boundaries (append latency, conflict-retries, projection lag) or a deployed system is blind. 0.5 adds a thin `Metrics` port — counters/gauges/histograms as a trait, a `tracing` impl behind a feature flag, `NoopMetrics` the default — so instrumenting a store or projector is an option, not a framework takeover. This is the §6 runner's natural companion: the runner is already the seam a production deploy wraps.
+
+### 0.5.4 The example — a worked domain end to end
+
+Everything above is the means; the example is the proof the design holds in one sitting. 0.5 ships one small, complete domain — a bank (`open → deposit → withdraw → transfer`, a cross-aggregate transfer on the 0.4 batch machine, upcast a renamed event, rebuild a read model, snapshot a long-lived account) as a runnable binary plus a mirroring test suite. It is the doc's §1–§6 with code under it, and the thing a new reader runs before trusting the abstraction. (This is `eventually`'s `examples/` and `esrs`'s demo done the Eventyr way: one domain, every feature, no toy-versus-real gap.)
+
+### 0.5 — what it is *not*
+
+Still not a framework: no HTTP server, no message-bus drivers beyond the `EventBus` trait, no actor runtime (§2 stands). The four pieces are width (observability, a worked example, upcasting made real, metadata made load-bearing), not a second core. The next *structural* release, if there is one, is 0.6: process managers / sagas as a machine — events in, commands out, per §7 — deliberately deferred until the write and read sides have both shipped at least one production-grade store.
