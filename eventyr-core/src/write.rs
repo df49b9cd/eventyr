@@ -105,8 +105,9 @@ pub enum WriteInput<E, S = ()> {
     /// expectation still guards the append against staleness the cache
     /// could never see.
     Cached {
-        /// The snapshot the caller says is current.
-        snapshot: Snapshot<S>,
+        /// The snapshot the cache holds, or `None` on a miss (the
+        /// machine falls back to the ordinary stream load).
+        snapshot: Option<Snapshot<S>>,
     },
     /// The snapshot read completed: the newest persisted snapshot for
     /// the stream, or `None` when the store has none.
@@ -478,10 +479,18 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
         }
     }
 
-    fn on_cached(&mut self, snapshot: Snapshot<S>) -> WriteAction<A::Event, A::Error, S> {
+    fn on_cached(&mut self, snapshot: Option<Snapshot<S>>) -> WriteAction<A::Event, A::Error, S> {
         if self.phase != Phase::Warm {
             return self.violation("`Cached` outside the priming phase");
         }
+        let Some(snapshot) = snapshot else {
+            // Cache miss: fall through to the ordinary read.
+            self.phase = Phase::Loading;
+            return WriteAction::LoadStream {
+                stream_id: self.stream_id.clone(),
+                from: self.version,
+            };
+        };
         if snapshot.stream_id != self.stream_id {
             return self.violation("`Cached` delivered a snapshot for another stream");
         }
@@ -1172,6 +1181,120 @@ mod tests {
             actions[2],
             WriteAction::Done(WriteOutcome::Committed { .. })
         ));
+    }
+
+    // -- cache-primed (0.6.5) ----------------------------------------------
+
+    #[test]
+    fn a_cache_prime_starts_with_primed_not_a_load() {
+        let mut m = WriteMachine::<Account, AccountState>::with_cache(
+            AccountId(7),
+            AccountCommand::Deposit { amount: 5 },
+            RetryPolicy::default(),
+        );
+        assert!(matches!(
+            m.start(),
+            WriteAction::Primed { ref stream_id } if stream_id.as_str() == "account-7"
+        ));
+    }
+
+    #[test]
+    fn the_seed_drives_the_decision_without_a_stream_read() {
+        // The cache says the account already holds 100 at version 3: the
+        // machine decides on the seed, appends guarded at v3, and offers
+        // the re-based state back to the cache.
+        let mut m = WriteMachine::<Account, AccountState>::with_cache(
+            AccountId(7),
+            AccountCommand::Deposit { amount: 5 },
+            RetryPolicy::default(),
+        );
+        m.start();
+        let action = m.handle(WriteInput::Cached {
+            snapshot: Some(snapshot(3, 100)),
+        });
+        let WriteAction::Append {
+            expected, events, ..
+        } = action
+        else {
+            panic!("expected an append")
+        };
+        assert_eq!(expected, ExpectedVersion::Exact(Version::new(3)));
+        assert_eq!(events.len(), 1);
+
+        // The commit re-primes the cache unconditionally: v4, balance 105.
+        let action = m.handle(WriteInput::Appended {
+            committed: vec![env(4, AccountEvent::Deposited { amount: 5 })],
+        });
+        let WriteAction::Done(WriteOutcome::Committed {
+            snapshot: Some(offer),
+            ..
+        }) = action
+        else {
+            panic!("expected a committed outcome with the re-prime offer")
+        };
+        let offered = offer.into_inner();
+        assert_eq!(offered.version, Version::new(4));
+        assert_eq!(offered.state.balance, 105);
+    }
+
+    #[test]
+    fn a_stale_seed_conflicts_on_the_append_and_retries_from_the_store() {
+        // The cache says v3, the store has since appended v4: the append
+        // conflicts at 4, the machine reloads the stream it would have
+        // loaded without a cache, and the retry carries the truth.
+        let mut m = WriteMachine::<Account, AccountState>::with_cache(
+            AccountId(7),
+            AccountCommand::Deposit { amount: 5 },
+            RetryPolicy::default(),
+        );
+        m.start();
+        let action = m.handle(WriteInput::Cached {
+            snapshot: Some(snapshot(3, 100)),
+        });
+        assert!(matches!(action, WriteAction::Append { .. }));
+        let action = m.handle(WriteInput::Conflict {
+            current: Version::new(4),
+        });
+        assert!(matches!(
+            action,
+            WriteAction::LoadStream { from, .. } if from == Version::new(3)
+        ));
+        let action = m.handle(WriteInput::Loaded {
+            events: vec![env(4, AccountEvent::Deposited { amount: 7 })],
+        });
+        let WriteAction::Append { expected, .. } = action else {
+            panic!("expected the retry's append")
+        };
+        assert_eq!(expected, ExpectedVersion::Exact(Version::new(4)));
+    }
+
+    #[test]
+    fn cached_outside_warm_is_a_protocol_violation() {
+        let mut m = WriteMachine::<Account, AccountState>::with_cache(
+            AccountId(7),
+            AccountCommand::Deposit { amount: 5 },
+            RetryPolicy::default(),
+        );
+        m.start();
+        m.handle(WriteInput::Cached {
+            snapshot: Some(snapshot(3, 100)),
+        });
+        assert!(is_protocol_violation(&m.handle(WriteInput::Cached {
+            snapshot: Some(snapshot(3, 100)),
+        })));
+    }
+
+    #[test]
+    fn a_cache_snapshot_for_another_stream_is_a_protocol_violation() {
+        let mut m = WriteMachine::<Account, AccountState>::with_cache(
+            AccountId(7),
+            AccountCommand::Deposit { amount: 5 },
+            RetryPolicy::default(),
+        );
+        m.start();
+        let mut alien = snapshot(3, 100);
+        alien.stream_id = StreamId::from("account-999");
+        assert!(is_protocol_violation(&m.handle(WriteInput::Cached { snapshot: Some(alien) })));
     }
 
     // -- snapshots on -----------------------------------------------------

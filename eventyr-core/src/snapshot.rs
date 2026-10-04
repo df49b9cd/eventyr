@@ -165,9 +165,15 @@ pub trait SnapshotCache<S> {
 /// The in-memory store's cache: one row per stream, newest wins — the
 /// same newest-wins rule the [`SnapshotStore`](crate::snapshot) port
 /// carries, kept in-process.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InMemorySnapshotCache<S> {
     inner: alloc::collections::BTreeMap<StreamId, Snapshot<S>>,
+}
+
+impl<S> Default for InMemorySnapshotCache<S> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<S> InMemorySnapshotCache<S> {

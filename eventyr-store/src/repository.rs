@@ -359,27 +359,22 @@ where
         let stream_id = stream_id.clone();
         // Seed: the cache's latest prime, or the state the machine
         // starts from (a cache miss is a miss, not a guess about `Id`).
-        let seed = match self.cache.lookup(&stream_id) {
-            Some(snapshot) => snapshot,
-            None => Snapshot {
-                stream_id: stream_id.clone(),
-                version: eventyr_core::vocabulary::Version::EMPTY,
-                state: machine.initial_state().clone(),
-            },
-        };
+        let seed = self.cache.lookup(&stream_id);
         let action = machine.handle(eventyr_core::write::WriteInput::Cached { snapshot: seed });
-        let outcome = self.drive_from(action, &mut machine).await;
+        let store = &self.store;
+        let cache = &mut self.cache;
+        let outcome = drive_cached(store, action, &mut machine).await;
         match outcome {
             WriteOutcome::Committed { committed, snapshot } => {
                 if let Some(offer) = &snapshot {
-                    self.cache.prime(offer.clone().into_inner());
+                    cache.prime(offer.clone().into_inner());
                 }
                 Ok(ExecutionOutcome::Committed { committed, snapshot })
             }
             // A command that decided nothing still moves the cache: the
             // fold the decision ran against is itself the freshest state.
             WriteOutcome::Noop => {
-                self.cache.prime(Snapshot {
+                cache.prime(Snapshot {
                     stream_id,
                     version: machine.version(),
                     state: machine.initial_state().clone(),
@@ -390,42 +385,138 @@ where
             WriteOutcome::Failed(error) => Err(ExecutionError::Store(error)),
         }
     }
+}
 
-    /// Finish the interaction after its priming answer: the async
-    /// driver over the store.
-    async fn drive_from(
-        &self,
-        action: eventyr_core::write::WriteAction<A::Event, A::Error, A::State>,
-        machine: &mut WriteMachine<A, A::State>,
-    ) -> WriteOutcome<A::Event, A::Error, A::State> {
-        let mut action = action;
-        loop {
-            use eventyr_core::write::WriteInput;
-            action = match action {
-                eventyr_core::write::WriteAction::LoadStream { stream_id, from } => {
-                    let loaded: Result<Vec<EventEnvelope<A::Event>>, _> =
-                        self.store.stream(&stream_id, from).try_collect().await;
-                    machine.handle(match loaded {
-                        Ok(events) => WriteInput::Loaded { events },
-                        Err(error) => WriteInput::Failed(error),
-                    })
-                }
-                eventyr_core::write::WriteAction::Append {
-                    stream_id,
-                    expected,
-                    events,
-                } => match self.store.append(&stream_id, expected, events).await {
-                    Ok(committed) => machine.handle(WriteInput::Appended { committed }),
-                    Err(error) => machine.handle(error.into()),
+
+/// The drive half of `execute_cached`: the primed machine's async loop.
+///
+/// Kept a free function so the caller can hold `&mut self.cache` and
+/// `&self.store` apart — the borrow checker needs no story about both
+/// living on one `&mut self`.
+async fn drive_cached<A, S>(
+    store: &S,
+    action: eventyr_core::write::WriteAction<A::Event, A::Error, A::State>,
+    machine: &mut WriteMachine<A, A::State>,
+) -> WriteOutcome<A::Event, A::Error, A::State>
+where
+    A: HasSnapshotState,
+    A::State: Clone + Send,
+    S: EventStore<Event = A::Event>,
+{
+    let mut action = action;
+    loop {
+        use eventyr_core::write::WriteInput;
+        action = match action {
+            eventyr_core::write::WriteAction::LoadStream { stream_id, from } => {
+                let loaded: Result<Vec<EventEnvelope<A::Event>>, _> =
+                    store.stream(&stream_id, from).try_collect().await;
+                machine.handle(match loaded {
+                    Ok(events) => WriteInput::Loaded { events },
+                    Err(error) => WriteInput::Failed(error),
+                })
+            }
+            eventyr_core::write::WriteAction::Append {
+                stream_id,
+                expected,
+                events,
+            } => match store.append(&stream_id, expected, events).await {
+                Ok(committed) => machine.handle(WriteInput::Appended { committed }),
+                Err(error) => machine.handle(error.into()),
+            },
+            eventyr_core::write::WriteAction::LoadSnapshot { .. }
+            | eventyr_core::write::WriteAction::Primed { .. } => machine.handle(
+                WriteInput::Failed(StoreError::other(
+                    "the cached path only loads and appends; it never re-reads a snapshot",
+                )),
+            ),
+            eventyr_core::write::WriteAction::Done(outcome) => return outcome,
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eventyr_core::testing::account::{Account, AccountCommand, AccountEvent, AccountId};
+
+    /// An in-memory store that counts its `stream` reads: the proof the
+    /// cache actually skips them.
+    struct CountingStore {
+        inner: crate::memory::InMemoryStore<AccountEvent>,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingStore {
+        fn new() -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+            let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    inner: crate::memory::InMemoryStore::new(),
+                    reads: std::sync::Arc::clone(&reads),
                 },
-                eventyr_core::write::WriteAction::LoadSnapshot { .. }
-                | eventyr_core::write::WriteAction::Primed { .. } => machine.handle(
-                    WriteInput::Failed(StoreError::other(
-                        "the cached path only loads and appends; it never re-reads a snapshot",
-                    )),
-                ),
-                eventyr_core::write::WriteAction::Done(outcome) => return outcome,
-            };
+                reads,
+            )
         }
+    }
+
+    impl EventStore for CountingStore {
+        type Event = AccountEvent;
+
+        async fn append(
+            &self,
+            stream_id: &eventyr_core::vocabulary::StreamId,
+            expected: eventyr_core::vocabulary::ExpectedVersion,
+            events: Vec<eventyr_core::envelope::NewEvent<AccountEvent>>,
+        ) -> Result<Vec<eventyr_core::envelope::EventEnvelope<AccountEvent>>, StoreError> {
+            self.inner.append(stream_id, expected, events).await
+        }
+
+        async fn append_batch(
+            &self,
+            appends: Vec<eventyr_core::batch::StreamAppend<AccountEvent>>,
+        ) -> Result<Vec<eventyr_core::batch::CommittedStream<AccountEvent>>, StoreError> {
+            self.inner.append_batch(appends).await
+        }
+
+        fn stream(
+            &self,
+            stream_id: &eventyr_core::vocabulary::StreamId,
+            from: eventyr_core::vocabulary::Version,
+        ) -> impl futures::Stream<Item = Result<eventyr_core::envelope::EventEnvelope<AccountEvent>, StoreError>> + Send {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.stream(stream_id, from)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_second_command_reads_from_the_cache_not_the_store() {
+        let (store, reads) = CountingStore::new();
+        let mut repo: CachedRepository<Account, _, eventyr_core::snapshot::InMemorySnapshotCache<eventyr_core::testing::account::AccountState>> =
+            CachedRepository::new(store, Default::default(), RetryPolicy::default());
+        let id = AccountId(1);
+
+        // First command: cache miss — one stream read.
+        repo.execute_cached(id.clone(), AccountCommand::Open { owner: "me".into() })
+            .await
+            .expect("first opens");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1, "the first read is real");
+
+        // Second command: the cache has the post-open state. No read.
+        let outcome = repo
+            .execute_cached(id.clone(), AccountCommand::Deposit { amount: 10 })
+            .await
+            .expect("second commits");
+        let ExecutionOutcome::Committed { committed, snapshot } = outcome else {
+            panic!("expected a committed outcome");
+        };
+        assert_eq!(committed.len(), 1);
+        assert_eq!(snapshot.expect("re-primed offer").into_inner().state.balance, 10);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1, "no reload across the cache");
+
+        // Third, still no read.
+        repo.execute_cached(id, AccountCommand::Deposit { amount: 5 })
+            .await
+            .expect("third commits");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
