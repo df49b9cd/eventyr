@@ -123,14 +123,19 @@
 
 pub mod chain;
 pub mod rebuild;
+pub mod registry;
 pub mod source;
 
 pub mod prelude {
     //! The read path: upcaster chains, the raw→typed source adapter,
-    //! and schema-versioned rebuilds.
+    //! the versioned registry, and schema-versioned rebuilds.
 
     pub use crate::chain::{ClosureUpcaster, UpcasterChain};
     pub use crate::rebuild::{RebuildPlan, SchemaCheckpointStore, SchemaVersion, checkpoint_key};
-    pub use crate::source::UpcastingSource;
+    pub use crate::registry::{
+        RegistryError, UpcasterRegistry, VersionRung, VersionUpcaster,
+    };
+    pub use crate::source::{UpcastingSource, VersionedSource};
     pub use eventyr_core::upcast::{RawEvent, Upcaster};
+    pub use eventyr_core::version_registry::{EventSchemaVersion, VersionedRaw};
 }

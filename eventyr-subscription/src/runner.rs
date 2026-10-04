@@ -13,6 +13,8 @@
 
 use core::future::Future;
 
+use eventyr_store::metrics::names::{PROJECTED_EVENTS, PROJECTION_LAG};
+
 use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
 use eventyr_core::subscription::{
@@ -142,34 +144,65 @@ where
     E: Clone + Send,
 {
     let mut action = machine.start();
+    // The batch being applied, when `Applying` began — for the latency
+    // histogram. The machine owns *what* to do; the driver owns timing it.
+    let mut batch_started: Option<std::time::Instant> = None;
     loop {
         action = match action {
-            SubscriptionAction::Fetch { from, limit } => match source.fetch(from, limit).await {
-                Ok(batch) => machine.handle(SubscriptionInput::Fetched { batch }),
-                Err(error) => machine.handle(SubscriptionInput::Failed(error)),
-            },
+            SubscriptionAction::Fetch { from, limit } => {
+                let fetched = source.fetch(from, limit).await;
+                // Lag as a gauge: how far behind the store's tip the
+                // last fetch left us — zero once an empty batch says
+                // "caught up". Reported from the answer the machine is
+                // about to see.
+                if let Ok(batch) = &fetched {
+                    let last = batch
+                        .events
+                        .last()
+                        .map_or(from.as_sequence().as_u64(), |e| e.sequence.as_u64());
+                    metrics.gauge(PROJECTION_LAG, last.saturating_sub(from.as_sequence().as_u64()));
+                }
+                match fetched {
+                    Ok(batch) => machine.handle(SubscriptionInput::Fetched { batch }),
+                    Err(error) => machine.handle(SubscriptionInput::Failed(error)),
+                }
+            }
             SubscriptionAction::Apply { envelope } => {
                 let sequence = envelope.sequence;
+                if batch_started.is_none() {
+                    batch_started = Some(std::time::Instant::now());
+                }
                 let result = projection.apply(&envelope).await;
                 match result {
                     Ok(()) => {
-                        metrics.counter(
-                            eventyr_store::metrics::names::PROJECTED_EVENTS,
-                            1,
-                        );
+                        metrics.counter(PROJECTED_EVENTS, 1);
                         machine.handle(SubscriptionInput::Applied)
                     }
-                    Err(error) => machine.handle(SubscriptionInput::ApplyFailed {
-                        error: StoreError::other(format!(
-                            "projection applying sequence {sequence}: {error}"
-                        )),
-                    }),
+                    Err(error) => {
+                        batch_started = None;
+                        machine.handle(SubscriptionInput::ApplyFailed {
+                            error: StoreError::other(format!(
+                                "projection applying sequence {sequence}: {error}"
+                            )),
+                        })
+                    }
                 }
             }
             SubscriptionAction::Ack { checkpoint } => {
                 match checkpoints.store(name, checkpoint).await {
-                    Ok(()) => machine.handle(SubscriptionInput::Acked),
-                    Err(_) => machine.handle(SubscriptionInput::AckFailed),
+                    Ok(()) => {
+                        if let Some(start) = batch_started.take() {
+                            metrics.histogram(
+                                eventyr_store::metrics::names::PROJECT_BATCH_LATENCY,
+                                start.elapsed(),
+                            );
+                        }
+                        machine.handle(SubscriptionInput::Acked)
+                    }
+                    Err(_) => {
+                        batch_started = None;
+                        machine.handle(SubscriptionInput::AckFailed)
+                    }
                 }
             }
             SubscriptionAction::Sleep { for_ } => {

@@ -684,11 +684,31 @@ mod tests {
         }
     }
 
+    /// Whether `action` is the protocol-violation outcome.
     fn is_protocol_violation<E, Err, S>(action: &WriteAction<E, Err, S>) -> bool {
-        let WriteAction::Done(WriteOutcome::Failed(StoreError::Other(source))) = action else {
-            return false;
+        matches!(
+            action,
+            WriteAction::Done(WriteOutcome::Failed(StoreError::Other(source)))
+                if source.downcast_ref::<ProtocolError>().is_some()
+        )
+    }
+
+    /// Assert `action` is the protocol-violation outcome, naming the
+    /// scenario step on failure.
+    macro_rules! assert_protocol_violation {
+        ($action:expr) => {
+            assert!(
+                is_protocol_violation(&$action),
+                "expected a protocol-violation outcome"
+            );
         };
-        source.downcast_ref::<ProtocolError>().is_some()
+        ($action:expr, $step:expr) => {
+            assert!(
+                is_protocol_violation(&$action),
+                "[{}] expected a protocol-violation outcome",
+                $step
+            );
+        };
     }
 
     // -- transitions (snapshots off: the pre-snapshot protocol) ----------
@@ -920,14 +940,21 @@ mod tests {
     // -- protocol violations (snapshots off) ------------------------------
 
     #[test]
-    fn driving_a_finished_machine_is_a_protocol_violation() {
+    fn appended_after_done_is_a_protocol_violation() {
         let mut m = machine(AccountCommand::CheckBalance);
         m.start();
         m.handle(WriteInput::Loaded { events: vec![] }); // Done(Noop)
-        assert!(is_protocol_violation(
-            &m.handle(WriteInput::Appended { committed: vec![] })
-        ));
-        assert!(is_protocol_violation(&m.start()));
+        assert_protocol_violation!(
+            m.handle(WriteInput::Appended { committed: vec![] })
+        );
+    }
+
+    #[test]
+    fn start_after_done_is_a_protocol_violation() {
+        let mut m = machine(AccountCommand::CheckBalance);
+        m.start();
+        m.handle(WriteInput::Loaded { events: vec![] }); // Done(Noop)
+        assert_protocol_violation!(m.start());
     }
 
     #[test]
@@ -956,7 +983,10 @@ mod tests {
         let action = m.handle(WriteInput::Loaded {
             events: vec![env(2, AccountEvent::Deposited { amount: 1 })], // gap at v1
         });
-        assert!(is_protocol_violation(&action));
+        assert!(
+            is_protocol_violation(&action),
+            "expected a protocol-violation outcome"
+        );
     }
 
     #[test]
@@ -973,7 +1003,10 @@ mod tests {
         let action = m.handle(WriteInput::Loaded {
             events: vec![envelope],
         });
-        assert!(is_protocol_violation(&action));
+        assert!(
+            is_protocol_violation(&action),
+            "expected a protocol-violation outcome"
+        );
     }
 
     #[test]
@@ -993,7 +1026,10 @@ mod tests {
         let action = m.handle(WriteInput::Conflict {
             current: Version::new(1),
         });
-        assert!(is_protocol_violation(&action));
+        assert!(
+            is_protocol_violation(&action),
+            "expected a protocol-violation outcome"
+        );
     }
 
     // -- the scripted driver ----------------------------------------------
@@ -1154,7 +1190,10 @@ mod tests {
         let action = m.handle(WriteInput::SnapshotLoaded {
             snapshot: Some(alien),
         });
-        assert!(is_protocol_violation(&action));
+        assert!(
+            is_protocol_violation(&action),
+            "expected a protocol-violation outcome"
+        );
     }
 
     #[test]
@@ -1170,7 +1209,10 @@ mod tests {
         let action = m.handle(WriteInput::Loaded {
             events: vec![env(12, AccountEvent::Deposited { amount: 1 })],
         });
-        assert!(is_protocol_violation(&action));
+        assert!(
+            is_protocol_violation(&action),
+            "expected a protocol-violation outcome"
+        );
     }
 
     #[test]
@@ -1178,7 +1220,10 @@ mod tests {
         let mut m = machine(AccountCommand::Deposit { amount: 5 });
         m.start();
         let action = m.handle(WriteInput::<AccountEvent>::SnapshotLoaded { snapshot: None });
-        assert!(is_protocol_violation(&action));
+        assert!(
+            is_protocol_violation(&action),
+            "expected a protocol-violation outcome"
+        );
     }
 
     #[test]

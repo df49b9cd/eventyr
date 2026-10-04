@@ -53,7 +53,7 @@ impl<E: Clone> Inner<E> {
         events: Vec<NewEvent<E>>,
     ) -> Result<Vec<EventEnvelope<E>>, StoreError> {
         let current = self.current_version(stream_id);
-        if !matches_expected(expected, current) {
+        if !crate::store::expected_version_matches(expected, current) {
             return Err(StoreError::Conflict {
                 stream_id: Some(stream_id.clone()),
                 current: Version::new(current),
@@ -79,14 +79,6 @@ impl<E: Clone> Inner<E> {
             committed.push(envelope);
         }
         Ok(committed)
-    }
-}
-
-fn matches_expected(expected: ExpectedVersion, current: u64) -> bool {
-    match expected {
-        ExpectedVersion::Any => true,
-        ExpectedVersion::Empty => current == 0,
-        ExpectedVersion::Exact(version) => current == version.as_u64(),
     }
 }
 
@@ -158,7 +150,7 @@ where
         // Pass 1: every expectation, before anything is written.
         for append in &appends {
             let current = inner.current_version(&append.stream_id);
-            if !matches_expected(append.expected, current) {
+            if !crate::store::expected_version_matches(append.expected, current) {
                 return Err(StoreError::Conflict {
                     stream_id: Some(append.stream_id.clone()),
                     current: Version::new(current),

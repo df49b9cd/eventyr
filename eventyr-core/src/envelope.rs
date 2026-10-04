@@ -38,6 +38,24 @@ pub struct Metadata {
     pub timestamp: Option<time::OffsetDateTime>,
 }
 
+impl Metadata {
+    /// Metadata carrying the two ids and nothing else: the shape every
+    /// store's read path builds from its columns. The one constructor
+    /// for the "metadata-as-it-travels" case, so stores don't repeat the
+    /// struct-literal-and-default dance per read.
+    pub fn of_ids(causation_id: Option<String>, correlation_id: Option<String>) -> Self {
+        #[allow(
+            clippy::needless_update,
+            reason = "no-op without the `time` field; required with it"
+        )]
+        Self {
+            causation_id,
+            correlation_id,
+            ..Self::default()
+        }
+    }
+}
+
 /// An event the machine asks the driver to append.
 ///
 /// The store assigns sequence, stream id and version; the committed

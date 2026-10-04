@@ -12,6 +12,7 @@ use eventyr_core::snapshot::Snapshot;
 use eventyr_core::vocabulary::{StreamId, Version};
 use eventyr_store::snapshot_store::SnapshotStore;
 use eventyr_store_postgres::PgStore;
+use eventyr_store_postgres::snapshots::PgSnapshotStore;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -31,10 +32,10 @@ fn new_stream() -> StreamId {
 async fn snapshot_save_and_load_roundtrip() {
     let url = std::env::var("EVENTYR_TEST_PG_URL")
         .expect("EVENTYR_TEST_PG_URL must point at a real Postgres");
-    let store = PgStore::<()>::connect(&url)
+    let events = PgStore::<AccountState>::connect(&url)
         .await
         .expect("connect and migrate");
-    let store = PgStore::<AccountState>::new(store.pool().clone());
+    let store = PgSnapshotStore::<AccountState>::new(&events);
     let stream = new_stream();
 
     // Unknown stream: no snapshot, not an error.
@@ -104,14 +105,15 @@ async fn snapshot_save_and_load_roundtrip() {
 async fn snapshot_offers_persist_through_the_store_directly() {
     let url = std::env::var("EVENTYR_TEST_PG_URL")
         .expect("EVENTYR_TEST_PG_URL must point at a real Postgres");
-    let store = PgStore::<AccountState>::connect(&url)
+    let events = PgStore::<AccountState>::connect(&url)
         .await
         .expect("connect and migrate");
+    let store = PgSnapshotStore::<AccountState>::new(&events);
     let stream = new_stream();
 
-    // `PgStore<E>` *is* the `SnapshotStore<State = E>`: no adapter
-    // layer. A commit's offer routes straight to `save` on the store —
-    // the fire-and-forget caller drops the result.
+    // `PgSnapshotStore<S>` wraps the pool with the snapshot's own
+    // state type. A commit's offer routes straight to `save` — the
+    // fire-and-forget caller drops the result.
     let offer = Snapshot {
         stream_id: stream.clone(),
         version: Version::new(3),

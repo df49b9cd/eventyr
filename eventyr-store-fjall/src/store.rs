@@ -182,11 +182,8 @@ impl<E> FjallStore<E> {
                 ),
                 None => 0,
             };
-            let matches = match expected {
-                ExpectedVersion::Any => true,
-                ExpectedVersion::Empty => current == 0,
-                ExpectedVersion::Exact(version) => current == version.as_u64(),
-            };
+            let matches =
+                eventyr_store::store::expected_version_matches(*expected, current);
             if !matches {
                 return Err(StoreError::Conflict {
                     stream_id: Some(stream_id.clone()),
@@ -241,11 +238,7 @@ impl<E> FjallStore<E> {
                     stream_id: stream_id.clone(),
                     version,
                     event: row.payload,
-                    metadata: Metadata {
-                        causation_id: row.causation_id,
-                        correlation_id: row.correlation_id,
-                        ..Metadata::default()
-                    },
+                    metadata: Metadata::of_ids(row.causation_id, row.correlation_id),
                 });
             }
             tx.insert(
@@ -284,11 +277,7 @@ impl<E> FjallStore<E> {
             stream_id: stream_id.clone(),
             version: Version::new(row.version),
             event: row.payload,
-            metadata: Metadata {
-                causation_id: row.causation_id,
-                correlation_id: row.correlation_id,
-                ..Metadata::default()
-            },
+            metadata: Metadata::of_ids(row.causation_id, row.correlation_id),
         })
     }
 }
@@ -299,8 +288,16 @@ fn corrupt(error: impl std::fmt::Display) -> StoreError {
     ))))
 }
 
+/// Engine errors: an I/O or lock failure is transient — the protocol's
+/// `Unavailable` (read: caller may retry) — while a corrupt journal, a
+/// version it can't read, or a failed commit is fatal-by-construction
+/// (`Other`). The write machine never retries I/O; the distinction is
+/// for the caller's retry policy.
 fn engine(error: fjall::Error) -> StoreError {
-    StoreError::Other(std::sync::Arc::new(FjallStoreError::Engine(error)))
+    match error {
+        fjall::Error::Io(_) | fjall::Error::Locked => StoreError::Unavailable,
+        other => StoreError::Other(std::sync::Arc::new(FjallStoreError::Engine(other))),
+    }
 }
 
 impl<E> EventStore for FjallStore<E>

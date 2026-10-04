@@ -494,7 +494,12 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
         if self.phase != Phase::Appending {
             return self.violation("`Conflict` outside the appending phase");
         }
-        let folded_version = self.versions.get(&stream).copied().unwrap_or_default();
+        let folded_version = match self.versions.get(&stream) {
+            Some(&version) => version,
+            // A conflict names the stream whose expectation failed; one
+            // outside the boundary can never have been emitted.
+            None => return self.violation("`Conflict` named a stream outside the boundary"),
+        };
         if current <= folded_version {
             return self.violation("conflict reported a version at or before the folded one");
         }
@@ -731,6 +736,24 @@ mod tests {
             return false;
         };
         source.downcast_ref::<ProtocolError>().is_some()
+    }
+
+    /// Assert `action` is the protocol-violation outcome, naming the
+    /// scenario step on failure.
+    macro_rules! assert_protocol_violation {
+        ($action:expr) => {
+            assert!(
+                is_protocol_violation(&$action),
+                "expected a protocol-violation outcome"
+            );
+        };
+        ($action:expr, $step:expr) => {
+            assert!(
+                is_protocol_violation(&$action),
+                "[{}] expected a protocol-violation outcome",
+                $step
+            );
+        };
     }
 
     /// Drive the load phase with empty streams for the whole boundary,
@@ -1018,14 +1041,19 @@ mod tests {
     // -- protocol violations --------------------------------------------
 
     #[test]
-    fn driving_a_finished_machine_is_a_protocol_violation() {
+    fn appended_after_done_is_a_protocol_violation() {
         let mut m = transfer_machine(1, 2, 5, &[1, 2]);
-        load_all_empty(&mut m);
-        m.handle(BatchInput::Appended { committed: vec![] });
-        assert!(is_protocol_violation(
-            &m.handle(BatchInput::Appended { committed: vec![] })
-        ));
-        assert!(is_protocol_violation(&m.start()));
+        load_all_empty(&mut m); // → Appending
+        m.handle(BatchInput::Appended { committed: vec![] }); // Done
+        assert_protocol_violation!(m.handle(BatchInput::Appended { committed: vec![] }));
+    }
+
+    #[test]
+    fn start_after_done_is_a_protocol_violation() {
+        let mut m = transfer_machine(1, 2, 5, &[1, 2]);
+        load_all_empty(&mut m); // → Appending
+        m.handle(BatchInput::Appended { committed: vec![] }); // Done
+        assert_protocol_violation!(m.start());
     }
 
     #[test]

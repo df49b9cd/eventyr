@@ -97,11 +97,12 @@ where
                         metrics.counter(names::APPENDS, committed.len() as u64);
                         machine.handle(WriteInput::Appended { committed })
                     }
-                    Err(StoreError::Conflict { current, .. }) => {
-                        metrics.counter(names::CONFLICTS, 1);
-                        machine.handle(WriteInput::Conflict { current })
+                    Err(error) => {
+                        if matches!(error, StoreError::Conflict { .. }) {
+                            metrics.counter(names::CONFLICTS, 1);
+                        }
+                        machine.handle(error.into())
                     }
-                    Err(error) => machine.handle(WriteInput::Failed(error)),
                 }
             }
             WriteAction::Done(outcome) => return outcome,
@@ -182,11 +183,12 @@ where
                         metrics.counter(names::APPENDS, committed.len() as u64);
                         machine.handle(WriteInput::Appended { committed })
                     }
-                    Err(StoreError::Conflict { current, .. }) => {
-                        metrics.counter(names::CONFLICTS, 1);
-                        machine.handle(WriteInput::Conflict { current })
+                    Err(error) => {
+                        if matches!(error, StoreError::Conflict { .. }) {
+                            metrics.counter(names::CONFLICTS, 1);
+                        }
+                        machine.handle(error.into())
                     }
-                    Err(error) => machine.handle(WriteInput::Failed(error)),
                 }
             }
             WriteAction::Done(outcome) => {
@@ -333,14 +335,29 @@ where
                         metrics.counter(names::APPENDS, count);
                         machine.handle(BatchInput::Appended { committed })
                     }
-                    Err(StoreError::Conflict { stream_id, current }) => {
-                        metrics.counter(names::CONFLICTS, 1);
-                        let stream = stream_id
-                            .or_else(|| machine.streams().first().cloned())
-                            .unwrap_or_default();
-                        machine.handle(BatchInput::Conflict { stream, current })
+                    Err(error) => {
+                        if matches!(error, StoreError::Conflict { .. }) {
+                            metrics.counter(names::CONFLICTS, 1);
+                        }
+                        match error {
+                            StoreError::Conflict { stream_id, current } => {
+                                // A batch conflict should name its stream;
+                                // one that doesn't is attributed to the
+                                // boundary's first stream — a wrong guess
+                                // surfaces as a violation, never as a fold
+                                // against the wrong stream's state.
+                                let stream = eventyr_core::error::named_conflict_stream(
+                                    stream_id,
+                                    machine
+                                        .streams()
+                                        .first()
+                                        .expect("a conflict follows an append to a non-empty boundary"),
+                                );
+                                machine.handle(BatchInput::Conflict { stream, current })
+                            }
+                            other => machine.handle(BatchInput::Failed(other)),
+                        }
                     }
-                    Err(error) => machine.handle(BatchInput::Failed(error)),
                 }
             }
             BatchAction::Done(outcome) => return outcome,

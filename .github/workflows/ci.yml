@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The integration tests' database (the `pg` service below).
+  EVENTYR_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/eventyr
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: eventyr
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --workspace --all-features
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --workspace --all-features --lib
+
+      # The Postgres-backed suites are `#[ignore]`d for casual `cargo
+      # test`; the service above makes the URL real, so run them here.
+      - name: Postgres integration tests
+        run: cargo test -p eventyr-store-postgres --features snapshots -- --ignored

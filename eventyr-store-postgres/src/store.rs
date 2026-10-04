@@ -165,17 +165,9 @@ where
         // data, not a number to wrap.
         let invalid =
             |value: i64| PgStoreError::CorruptRow(format!("negative position in the log: {value}"));
-        // `Metadata::default()` fills `timestamp` — present only when
-        // core's `time` feature is on (it can be switched on by the
-        // umbrella crate without this crate's `time`; the constructor
-        // must not depend on that). With `time` off the update is
-        // needless but must stay for the `time`-on build.
-        #[allow(clippy::needless_update)]
-        let metadata = Metadata {
-            causation_id: metadata.causation_id,
-            correlation_id: metadata.correlation_id,
-            ..Metadata::default()
-        };
+        // The two ids ride the `metadata` column; the timestamp is
+        // `created_at`, set only when this crate's `time` feature is on.
+        let metadata = Metadata::of_ids(metadata.causation_id, metadata.correlation_id);
         #[cfg(feature = "time")]
         let metadata = Metadata {
             timestamp: Some(row.created_at),
@@ -196,7 +188,9 @@ where
 }
 
 /// The expectation as the function's leading arguments:
-/// 0 = Any, 1 = Empty, 2 = Exact.
+/// 0 = Any, 1 = Empty, 2 = Exact. The wire encoding mirrors the port's
+/// [`expected_version_matches`](eventyr_store::store::expected_version_matches)
+/// — the `append_events` function applies the same rule in SQL.
 fn expectation_args(expected: ExpectedVersion) -> (i16, i64) {
     match expected {
         ExpectedVersion::Any => (0, 0),

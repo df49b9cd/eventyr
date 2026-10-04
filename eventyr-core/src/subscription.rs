@@ -613,6 +613,24 @@ mod tests {
         source.downcast_ref::<ProtocolError>().is_some()
     }
 
+    /// Assert `action` is the protocol-violation outcome, naming the
+    /// scenario step on failure.
+    macro_rules! assert_protocol_violation {
+        ($action:expr) => {
+            assert!(
+                is_protocol_violation(&$action),
+                "expected a protocol-violation outcome"
+            );
+        };
+        ($action:expr, $step:expr) => {
+            assert!(
+                is_protocol_violation(&$action),
+                "[{}] expected a protocol-violation outcome",
+                $step
+            );
+        };
+    }
+
     // -- transitions -----------------------------------------------------
 
     #[test]
@@ -868,12 +886,19 @@ mod tests {
     // -- protocol violations ----------------------------------------------
 
     #[test]
-    fn driving_a_finished_machine_is_a_protocol_violation() {
+    fn applied_after_done_is_a_protocol_violation() {
         let mut m = machine();
         m.start();
         m.handle(SubscriptionInput::Failed(StoreError::Unavailable)); // Done
-        assert!(is_protocol_violation(&m.handle(SubscriptionInput::Applied)));
-        assert!(is_protocol_violation(&m.start()));
+        assert_protocol_violation!(m.handle(SubscriptionInput::Applied));
+    }
+
+    #[test]
+    fn start_after_done_is_a_protocol_violation() {
+        let mut m = machine();
+        m.start();
+        m.handle(SubscriptionInput::Failed(StoreError::Unavailable)); // Done
+        assert_protocol_violation!(m.start());
     }
 
     #[test]

@@ -4,7 +4,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::vocabulary::Version;
+use crate::vocabulary::{StreamId, Version};
+use crate::write::WriteInput;
 
 /// A store operation failed — a stream read, an append, or a
 /// snapshot read. (A snapshot read failing fails the interaction: the
@@ -92,6 +93,31 @@ impl StoreError {
         Self::from(message.into())
     }
 }
+
+/// The [`StreamId`] for a [`Conflict`](StoreError::Conflict) that doesn't
+/// name one, and the driver can pin down — a single-stream interaction's
+/// own stream. The error leaves the field empty because its producer (a
+/// plain `append`) knows the caller has the id; centralizing the fill
+/// keeps the one decision out of every driver.
+pub fn named_conflict_stream(stream_id: Option<StreamId>, fallback: &StreamId) -> StreamId {
+    stream_id.unwrap_or_else(|| fallback.clone())
+}
+
+impl<E, S> From<StoreError> for WriteInput<E, S> {
+    /// Every store failure travels through the machine as
+    /// [`Failed`](WriteInput::Failed) — except a [`Conflict`], which the
+    /// write protocol owns a retry path for
+    /// ([`WriteInput::Conflict`]). This is the one place that mapping
+    /// exists; a `StoreError` variant that is not retry-shaped lands in
+    /// `Failed` without a driver edit.
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::Conflict { current, .. } => WriteInput::Conflict { current },
+            other => WriteInput::Failed(other),
+        }
+    }
+}
+
 
 /// A driver violated the machine protocol: fed an input the current phase
 /// does not accept, or drove a finished machine.

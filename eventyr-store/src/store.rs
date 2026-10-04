@@ -92,6 +92,18 @@ pub trait StreamsAll: EventStore {
     ) -> impl Stream<Item = Result<EventEnvelope<Self::Event>, StoreError>> + Send;
 }
 
+/// The optimistic-concurrency check, once: whether a stream at
+/// `current` (0 = absent) satisfies the [`ExpectedVersion`]. Every store
+/// answers the same question — the port ships the rule so no store
+/// re-derives it.
+pub fn expected_version_matches(expected: ExpectedVersion, current: u64) -> bool {
+    match expected {
+        ExpectedVersion::Any => true,
+        ExpectedVersion::Empty => current == 0,
+        ExpectedVersion::Exact(version) => current == version.as_u64(),
+    }
+}
+
 /// The fallback [`EventStore::append_batch`] for stores that cannot
 /// commit atomically across streams: an empty batch commits nothing, a
 /// single-stream batch delegates to [`append`](EventStore::append), and

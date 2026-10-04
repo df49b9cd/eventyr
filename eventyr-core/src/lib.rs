@@ -125,6 +125,7 @@ pub mod batch;
 pub mod envelope;
 pub mod error;
 pub mod event_name;
+pub mod metrics;
 pub mod version_registry;
 pub mod snapshot;
 pub mod subscription;
@@ -144,10 +145,8 @@ pub mod prelude {
     pub use crate::envelope::{EventEnvelope, Metadata, NewEvent};
     pub use crate::error::{ProtocolError, StoreError, UpcastError};
     pub use crate::event_name::EventName;
-    pub use crate::version_registry::{
-        VersionRung, RegistryError, EventSchemaVersion, UpcasterRegistry, VersionUpcaster,
-        VersionedRaw,
-    };
+    pub use crate::metrics::{Metrics, NoopMetrics};
+    pub use crate::version_registry::{EventSchemaVersion, VersionedRaw};
     pub use crate::snapshot::{
         HasSnapshotState, OfferSnapshot, Snapshot, SnapshotPolicy, WritePolicy,
     };

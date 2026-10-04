@@ -19,10 +19,11 @@ use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
 use eventyr_core::subscription::{Batch, Checkpoint};
 use eventyr_core::upcast::RawEvent;
-use eventyr_core::version_registry::UpcasterRegistry;
+use eventyr_core::version_registry::VersionedRaw;
 use eventyr_subscription::source::SubscriptionSource;
 
 use crate::chain::UpcasterChain;
+use crate::registry::UpcasterRegistry;
 
 /// A [`SubscriptionSource`] adapter that upcasts each fetched envelope's
 /// raw event through a chain at fetch time.
@@ -145,7 +146,7 @@ where
             let raw = envelope.event;
             let payload = self
                 .registry
-                .upcast(eventyr_core::version_registry::VersionedRaw {
+                .upcast(VersionedRaw {
                     event_type: raw.event_type.clone(),
                     version: raw.schema_version,
                     payload: raw.payload,
