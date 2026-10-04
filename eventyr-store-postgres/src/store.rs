@@ -19,26 +19,58 @@ use futures::Stream;
 use sqlx::postgres::PgPool;
 
 use crate::PgStoreError;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use eventyr_projection::inline::{
+    InlineView, InlineViews, RowKey, StoredRow, fold_inline, rows_touched,
+};
 
 /// An [`EventStore`] over Postgres, via sqlx, for one event enum `E` —
 /// and, for [`Tagged`] events, [`QueryAppend`] (0.7.1).
 ///
 /// Shareable and cloneable (it wraps a [`PgPool`]): the pool owns the
 /// connection count; the store holds no other state.
-#[derive(Clone)]
 pub struct PgStore<E> {
     pool: PgPool,
-    _event: std::marker::PhantomData<fn(E)>,
+    /// Views folded inside every append transaction (0.7.3).
+    inline_views: InlineViews<E>,
+}
+
+impl<E> Clone for PgStore<E> {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            inline_views: Arc::clone(&self.inline_views),
+        }
+    }
 }
 
 impl<E> PgStore<E> {
     /// Wrap an existing pool. Run the migration first
     /// ([`migrate`]) — the store assumes the schema.
-    pub const fn new(pool: PgPool) -> Self {
+    pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
-            _event: std::marker::PhantomData,
+            inline_views: Arc::from([]),
         }
+    }
+
+    /// Maintain `views` inline (0.7.3): every append folds its committed
+    /// events into the views' rows in the `views` table, inside the
+    /// append's transaction. A row that cannot be written fails the
+    /// append. Read the rows with [`PgViewStore`](crate::views::PgViewStore)
+    /// — they are the same rows an async
+    /// [`ViewProjection`](eventyr_projection::view::ViewProjection) of the
+    /// same view writes, under the same newest-wins guard.
+    ///
+    /// Every append commits one at a time on Postgres already (the
+    /// commit-order lock, migration 0006), so inline folds never race;
+    /// their cost is added to that serialized section. Keep inline views
+    /// cheap, and steer heavy or rarely-read ones to the async path.
+    pub fn with_inline_views(mut self, views: Vec<Arc<dyn InlineView<E>>>) -> Self {
+        self.inline_views = views.into();
+        self
     }
 
     /// Build a pool and run the migration.
@@ -220,6 +252,16 @@ async fn lock_streams<E>(
     Ok(())
 }
 
+fn decode_rows<E>(rows: Vec<EventRow>) -> Result<Vec<EventEnvelope<E>>, StoreError>
+where
+    E: serde::de::DeserializeOwned + EventName,
+{
+    rows.into_iter()
+        .map(EventEnvelope::try_from)
+        .collect::<Result<Vec<_>, PgStoreError>>()
+        .map_err(StoreError::from)
+}
+
 /// Run each append's `append_events` inside the caller's open
 /// transaction, in input order.
 async fn append_all_tx<E>(
@@ -300,6 +342,75 @@ async fn query_page<'c>(
     rows.map_err(PgStoreError::into_store)
 }
 
+/// Fold `committed` into the inline views and write the changed rows,
+/// inside the caller's open transaction.
+///
+/// No lock of its own: every append path holds the commit-order lock
+/// (migration 0006) by the time it gets here, until commit, so view
+/// folds are already serialized — two appends to different streams
+/// folding into one row cannot both read its old value. If that lock is
+/// ever relaxed (per-tag locking, §14), these rows need their own;
+/// `concurrent_folds_into_one_row_lose_nothing` fails without either.
+async fn write_inline_views<E>(
+    conn: &mut sqlx::PgConnection,
+    views: &[Arc<dyn InlineView<E>>],
+    committed: &[EventEnvelope<E>],
+) -> Result<(), StoreError> {
+    if views.is_empty() || committed.is_empty() {
+        return Ok(());
+    }
+    let touched = rows_touched(views, committed);
+    if touched.is_empty() {
+        return Ok(());
+    }
+    let mut loaded: BTreeMap<RowKey, StoredRow> = BTreeMap::new();
+    for (name, id) in &touched {
+        let row: Option<(i64, serde_json::Value)> = sqlx::query_as(
+            "SELECT version, payload FROM views WHERE view_name = $1 AND view_id = $2",
+        )
+        .bind(name)
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(PgStoreError::into_store)?;
+        if let Some((version, payload)) = row {
+            let version = u64::try_from(version).map_err(|_| {
+                StoreError::from(PgStoreError::CorruptRow(format!(
+                    "negative view version: {version}"
+                )))
+            })?;
+            loaded.insert(
+                (name.clone(), id.clone()),
+                StoredRow {
+                    version: Sequence::new(version),
+                    payload,
+                },
+            );
+        }
+    }
+    let rows = fold_inline(views, committed, loaded)
+        .map_err(|error| StoreError::Other(Arc::new(error)))?;
+    for ((name, id), row) in rows {
+        let version = i64::try_from(row.version.as_u64()).map_err(|_| {
+            StoreError::from(PgStoreError::CorruptRow("view version beyond i64".into()))
+        })?;
+        sqlx::query(
+            "INSERT INTO views (view_name, view_id, version, payload) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (view_name, view_id) DO UPDATE \
+             SET version = EXCLUDED.version, payload = EXCLUDED.payload, updated_at = now() \
+             WHERE views.version < EXCLUDED.version",
+        )
+        .bind(&name)
+        .bind(&id)
+        .bind(version)
+        .bind(&row.payload)
+        .execute(&mut *conn)
+        .await
+        .map_err(PgStoreError::into_store)?;
+    }
+    Ok(())
+}
+
 const QUERY_PAGE: i64 = 512;
 
 /// The advisory lock every append holds from drawing its global
@@ -321,24 +432,30 @@ where
         events: Vec<NewEvent<E>>,
     ) -> impl Future<Output = Result<Vec<EventEnvelope<E>>, StoreError>> + Send {
         let pool = self.pool.clone();
+        let views = Arc::clone(&self.inline_views);
         let stream_id = stream_id.clone();
         async move {
             if events.is_empty() {
                 return Ok(Vec::new());
             }
             let args = append_args(expected, events).map_err(StoreError::from)?;
-            let rows = append_events_tx(
-                &mut *pool.acquire().await.map_err(PgStoreError::into_store)?,
-                stream_id.as_str(),
-                args,
-            )
-            .await
-            .map_err(PgStoreError::into_store)?;
-
-            rows.into_iter()
-                .map(EventEnvelope::try_from)
-                .collect::<Result<Vec<_>, PgStoreError>>()
-                .map_err(StoreError::from)
+            let mut conn = pool.acquire().await.map_err(PgStoreError::into_store)?;
+            if views.is_empty() {
+                // No inline views: one autocommitted statement.
+                let rows = append_events_tx(&mut conn, stream_id.as_str(), args)
+                    .await
+                    .map_err(PgStoreError::into_store)?;
+                return decode_rows(rows);
+            }
+            use sqlx::Acquire;
+            let mut tx = conn.begin().await.map_err(PgStoreError::into_store)?;
+            let rows = append_events_tx(&mut tx, stream_id.as_str(), args)
+                .await
+                .map_err(PgStoreError::into_store)?;
+            let committed = decode_rows(rows)?;
+            write_inline_views(&mut tx, &views, &committed).await?;
+            tx.commit().await.map_err(PgStoreError::into_store)?;
+            Ok(committed)
         }
     }
 
@@ -356,6 +473,7 @@ where
         appends: Vec<StreamAppend<E>>,
     ) -> impl Future<Output = Result<Vec<CommittedStream<E>>, StoreError>> + Send {
         let pool = self.pool.clone();
+        let views = Arc::clone(&self.inline_views);
         async move {
             use sqlx::Acquire;
             let mut conn = pool.acquire().await.map_err(PgStoreError::into_store)?;
@@ -363,6 +481,11 @@ where
 
             lock_streams(&mut tx, &appends).await?;
             let committed = append_all_tx(&mut tx, appends).await?;
+            let events: Vec<_> = committed
+                .iter()
+                .flat_map(|c| c.events.iter().cloned())
+                .collect();
+            write_inline_views(&mut tx, &views, &events).await?;
             tx.commit().await.map_err(PgStoreError::into_store)?;
             Ok(committed)
         }
@@ -509,6 +632,7 @@ where
         condition: AppendCondition,
     ) -> impl Future<Output = Result<Vec<CommittedStream<E>>, StoreError>> + Send {
         let pool = self.pool.clone();
+        let views = Arc::clone(&self.inline_views);
         async move {
             use sqlx::Acquire;
             let mut conn = pool.acquire().await.map_err(PgStoreError::into_store)?;
@@ -547,6 +671,11 @@ where
             }
 
             let committed = append_all_tx(&mut tx, appends).await?;
+            let events: Vec<_> = committed
+                .iter()
+                .flat_map(|c| c.events.iter().cloned())
+                .collect();
+            write_inline_views(&mut tx, &views, &events).await?;
             tx.commit().await.map_err(PgStoreError::into_store)?;
             Ok(committed)
         }

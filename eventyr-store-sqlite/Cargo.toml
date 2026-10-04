@@ -15,10 +15,13 @@ default = []
 # The `SnapshotStore` implementation over a second table. Off by
 # default: stores that only want the event log pay nothing.
 snapshots = []
+# The `views` table: the `ViewStore` port and inline views (0.7.3).
+views = ["dep:eventyr-projection"]
 
 [dependencies]
 eventyr-core = { workspace = true, features = ["serde"] }
 eventyr-store = { workspace = true }
+eventyr-projection = { workspace = true, features = ["inline"], optional = true }
 rusqlite = { version = "0.34", features = ["bundled"] }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
@@ -28,5 +31,6 @@ futures = { version = "0.3", default-features = false, features = ["alloc"] }
 # dev-dependency on ourselves so the contract-suite tests can toggle
 # the feature (a crate's own --features don't reach `tests/`).
 [dev-dependencies]
-eventyr-store-sqlite = { path = ".", features = ["snapshots"] }
+eventyr-store-sqlite = { path = ".", features = ["snapshots", "views"] }
 eventyr-store-testing = { workspace = true }
+eventyr-subscription = { workspace = true }

@@ -53,6 +53,9 @@ const EVENT_COLUMNS: &str =
 /// one store handle to see all its writes).
 pub struct SqliteStore<E> {
     conn: Arc<Mutex<rusqlite::Connection>>,
+    /// Views folded inside every append transaction (0.7.3).
+    #[cfg(feature = "views")]
+    inline_views: eventyr_projection::inline::InlineViews<E>,
     /// Raised after every commit (0.7.2); shared by clones.
     signal: LocalCommitSignal,
     _event: std::marker::PhantomData<fn() -> E>,
@@ -62,6 +65,8 @@ impl<E> Clone for SqliteStore<E> {
     fn clone(&self) -> Self {
         Self {
             conn: Arc::clone(&self.conn),
+            #[cfg(feature = "views")]
+            inline_views: Arc::clone(&self.inline_views),
             signal: self.signal.clone(),
             _event: std::marker::PhantomData,
         }
@@ -86,16 +91,52 @@ impl<E> SqliteStore<E> {
     /// tables stand on. Run on the same connection the app reads with.
     pub fn from_connection(conn: rusqlite::Connection) -> Result<Self, SqliteStoreError> {
         conn.execute_batch(SCHEMA)?;
+        #[cfg(feature = "views")]
+        conn.execute_batch(crate::views::VIEWS_SCHEMA)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            #[cfg(feature = "views")]
+            inline_views: Arc::from([]),
             signal: LocalCommitSignal::new(),
             _event: std::marker::PhantomData,
         })
     }
 
+    /// Maintain `views` inline (0.7.3): every append folds its committed
+    /// events into the views' rows in the `views` table, inside the
+    /// append's transaction, and a row that cannot be written fails the
+    /// append. Read the rows with [`SqliteViewStore`](crate::SqliteViewStore).
+    #[cfg(feature = "views")]
+    pub fn with_inline_views(
+        mut self,
+        views: Vec<Arc<dyn eventyr_projection::inline::InlineView<E>>>,
+    ) -> Self {
+        self.inline_views = views.into();
+        self
+    }
+
+    /// Fold `committed` into the inline views inside `tx` — a no-op
+    /// without the `views` feature.
+    #[allow(clippy::unused_self, reason = "no-op without the `views` feature")]
+    fn write_views(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        committed: &[EventEnvelope<E>],
+    ) -> Result<(), StoreError> {
+        #[cfg(feature = "views")]
+        {
+            crate::views::write_inline_views(tx, &self.inline_views, committed)
+        }
+        #[cfg(not(feature = "views"))]
+        {
+            let _ = (tx, committed);
+            Ok(())
+        }
+    }
+
     /// The connection, for sibling stores on the same database (the
-    /// snapshot store behind the `snapshots` feature).
-    #[cfg(feature = "snapshots")]
+    /// snapshot and view stores behind their features).
+    #[cfg(any(feature = "snapshots", feature = "views"))]
     pub(crate) fn conn(&self) -> Arc<Mutex<rusqlite::Connection>> {
         Arc::clone(&self.conn)
     }
@@ -298,6 +339,7 @@ where
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(SqliteStoreError::into_store)?;
         let mut committed = append_within(&tx, &[(stream_id.clone(), expected, events)])?;
+        self.write_views(&tx, &committed[0])?;
         tx.commit().map_err(SqliteStoreError::into_store)?;
         self.notify_if_written(&committed);
         // One stream in the batch: the writes above are the caller's
@@ -319,6 +361,7 @@ where
             .map(|a| (a.stream_id, a.expected, a.events))
             .collect();
         let committed = append_within(&tx, &appends)?;
+        self.write_views(&tx, &committed.concat())?;
         tx.commit().map_err(SqliteStoreError::into_store)?;
         self.notify_if_written(&committed);
         Ok(appends
@@ -405,6 +448,7 @@ where
             .map(|a| (a.stream_id, a.expected, a.events))
             .collect();
         let committed = append_within(&tx, &appends)?;
+        self.write_views(&tx, &committed.concat())?;
         tx.commit().map_err(SqliteStoreError::into_store)?;
         self.notify_if_written(&committed);
         Ok(appends

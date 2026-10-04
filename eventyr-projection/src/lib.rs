@@ -123,6 +123,8 @@
 //! ```
 
 pub mod chain;
+#[cfg(feature = "inline")]
+pub mod inline;
 pub mod rebuild;
 pub mod registry;
 pub mod source;

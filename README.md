@@ -23,7 +23,7 @@ user-implementable trait), no ORM, no DDD toolkit.
 | `eventyr-store` | `EventStore`/`StreamsAll` ports, the opt-in `QueryAppend` and `CommitSignal` ports, `InMemoryStore`, `drive_write` driver, `AggregateRepository`, prelude | shipped |
 | `eventyr-macros` | `#[derive(Aggregate)]`, `#[derive(EventName)]` — convention wiring, sugar not API | shipped |
 | `eventyr-store-postgres` | sqlx-based `EventStore`/`StreamsAll` (`PgStore`, `append_events` PL/pgSQL, DESIGN §9's single-table sketch made real) — a standalone crate, not an umbrella feature yet | shipped |
-| `eventyr-projection` | Read-path correctness layer: `UpcasterChain`/`ClosureUpcaster`, `UpcastingSource` (raw→typed), `RebuildPlan`/`SchemaVersion`/`checkpoint_key` | shipped |
+| `eventyr-projection` | Read-path correctness layer: `UpcasterChain`/`ClosureUpcaster`, `UpcastingSource` (raw→typed), `RebuildPlan`/`SchemaVersion`/`checkpoint_key`; `View`/`ViewProjection`, and inline views written in the append transaction (`inline` feature, run by the Postgres and SQLite stores) | shipped |
 | `eventyr-subscription` | Catch-up runner: `Projection` trait, `Projector`/`drive_projector` (`drive_projector_blocking` too; `wake_on`/`drive_projector_woken` poll on commit instead of after the idle sleep), `Fanout`, `CheckpointStore`/`InMemoryCheckpointStore`, `StoreSubscription`; `EventBus` trait behind its `bus` feature | shipped |
 | `eventyr-store-fjall` | Embedded `EventStore`/`StreamsAll` over fjall — transactional appends, no server, driveable without an async runtime | shipped |
 | `eventyr-store-testing` | The store contract: `event_store_contract` / `streams_all_contract` / `snapshot_contract` / `query_append_contract` / `commit_signal_contract`, self-tested against the in-memory store | shipped |
