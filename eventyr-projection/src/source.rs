@@ -40,16 +40,6 @@ impl<S, E> UpcastingSource<S, E> {
         Self { inner, chain }
     }
 
-    /// The wrapped raw source.
-    pub fn get_ref(&self) -> &S {
-        &self.inner
-    }
-
-    /// The chain this source upcasts through.
-    pub fn chain(&self) -> &UpcasterChain<E> {
-        &self.chain
-    }
-
     /// Unwrap the raw source.
     pub fn into_inner(self) -> S {
         self.inner

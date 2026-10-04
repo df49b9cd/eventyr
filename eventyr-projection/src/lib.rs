@@ -80,7 +80,7 @@
 //! // The chain: one registered upcaster per historical shape.
 //! let chain = UpcasterChain::new().with(
 //!     "AmountV1",
-//!     SequenceUpcaster::new(|raw: RawEvent| {
+//!     ClosureUpcaster::new(|raw: RawEvent| {
 //!         std::str::from_utf8(&raw.payload)
 //!             .ok()
 //!             .and_then(|text| text.parse::<u64>().ok())
@@ -128,7 +128,7 @@ pub mod prelude {
     //! The read path: upcaster chains, the raw→typed source adapter,
     //! and schema-versioned rebuilds.
 
-    pub use crate::chain::{SequenceUpcaster, UpcasterChain};
+    pub use crate::chain::{ClosureUpcaster, UpcasterChain};
     pub use crate::rebuild::{
         RebuildPlan, SchemaCheckpointStore, SchemaVersion, checkpoint_key,
     };

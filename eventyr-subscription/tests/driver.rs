@@ -183,6 +183,13 @@ fn apply_failed_redelivers_the_whole_batch() {
             SubscriptionInput::Applied, // re-applied 1
         ],
     );
+    // Backoff evidence: after ApplyFailed the machine drops the pending
+    // batch and sleeps `retry_sleep` before re-fetching. The sequence is
+    // Fetch[0] → Apply(1)[1] → Apply(2)[2] → (ApplyFailed) Sleep[3].
+    assert!(matches!(
+        actions[3],
+        SubscriptionAction::Sleep { for_ } if for_ == SubscriptionPolicy::default().retry_sleep
+    ));
     assert!(matches!(
         actions.last(),
         Some(SubscriptionAction::Apply { envelope })
@@ -271,4 +278,121 @@ fn shutdown_during_idle_drains_a_final_poll() {
         Some(SubscriptionAction::Done(SubscriptionOutcome::Stopped { checkpoint }))
             if *checkpoint == Checkpoint::new(Sequence::new(1))
     ));
+}
+
+// -- pagination & mid-batch errors through the real runner ----------------
+
+/// A checkpoint store that records every ack, wrapping the in-memory one.
+struct RecordingCheckpoints {
+    inner: InMemoryCheckpointStore,
+    acks: Arc<Mutex<Vec<Checkpoint>>>,
+}
+
+impl CheckpointStore for RecordingCheckpoints {
+    async fn load(&self, name: &str) -> Result<Checkpoint, StoreError> {
+        self.inner.load(name).await
+    }
+
+    async fn store(&self, name: &str, checkpoint: Checkpoint) -> Result<(), StoreError> {
+        self.acks.lock().expect("poisoned").push(checkpoint);
+        self.inner.store(name, checkpoint).await
+    }
+}
+
+/// With `batch_size` 1 over three events, the runner must run a fetch →
+/// apply → ack cycle per event, advancing the checkpoint one step each
+/// time — this is the path upstream gaps and partial failures re-enter.
+#[tokio::test]
+async fn batch_size_one_cycles_fetch_ack_per_event() {
+    let store = InMemoryStore::new();
+    populate(&store, &[10, 20, 30]).await;
+    let acks = Arc::new(Mutex::new(Vec::new()));
+    let checkpoints = RecordingCheckpoints {
+        inner: InMemoryCheckpointStore::new(),
+        acks: acks.clone(),
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+
+    let projector = Projector::new(
+        "balance",
+        StoreSubscription::new(&store),
+        checkpoints,
+        Seen(seen.clone()),
+    )
+    .with_policy(
+        SubscriptionPolicy::new(1, Default::default(), Default::default()).stop_at_catch_up(),
+    );
+    let outcome = projector.run(|_| future::ready(())).await.expect("run");
+
+    assert!(matches!(
+        outcome,
+        SubscriptionOutcome::CaughtUp { checkpoint }
+            if checkpoint == Checkpoint::new(Sequence::new(3))
+    ));
+    // One ack per single-event batch: the checkpoint advances 1 → 2 → 3.
+    assert_eq!(
+        *acks.lock().expect("poisoned"),
+        vec![
+            Checkpoint::new(Sequence::new(1)),
+            Checkpoint::new(Sequence::new(2)),
+            Checkpoint::new(Sequence::new(3)),
+        ],
+        "a fetch→ack cycle per batch"
+    );
+    assert_eq!(*seen.lock().expect("poisoned"), vec![1, 2, 3]);
+}
+
+/// A source whose stream fails after delivering `fail_after` events: the
+/// mid-batch error path a real store can't reach on demand.
+struct FailAfter {
+    events: Vec<EventEnvelope<u64>>,
+    fail_after: usize,
+}
+
+impl SubscriptionSource for &FailAfter {
+    type Event = u64;
+
+    async fn fetch(&self, from: Checkpoint, max: usize) -> Result<Batch<u64>, StoreError> {
+        let floor = from.as_sequence().as_u64();
+        let rest: Vec<_> = self
+            .events
+            .iter()
+            .filter(|e| e.sequence.as_u64() > floor)
+            .take(max)
+            .cloned()
+            .collect();
+        if rest.len() > self.fail_after {
+            return Err(StoreError::other("stream broke mid-batch"));
+        }
+        let upper = rest.last().map(|e| Checkpoint::new(e.sequence));
+        Ok(Batch::new(rest, upper))
+    }
+}
+
+/// A fetch that errors part-way through a batch surfaces as a fatal
+/// `Failed` — the machine does not ack a partial batch.
+#[tokio::test]
+async fn a_source_error_surfaces_as_a_failed_outcome() {
+    let source = FailAfter {
+        events: vec![envelope(1, 10), envelope(2, 20)],
+        fail_after: 1,
+    };
+    let projector = Projector::new(
+        "balance",
+        &source,
+        InMemoryCheckpointStore::new(),
+        Seen(Arc::new(Mutex::new(Vec::new()))),
+    )
+    // Batch over both events so the stream fails mid-batch.
+    .with_policy(SubscriptionPolicy {
+        batch_size: 2,
+        ..SubscriptionPolicy::default()
+    });
+
+    let outcome = projector.run(|_| future::ready(())).await.expect("run");
+
+    assert!(
+        matches!(outcome, SubscriptionOutcome::Failed(StoreError::Other(_))),
+        "a mid-batch source error is fatal, got {outcome:?}"
+    );
 }

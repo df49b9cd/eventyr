@@ -114,7 +114,9 @@ where
         // `Metadata::default()` fills `timestamp` — present only when
         // core's `time` feature is on (it can be switched on by the
         // umbrella crate without this crate's `time`; the constructor
-        // must not depend on that).
+        // must not depend on that). With `time` off the update is
+        // needless but must stay for the `time`-on build.
+        #[allow(clippy::needless_update)]
         let metadata = Metadata {
             causation_id: metadata.causation_id,
             correlation_id: metadata.correlation_id,
@@ -280,5 +282,134 @@ where
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eventyr_core::error::StoreError;
+    use serde::Deserialize;
+
+    #[derive(Clone, Deserialize, Debug, PartialEq)]
+    enum TestEvent {
+        Ping { value: u64 },
+    }
+
+    impl EventName for TestEvent {
+        fn event_name(&self) -> &'static str {
+            match self {
+                TestEvent::Ping { .. } => "Ping",
+            }
+        }
+    }
+
+    fn row(payload: serde_json::Value, metadata: serde_json::Value) -> EventRow {
+        EventRow {
+            global_sequence: 1,
+            stream_id: "stream-1".into(),
+            stream_version: 1,
+            payload,
+            metadata,
+            #[cfg(feature = "time")]
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn good_payload() -> serde_json::Value {
+        serde_json::json!({"Ping": {"value": 9}})
+    }
+
+    fn good_metadata() -> serde_json::Value {
+        serde_json::json!({"causation_id": "cmd-1", "correlation_id": "corr-1"})
+    }
+
+    fn corrupt_row(error: PgStoreError, needle: &str) {
+        match error {
+            PgStoreError::CorruptRow(message) => {
+                assert!(message.contains(needle), "message: {message}");
+            }
+            other => panic!("expected CorruptRow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_well_formed_row_decodes() {
+        // A full pass through the happy path pins the decode contract
+        // the failure tests below interrupt.
+        let envelope =
+            EventEnvelope::<TestEvent>::try_from(row(good_payload(), good_metadata())).expect("decodes");
+        assert_eq!(envelope.event, TestEvent::Ping { value: 9 });
+        assert_eq!(envelope.sequence, Sequence::new(1));
+        assert_eq!(envelope.version, Version::new(1));
+        assert_eq!(envelope.stream_id.as_str(), "stream-1");
+        assert_eq!(envelope.metadata.causation_id.as_deref(), Some("cmd-1"));
+    }
+
+    #[test]
+    fn an_undecodable_payload_is_a_corrupt_row() {
+        // Not the variant the enum offers.
+        let payload = serde_json::json!({"Bounce": {}});
+        corrupt_row(
+            EventEnvelope::<TestEvent>::try_from(row(payload, good_metadata()))
+                .expect_err("the payload does not decode"),
+            "payload",
+        );
+    }
+
+    #[test]
+    fn undecodable_metadata_is_a_corrupt_row() {
+        // ids arrive as the wrong shape.
+        let metadata = serde_json::json!({"causation_id": 42, "correlation_id": null});
+        corrupt_row(
+            EventEnvelope::<TestEvent>::try_from(row(good_payload(), metadata))
+                .expect_err("the metadata does not decode"),
+            "metadata",
+        );
+    }
+
+    #[test]
+    fn a_negative_sequence_is_a_corrupt_row() {
+        corrupt_row(
+            EventEnvelope::<TestEvent>::try_from(EventRow {
+                global_sequence: -1,
+                ..row(good_payload(), good_metadata())
+            })
+            .expect_err("negative sequence"),
+            "negative position",
+        );
+    }
+
+    #[test]
+    fn a_negative_version_is_a_corrupt_row() {
+        corrupt_row(
+            EventEnvelope::<TestEvent>::try_from(EventRow {
+                stream_version: -1,
+                ..row(good_payload(), good_metadata())
+            })
+            .expect_err("negative version"),
+            "negative position",
+        );
+    }
+
+    #[test]
+    fn a_corrupt_row_maps_to_store_error_other() {
+        // The store-level conversion the streams lean on: a corrupt row
+        // is fatal-by-construction, not a conflict or an outage.
+        let error =
+            StoreError::from(PgStoreError::CorruptRow("the payload does not decode".into()));
+        assert!(matches!(error, StoreError::Other(_)));
+    }
+
+    #[test]
+    fn expectation_args_encode_kind_and_version() {
+        assert_eq!(expectation_args(ExpectedVersion::Any), (0, 0));
+        assert_eq!(expectation_args(ExpectedVersion::Empty), (1, 0));
+        assert_eq!(expectation_args(ExpectedVersion::Exact(Version::new(3))), (2, 3));
+        // A version beyond i64 saturates rather than wrapping.
+        assert_eq!(
+            expectation_args(ExpectedVersion::Exact(Version::new(u64::MAX))),
+            (2, i64::MAX)
+        );
     }
 }

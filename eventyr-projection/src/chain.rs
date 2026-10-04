@@ -125,7 +125,7 @@ where
 /// # use eventyr_core::error::UpcastError;
 /// let chain = UpcasterChain::new().with(
 ///     "AmountV1",
-///     SequenceUpcaster::new(|raw: RawEvent| -> Result<u64, UpcastError> {
+///     ClosureUpcaster::new(|raw: RawEvent| -> Result<u64, UpcastError> {
 ///         // Parse the old shape, return the current one. A V2 -> V1
 ///         // rung for an older pair is just another `with` entry.
 ///         std::str::from_utf8(&raw.payload)
@@ -141,18 +141,18 @@ where
 ///
 /// The chain routes by `event_type`; the step body owns parsing, so the
 /// crate takes no serde dependency.
-pub struct SequenceUpcaster<F> {
+pub struct ClosureUpcaster<F> {
     step: F,
 }
 
-impl<F> SequenceUpcaster<F> {
+impl<F> ClosureUpcaster<F> {
     /// Wrap a step function as an upcaster.
     pub fn new(step: F) -> Self {
         Self { step }
     }
 }
 
-impl<E, F> Upcaster<E> for SequenceUpcaster<F>
+impl<E, F> Upcaster<E> for ClosureUpcaster<F>
 where
     F: Fn(RawEvent) -> Result<E, UpcastError> + Send + Sync,
     E: Send + Sync,
@@ -187,13 +187,13 @@ mod tests {
 
     #[test]
     fn a_registered_event_type_upcasts() {
-        let chain = UpcasterChain::new().with("AmountV1", SequenceUpcaster::new(parse_amount));
+        let chain = UpcasterChain::new().with("AmountV1", ClosureUpcaster::new(parse_amount));
         assert_eq!(chain.upcast(raw("AmountV1", "42")).expect("upcast"), 42);
     }
 
     #[test]
     fn a_miss_is_a_loud_error_naming_the_event_type() {
-        let chain = UpcasterChain::new().with("AmountV1", SequenceUpcaster::new(parse_amount));
+        let chain = UpcasterChain::new().with("AmountV1", ClosureUpcaster::new(parse_amount));
         let error = chain
             .upcast(raw("AmountV0", "42"))
             .expect_err("an unregistered type is never skipped");
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn a_registered_upcasters_failure_propagates_unwrapped() {
-        let chain = UpcasterChain::new().with("AmountV1", SequenceUpcaster::new(parse_amount));
+        let chain = UpcasterChain::new().with("AmountV1", ClosureUpcaster::new(parse_amount));
         let error = chain
             .upcast(raw("AmountV1", "not a number"))
             .expect_err("a bad payload is loud");
@@ -214,10 +214,10 @@ mod tests {
     fn the_chain_is_itself_an_upcaster_so_chains_nest() {
         // Nesting merges chains: the inner chain handles the event
         // types it was built for, and the outer adds its own alongside.
-        let amount_v1 = UpcasterChain::new().with("AmountV1", SequenceUpcaster::new(parse_amount));
+        let amount_v1 = UpcasterChain::new().with("AmountV1", ClosureUpcaster::new(parse_amount));
         let chain = UpcasterChain::new()
             .with("AmountV1", amount_v1)
-            .with("Other", SequenceUpcaster::new(|_| Ok(0)));
+            .with("Other", ClosureUpcaster::new(|_| Ok(0)));
         assert_eq!(
             Upcaster::upcast(&chain, raw("AmountV1", "7")).expect("nested upcast"),
             7
@@ -229,10 +229,10 @@ mod tests {
     fn a_version_ladder_composes_rung_by_rung() {
         // A1 -> A2 doubles; A2 -> A3 (the current shape) adds one.
         let chain = UpcasterChain::new()
-            .with("AmountV2", SequenceUpcaster::new(|raw: RawEvent| parse_amount(raw).map(
+            .with("AmountV2", ClosureUpcaster::new(|raw: RawEvent| parse_amount(raw).map(
                 |old| old + 1,
             )))
-            .with("AmountV1", SequenceUpcaster::new(|raw: RawEvent| {
+            .with("AmountV1", ClosureUpcaster::new(|raw: RawEvent| {
                 parse_amount(raw).map(|a1| a1 * 2 + 1)
             }));
         assert_eq!(chain.upcast(raw("AmountV1", "3")).expect("ladder"), 7);
@@ -242,8 +242,8 @@ mod tests {
     #[test]
     fn a_later_registration_shadows_an_earlier_one() {
         let chain = UpcasterChain::new()
-            .with("AmountV1", SequenceUpcaster::new(|_| Ok(1)))
-            .with("AmountV1", SequenceUpcaster::new(|_| Ok(2)));
+            .with("AmountV1", ClosureUpcaster::new(|_| Ok(1)))
+            .with("AmountV1", ClosureUpcaster::new(|_| Ok(2)));
         assert_eq!(chain.upcast(raw("AmountV1", "x")).expect("shadowed"), 2);
         assert_eq!(chain.len(), 2);
         assert!(!chain.is_empty());

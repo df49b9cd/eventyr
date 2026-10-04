@@ -198,6 +198,10 @@ async fn append_read_conflict_stream_all() {
         )
         .await
         .expect("opened");
+    // `..Metadata::default()` fills `timestamp` when the `time` feature
+    // is on; without it the update is needless but must stay (same as
+    // in store.rs).
+    #[allow(clippy::needless_update)]
     let meta = Metadata {
         causation_id: Some("cmd-42".into()),
         correlation_id: Some("corr-7".into()),

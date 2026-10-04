@@ -61,14 +61,16 @@ impl PgStoreError {
     /// connection-level failure as [`StoreError::Unavailable`], anything
     /// else as fatal-by-construction.
     pub(crate) fn into_store(error: sqlx::Error) -> StoreError {
-        // The function raises a version conflict as `USING HINT =
-        // <current-version>`; read the hint, not the message text.
         let conflict_current = error
             .as_database_error()
             .and_then(|db| db.try_downcast_ref::<PgDatabaseError>())
-            .filter(|pg| pg.code() == RAISE_EXCEPTION)
-            .and_then(|pg| pg.hint())
-            .and_then(|hint| hint.trim().parse().ok());
+            .and_then(|pg| parse_conflict_hint(pg.code(), pg.hint()));
+        Self::classify(conflict_current, error)
+    }
+
+    /// The classification itself, split from the sqlx plumbing so the
+    /// branches are unit-testable without a database.
+    fn classify(conflict_current: Option<u64>, error: sqlx::Error) -> StoreError {
         match conflict_current {
             Some(current) => StoreError::Conflict {
                 current: eventyr_core::vocabulary::Version::new(current),
@@ -83,8 +85,75 @@ impl PgStoreError {
     }
 }
 
+/// The function raises a version conflict as `RAISE EXCEPTION ... USING
+/// HINT = <current-version>`; read the hint, not the message text. Any
+/// other SQLSTATE — or a hint that is not a version — is not a conflict.
+fn parse_conflict_hint(code: &str, hint: Option<&str>) -> Option<u64> {
+    if code != RAISE_EXCEPTION {
+        return None;
+    }
+    hint?.trim().parse().ok()
+}
+
 impl From<PgStoreError> for StoreError {
     fn from(error: PgStoreError) -> Self {
         Self::Other(Arc::new(error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conflict_hint_only_for_raised_exception_with_numeric_hint() {
+        assert_eq!(parse_conflict_hint(RAISE_EXCEPTION, Some("1")), Some(1));
+        assert_eq!(parse_conflict_hint(RAISE_EXCEPTION, Some(" 42 ")), Some(42));
+        // The same hint on any other SQLSTATE is not a conflict.
+        assert_eq!(parse_conflict_hint("23505", Some("1")), None);
+        // A raised exception without a numeric hint carries no version.
+        assert_eq!(parse_conflict_hint(RAISE_EXCEPTION, None), None);
+        assert_eq!(parse_conflict_hint(RAISE_EXCEPTION, Some("oops")), None);
+    }
+
+    #[test]
+    fn classify_conflict_reads_the_hint_version() {
+        let before = sqlx::Error::RowNotFound;
+        match PgStoreError::classify(Some(7), before) {
+            StoreError::Conflict { current } => {
+                assert_eq!(current, eventyr_core::vocabulary::Version::new(7));
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_connection_failures_as_unavailable() {
+        let io: std::io::Error = std::io::ErrorKind::ConnectionReset.into();
+        assert!(matches!(
+            PgStoreError::classify(None, sqlx::Error::Io(io)),
+            StoreError::Unavailable
+        ));
+        assert!(matches!(
+            PgStoreError::classify(None, sqlx::Error::PoolTimedOut),
+            StoreError::Unavailable
+        ));
+        assert!(matches!(
+            PgStoreError::classify(None, sqlx::Error::PoolClosed),
+            StoreError::Unavailable
+        ));
+    }
+
+    #[test]
+    fn classify_anything_else_as_other() {
+        match PgStoreError::classify(None, sqlx::Error::RowNotFound) {
+            StoreError::Other(error) => {
+                let pg = error
+                    .downcast_ref::<PgStoreError>()
+                    .expect("Other wraps a PgStoreError");
+                assert!(matches!(pg, PgStoreError::Db(sqlx::Error::RowNotFound)));
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
     }
 }

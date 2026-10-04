@@ -54,7 +54,7 @@ impl SubscriptionSource for ScriptedSource {
 fn parse_amount_chain() -> UpcasterChain<u64> {
     UpcasterChain::new().with(
         "AmountV1",
-        SequenceUpcaster::new(|raw: RawEvent| {
+        ClosureUpcaster::new(|raw: RawEvent| {
             std::str::from_utf8(&raw.payload)
                 .ok()
                 .and_then(|text| text.parse::<u64>().ok())

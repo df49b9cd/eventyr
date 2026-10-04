@@ -349,7 +349,6 @@ dependencies = [
  "eventyr-core",
  "eventyr-store",
  "futures",
- "proptest",
  "tokio",
 ]
 
