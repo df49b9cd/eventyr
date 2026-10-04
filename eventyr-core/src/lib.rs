@@ -124,6 +124,7 @@ pub mod aggregate;
 pub mod envelope;
 pub mod error;
 pub mod event_name;
+pub mod subscription;
 pub mod testing;
 pub mod upcast;
 pub mod vocabulary;
@@ -136,6 +137,10 @@ pub mod prelude {
     pub use crate::envelope::{EventEnvelope, Metadata, NewEvent};
     pub use crate::error::{ProtocolError, StoreError, UpcastError};
     pub use crate::event_name::EventName;
+    pub use crate::subscription::{
+        Batch, Checkpoint, SubscriptionAction, SubscriptionInput, SubscriptionMachine,
+        SubscriptionOutcome, SubscriptionPolicy,
+    };
     pub use crate::upcast::{RawEvent, Upcaster};
     pub use crate::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
     pub use crate::write::{RetryPolicy, WriteAction, WriteInput, WriteMachine, WriteOutcome};

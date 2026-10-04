@@ -10,5 +10,18 @@ keywords = ["event-sourcing", "subscription", "event-bus"]
 [lints]
 workspace = true
 
+[features]
+default = []
+# The §6 Subscription / §2 EventBus seam: ship as transport adapters land (0.3).
+bus = []
+
 [dependencies]
+eventyr-core = { workspace = true, features = ["std"] }
+eventyr-store = { workspace = true }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+proptest = "1"
 eventyr-core = { workspace = true }
+eventyr-store = { workspace = true }

@@ -6,6 +6,7 @@
 use alloc::vec::Vec;
 
 use crate::aggregate::Aggregate;
+use crate::subscription::{SubscriptionAction, SubscriptionInput, SubscriptionMachine};
 use crate::write::{WriteAction, WriteInput, WriteMachine};
 
 /// Drives `machine` through `start()` and every input in `script`,
@@ -18,6 +19,25 @@ pub fn drive_scripted<A: Aggregate>(
     machine: &mut WriteMachine<A>,
     script: impl IntoIterator<Item = WriteInput<A::Event>>,
 ) -> Vec<WriteAction<A::Event, A::Error>> {
+    let mut actions = Vec::new();
+    actions.push(machine.start());
+    for input in script {
+        actions.push(machine.handle(input));
+    }
+    actions
+}
+
+/// The [`SubscriptionMachine`] sibling of [`drive_scripted`]: feeds
+/// `script` verbatim, recording every action in order.
+///
+/// [`Slept`](SubscriptionInput::Slept) is fed instantly — the machine
+/// decides durations as data, so the scripted driver needs no clock,
+/// and a perennial machine stops only at a scripted `Done`-reaching
+/// input (`Failed`, `Shutdown`, or a catch-up policy).
+pub fn projector_scripted<E: Clone>(
+    machine: &mut SubscriptionMachine<E>,
+    script: impl IntoIterator<Item = SubscriptionInput<E>>,
+) -> Vec<SubscriptionAction<E>> {
     let mut actions = Vec::new();
     actions.push(machine.start());
     for input in script {

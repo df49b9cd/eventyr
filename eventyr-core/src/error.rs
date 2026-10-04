@@ -53,6 +53,41 @@ impl core::error::Error for StoreError {
     }
 }
 
+impl From<ProtocolError> for StoreError {
+    fn from(error: ProtocolError) -> Self {
+        Self::Other(Arc::new(error))
+    }
+}
+
+impl From<String> for StoreError {
+    fn from(message: String) -> Self {
+        struct StringError(String);
+
+        impl fmt::Display for StringError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl fmt::Debug for StringError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl core::error::Error for StringError {}
+
+        Self::Other(Arc::new(StringError(message)))
+    }
+}
+
+impl StoreError {
+    /// Wrap a message as [`Other`](StoreError::Other).
+    pub fn other(message: impl Into<String>) -> Self {
+        Self::from(message.into())
+    }
+}
+
 /// A driver violated the machine protocol: fed an input the current phase
 /// does not accept, or drove a finished machine.
 ///

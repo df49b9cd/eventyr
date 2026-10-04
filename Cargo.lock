@@ -280,6 +280,7 @@ version = "0.1.0"
 dependencies = [
  "eventyr-core",
  "eventyr-store",
+ "eventyr-subscription",
 ]
 
 [[package]]
@@ -342,6 +343,10 @@ name = "eventyr-subscription"
 version = "0.1.0"
 dependencies = [
  "eventyr-core",
+ "eventyr-store",
+ "futures",
+ "proptest",
+ "tokio",
 ]
 
 [[package]]

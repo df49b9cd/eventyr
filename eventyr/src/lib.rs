@@ -11,9 +11,9 @@
 //! [`InMemoryStore`](store::prelude::InMemoryStore), the
 //! [`drive_write`](store::prelude::drive_write) driver, and the
 //! [`AggregateRepository`](store::prelude::AggregateRepository). The
-//! remaining store-side crates — the Postgres store, projections,
-//! subscriptions — arrive with 0.2; see the design document for the
-//! roadmap.
+//! `subscription` feature re-exports the catch-up subscription side as
+//! [`subscription`]; the Postgres store and projection helpers arrive
+//! with 0.2 — see the design document for the roadmap.
 //!
 //! ```
 //! use eventyr::prelude::*;
@@ -29,3 +29,9 @@ pub use eventyr_core::*;
 /// `store` feature.
 #[cfg(feature = "store")]
 pub use eventyr_store as store;
+
+/// The subscription side: the projector runner, the checkpoint store,
+/// and the store-source adapter — re-exported from
+/// `eventyr-subscription` behind the `subscription` feature.
+#[cfg(feature = "subscription")]
+pub use eventyr_subscription as subscription;

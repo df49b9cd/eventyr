@@ -22,6 +22,10 @@ macros = ["dep:eventyr-macros"]
 # Derives Serialize/Deserialize on the value types (the vocabulary, the
 # envelopes, the metadata) — the serde glue a store needs. Off by default.
 serde = ["dep:serde", "time?/serde"]
+# Opts in to `String`-formatting sugar on the error types. Off here
+# (no_std + alloc by default), on via store-side crates that can use the
+# convenience.
+std = []
 
 [dependencies]
 eventyr-macros = { workspace = true, optional = true }
