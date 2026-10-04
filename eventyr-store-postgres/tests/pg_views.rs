@@ -33,10 +33,12 @@ async fn view_save_load_and_newest_wins() {
     let view_name = fresh_name();
 
     // Unknown row: None, not an error.
-    assert!(ViewStore::load(&store, &view_name, "account-1")
-        .await
-        .expect("load")
-        .is_none());
+    assert!(
+        ViewStore::load(&store, &view_name, "account-1")
+            .await
+            .expect("load")
+            .is_none()
+    );
 
     // Save and read back.
     let row = ViewRow {

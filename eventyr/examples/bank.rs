@@ -23,10 +23,9 @@ use eventyr::prelude::*;
 use eventyr::projection::prelude::{ClosureUpcaster, UpcasterChain};
 use eventyr::store::prelude::*;
 use eventyr::subscription::prelude::{
-    drive_projector_with_metrics, InMemoryCheckpointStore, Projection, StoreSubscription,
-    SubscriptionOutcome,
+    InMemoryCheckpointStore, Projection, StoreSubscription, SubscriptionOutcome,
+    drive_projector_with_metrics,
 };
-
 
 // -- the domain -----------------------------------------------------
 
@@ -109,10 +108,12 @@ fn decide(
 ) -> Result<Vec<AccountEvent>, AccountError> {
     match command {
         AccountCommand::Open { .. } if state.open => Err(AccountError::AlreadyOpen),
-        AccountCommand::Open { owner } => Ok(vec![Opened {
-            owner: owner.clone(),
-        }
-        .into()]),
+        AccountCommand::Open { owner } => Ok(vec![
+            Opened {
+                owner: owner.clone(),
+            }
+            .into(),
+        ]),
         AccountCommand::Deposit { .. } | AccountCommand::Withdraw { .. } if !state.open => {
             Err(AccountError::NotOpen)
         }
@@ -211,10 +212,7 @@ struct Ledger {
 impl Projection for Ledger {
     type Event = AccountEvent;
     type Error = std::convert::Infallible;
-    async fn apply(
-        &mut self,
-        envelope: &EventEnvelope<AccountEvent>,
-    ) -> Result<(), Self::Error> {
+    async fn apply(&mut self, envelope: &EventEnvelope<AccountEvent>) -> Result<(), Self::Error> {
         let id: u64 = envelope
             .stream_id
             .as_str()
@@ -226,10 +224,20 @@ impl Projection for Ledger {
                 self.balances.lock().expect("the lock").insert(id, 0);
             }
             AccountEvent::Deposited(Deposited { amount }) => {
-                *self.balances.lock().expect("the lock").entry(id).or_default() += amount;
+                *self
+                    .balances
+                    .lock()
+                    .expect("the lock")
+                    .entry(id)
+                    .or_default() += amount;
             }
             AccountEvent::Withdrawn(Withdrawn { amount }) => {
-                *self.balances.lock().expect("the lock").entry(id).or_default() -= amount;
+                *self
+                    .balances
+                    .lock()
+                    .expect("the lock")
+                    .entry(id)
+                    .or_default() -= amount;
             }
         }
         Ok(())
@@ -344,8 +352,8 @@ async fn run() {
         .with(
             "AmountV1",
             ClosureUpcaster::new(|raw: RawEvent| {
-                let amount: u64 = serde_json::from_slice(&raw.payload)
-                    .map_err(|_| UpcastError {
+                let amount: u64 =
+                    serde_json::from_slice(&raw.payload).map_err(|_| UpcastError {
                         event_type: raw.event_type.clone(),
                         message: "payload is not a number".into(),
                     })?;
@@ -383,4 +391,3 @@ async fn run() {
 
     println!("ledger: alice=70 bob=30; upcast AmountV1=42");
 }
-

@@ -11,7 +11,6 @@ use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
 use eventyr_core::snapshot::{HasSnapshotState, OfferSnapshot, WritePolicy};
 use eventyr_core::write::{RetryPolicy, WriteMachine, WriteOutcome};
-use futures::TryStreamExt;
 
 use crate::driver::{drive_write, drive_write_with_snapshots};
 use crate::snapshot_store::SnapshotStore;
@@ -112,7 +111,7 @@ where
     /// A repository over `store` whose whole write path — retry budget
     /// and (like [`new`](AggregateRepository::new), absent) snapshot
     /// cadence — comes from the combined
-    /// [`WritePolicy`](eventyr_core::snapshot::WritePolicy).
+    /// [`WritePolicy`].
     ///
     /// Snapshot cadence on a snapshots-off repository is a no-op (`with_snapshots`
     /// reads the same field); build from a policy already carrying one
@@ -187,8 +186,8 @@ where
         command: A::Command,
         metadata: eventyr_core::envelope::Metadata,
     ) -> Result<ExecutionOutcome<A::Event>, ExecutionError<A>> {
-        let mut machine = WriteMachine::<A>::new(id, command, self.policy.retry)
-            .with_metadata(metadata);
+        let mut machine =
+            WriteMachine::<A>::new(id, command, self.policy.retry).with_metadata(metadata);
         match drive_write(&mut machine, &self.store).await {
             WriteOutcome::Committed { committed, .. } => Ok(ExecutionOutcome::Committed {
                 committed,
@@ -217,7 +216,7 @@ where
     /// fire-and-forget — a failed save logs nothing and changes
     /// nothing; the next load simply folds a longer delta.
     ///
-    /// Takes a [`SnapshotPolicy`] (not a [`WritePolicy`]) so the
+    /// Takes a [`SnapshotPolicy`](eventyr_core::snapshot::SnapshotPolicy) (not a [`WritePolicy`]) so the
     /// "snapshots on, but no cadence" shape is unrepresentable at the
     /// type level — no `assert!` for what the signature rules out.
     pub fn with_snapshots<SS>(
@@ -284,13 +283,9 @@ where
             .policy
             .snapshot
             .expect("with_snapshots sets the policy before this method is reachable");
-        let mut machine = WriteMachine::<A, A::State>::with_snapshots(
-            id,
-            command,
-            self.policy.retry,
-            policy,
-        )
-        .with_metadata(metadata);
+        let mut machine =
+            WriteMachine::<A, A::State>::with_snapshots(id, command, self.policy.retry, policy)
+                .with_metadata(metadata);
         match drive_write_with_snapshots(&mut machine, &self.store, &self.snapshots).await {
             WriteOutcome::Committed {
                 committed,
@@ -303,220 +298,5 @@ where
             WriteOutcome::Rejected(error) => Err(ExecutionError::Domain(error)),
             WriteOutcome::Failed(error) => Err(ExecutionError::Store(error)),
         }
-    }
-}
-use eventyr_core::snapshot::{Snapshot, SnapshotCache};
-
-/// A repository that holds the last-committed snapshot of each stream
-/// in-process (roadmap 0.6.5): next command starts from the cached
-/// state instead of re-folding the stream.
-///
-/// The cache is a snapshot the repository promotes: a miss runs the
-/// ordinary write protocol; a hit's state seeds the fold, and the
-/// append's optimistic-concurrency expectation still guards the write
-/// — a stale cache lands me as a conflict, never as a corrupt fold.
-/// Every commit's snapshot re-primes the cache, so the next interaction
-/// over this stream starts from it.
-pub struct CachedRepository<A, S, C>
-where
-    A: Aggregate,
-{
-    store: S,
-    cache: C,
-    retry_policy: RetryPolicy,
-    _aggregate: core::marker::PhantomData<fn(A)>,
-}
-
-impl<A, S, C> CachedRepository<A, S, C>
-where
-    A: HasSnapshotState,
-    A::State: Clone + Send,
-    S: EventStore<Event = A::Event>,
-    C: SnapshotCache<A::State>,
-{
-    /// A cached repository over `store`, sharing `cache` across
-    /// interactions.
-    pub fn new(store: S, cache: C, retry_policy: RetryPolicy) -> Self {
-        Self {
-            store,
-            cache,
-            retry_policy,
-            _aggregate: core::marker::PhantomData,
-        }
-    }
-
-    /// Execute `command` against `id`, priming the fold from the cache.
-    pub async fn execute_cached(
-        &mut self,
-        id: A::Id,
-        command: A::Command,
-    ) -> Result<ExecutionOutcome<A::Event, A::State>, ExecutionError<A>> {
-        let mut machine = WriteMachine::<A, A::State>::with_cache(id, command, self.retry_policy);
-        let action = machine.start();
-        let eventyr_core::write::WriteAction::Primed { stream_id } = action else {
-            unreachable!("a cache-primed machine opens on Primed");
-        };
-        let stream_id = stream_id.clone();
-        // Seed: the cache's latest prime, or the state the machine
-        // starts from (a cache miss is a miss, not a guess about `Id`).
-        let seed = self.cache.lookup(&stream_id);
-        let action = machine.handle(eventyr_core::write::WriteInput::Cached { snapshot: seed });
-        let store = &self.store;
-        let cache = &mut self.cache;
-        let outcome = drive_cached(store, action, &mut machine).await;
-        match outcome {
-            WriteOutcome::Committed { committed, snapshot } => {
-                if let Some(offer) = &snapshot {
-                    cache.prime(offer.clone().into_inner());
-                }
-                Ok(ExecutionOutcome::Committed { committed, snapshot })
-            }
-            // A command that decided nothing still moves the cache: the
-            // fold the decision ran against is itself the freshest state.
-            WriteOutcome::Noop => {
-                cache.prime(Snapshot {
-                    stream_id,
-                    version: machine.version(),
-                    state: machine.initial_state().clone(),
-                });
-                Ok(ExecutionOutcome::Noop)
-            }
-            WriteOutcome::Rejected(error) => Err(ExecutionError::Domain(error)),
-            WriteOutcome::Failed(error) => Err(ExecutionError::Store(error)),
-        }
-    }
-}
-
-
-/// The drive half of `execute_cached`: the primed machine's async loop.
-///
-/// Kept a free function so the caller can hold `&mut self.cache` and
-/// `&self.store` apart — the borrow checker needs no story about both
-/// living on one `&mut self`.
-async fn drive_cached<A, S>(
-    store: &S,
-    action: eventyr_core::write::WriteAction<A::Event, A::Error, A::State>,
-    machine: &mut WriteMachine<A, A::State>,
-) -> WriteOutcome<A::Event, A::Error, A::State>
-where
-    A: HasSnapshotState,
-    A::State: Clone + Send,
-    S: EventStore<Event = A::Event>,
-{
-    let mut action = action;
-    loop {
-        use eventyr_core::write::WriteInput;
-        action = match action {
-            eventyr_core::write::WriteAction::LoadStream { stream_id, from } => {
-                let loaded: Result<Vec<EventEnvelope<A::Event>>, _> =
-                    store.stream(&stream_id, from).try_collect().await;
-                machine.handle(match loaded {
-                    Ok(events) => WriteInput::Loaded { events },
-                    Err(error) => WriteInput::Failed(error),
-                })
-            }
-            eventyr_core::write::WriteAction::Append {
-                stream_id,
-                expected,
-                events,
-            } => match store.append(&stream_id, expected, events).await {
-                Ok(committed) => machine.handle(WriteInput::Appended { committed }),
-                Err(error) => machine.handle(error.into()),
-            },
-            eventyr_core::write::WriteAction::LoadSnapshot { .. }
-            | eventyr_core::write::WriteAction::Primed { .. } => machine.handle(
-                WriteInput::Failed(StoreError::other(
-                    "the cached path only loads and appends; it never re-reads a snapshot",
-                )),
-            ),
-            eventyr_core::write::WriteAction::Done(outcome) => return outcome,
-        };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use eventyr_core::testing::account::{Account, AccountCommand, AccountEvent, AccountId};
-
-    /// An in-memory store that counts its `stream` reads: the proof the
-    /// cache actually skips them.
-    struct CountingStore {
-        inner: crate::memory::InMemoryStore<AccountEvent>,
-        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl CountingStore {
-        fn new() -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-            let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            (
-                Self {
-                    inner: crate::memory::InMemoryStore::new(),
-                    reads: std::sync::Arc::clone(&reads),
-                },
-                reads,
-            )
-        }
-    }
-
-    impl EventStore for CountingStore {
-        type Event = AccountEvent;
-
-        async fn append(
-            &self,
-            stream_id: &eventyr_core::vocabulary::StreamId,
-            expected: eventyr_core::vocabulary::ExpectedVersion,
-            events: Vec<eventyr_core::envelope::NewEvent<AccountEvent>>,
-        ) -> Result<Vec<eventyr_core::envelope::EventEnvelope<AccountEvent>>, StoreError> {
-            self.inner.append(stream_id, expected, events).await
-        }
-
-        async fn append_batch(
-            &self,
-            appends: Vec<eventyr_core::batch::StreamAppend<AccountEvent>>,
-        ) -> Result<Vec<eventyr_core::batch::CommittedStream<AccountEvent>>, StoreError> {
-            self.inner.append_batch(appends).await
-        }
-
-        fn stream(
-            &self,
-            stream_id: &eventyr_core::vocabulary::StreamId,
-            from: eventyr_core::vocabulary::Version,
-        ) -> impl futures::Stream<Item = Result<eventyr_core::envelope::EventEnvelope<AccountEvent>, StoreError>> + Send {
-            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner.stream(stream_id, from)
-        }
-    }
-
-    #[tokio::test]
-    async fn the_second_command_reads_from_the_cache_not_the_store() {
-        let (store, reads) = CountingStore::new();
-        let mut repo: CachedRepository<Account, _, eventyr_core::snapshot::InMemorySnapshotCache<eventyr_core::testing::account::AccountState>> =
-            CachedRepository::new(store, Default::default(), RetryPolicy::default());
-        let id = AccountId(1);
-
-        // First command: cache miss — one stream read.
-        repo.execute_cached(id.clone(), AccountCommand::Open { owner: "me".into() })
-            .await
-            .expect("first opens");
-        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1, "the first read is real");
-
-        // Second command: the cache has the post-open state. No read.
-        let outcome = repo
-            .execute_cached(id.clone(), AccountCommand::Deposit { amount: 10 })
-            .await
-            .expect("second commits");
-        let ExecutionOutcome::Committed { committed, snapshot } = outcome else {
-            panic!("expected a committed outcome");
-        };
-        assert_eq!(committed.len(), 1);
-        assert_eq!(snapshot.expect("re-primed offer").into_inner().state.balance, 10);
-        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1, "no reload across the cache");
-
-        // Third, still no read.
-        repo.execute_cached(id, AccountCommand::Deposit { amount: 5 })
-            .await
-            .expect("third commits");
-        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

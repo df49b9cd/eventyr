@@ -12,7 +12,7 @@
 //! follow-on run or is done.
 //!
 //! Name rotation instead of a `delete` op on
-//! [`CheckpointStore`](eventyr_subscription::checkpoint::CheckpointStore):
+//! [`CheckpointStore`]:
 //! the port stays exactly as shipped (DESIGN.md §3's placement rule
 //! leaves its surface unchanged), and the old version's checkpoint
 //! remains for a rollback. The cost is stale checkpoints accumulating;

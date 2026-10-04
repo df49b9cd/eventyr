@@ -194,7 +194,8 @@ async fn conflict_retry_commits_against_fresh_state() {
 
     // A's append now conflicts; the machine must reload the delta and
     // re-decide against the fresh balance.
-    let Err(StoreError::Conflict { current, .. }) = store.append(&stream_id, expected, events).await
+    let Err(StoreError::Conflict { current, .. }) =
+        store.append(&stream_id, expected, events).await
     else {
         unreachable!("the expectation no longer matches")
     };
@@ -260,7 +261,8 @@ async fn conflict_beyond_the_retry_budget_fails() {
         .expect("competing append wins the race");
 
     // ...and A's conflict is terminal: NEVER means no reload.
-    let Err(StoreError::Conflict { current, .. }) = store.append(&stream_id, expected, events).await
+    let Err(StoreError::Conflict { current, .. }) =
+        store.append(&stream_id, expected, events).await
     else {
         unreachable!("the expectation no longer matches")
     };
@@ -361,9 +363,13 @@ async fn execute_with_metadata_stamps_every_committed_event() {
         correlation_id: Some("request-7".into()),
         ..Default::default()
     };
-    repo.execute_with_metadata(AccountId(9), AccountCommand::Deposit { amount: 5 }, metadata.clone())
-        .await
-        .expect("deposit");
+    repo.execute_with_metadata(
+        AccountId(9),
+        AccountCommand::Deposit { amount: 5 },
+        metadata.clone(),
+    )
+    .await
+    .expect("deposit");
 
     let events: Vec<_> = store
         .stream(
@@ -377,7 +383,10 @@ async fn execute_with_metadata_stamps_every_committed_event() {
     // carried none.
     assert!(events[0].metadata.causation_id.is_none());
     assert_eq!(events[1].metadata.causation_id.as_deref(), Some("cmd-42"));
-    assert_eq!(events[1].metadata.correlation_id.as_deref(), Some("request-7"));
+    assert_eq!(
+        events[1].metadata.correlation_id.as_deref(),
+        Some("request-7")
+    );
 }
 
 #[tokio::test]

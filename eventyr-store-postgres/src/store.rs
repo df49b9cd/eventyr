@@ -120,7 +120,6 @@ async fn append_events_tx(
         .await
 }
 
-
 /// One row of the events table, as read back. The `payload` column holds
 /// `{variant, args}` (externally-tagged serde) (the stored event); `metadata` is the JSONB
 /// envelope with the two ids.
@@ -218,10 +217,13 @@ where
                 return Ok(Vec::new());
             }
             let args = append_args(expected, events).map_err(StoreError::from)?;
-            let rows = append_events_tx(&mut *pool.acquire().await.map_err(PgStoreError::into_store)?,
-                stream_id.as_str(), args)
-                .await
-                .map_err(PgStoreError::into_store)?;
+            let rows = append_events_tx(
+                &mut *pool.acquire().await.map_err(PgStoreError::into_store)?,
+                stream_id.as_str(),
+                args,
+            )
+            .await
+            .map_err(PgStoreError::into_store)?;
 
             rows.into_iter()
                 .map(EventEnvelope::try_from)

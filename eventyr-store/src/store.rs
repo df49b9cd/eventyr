@@ -5,8 +5,8 @@
 //! subscriptions require. A store that cannot provide a global stream can
 //! still implement `EventStore` — the split keeps honesty.
 
-use std::vec::Vec;
 use core::future::Future;
+use std::vec::Vec;
 
 use futures::Stream;
 
@@ -40,7 +40,7 @@ pub trait EventStore {
 
     /// Append a multi-stream batch atomically: every append or none,
     /// each guarded by its own
-    /// [`ExpectedVersion`](eventyr_core::vocabulary::ExpectedVersion)
+    /// [`ExpectedVersion`]
     /// expectation (a violation on any stream is reported as
     /// [`StoreError::Conflict`] carrying that stream's id and version).
     ///

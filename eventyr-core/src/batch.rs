@@ -33,9 +33,9 @@
 //! machine takes a fixed set, which keeps the protocol (and its scripted
 //! tests) the small thing here.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::collections::btree_map::Entry;
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -152,16 +152,12 @@ impl<E, Err> BatchDecision<E, Err> {
             "every event needs a target stream",
         );
         Self {
-            outcome: Ok(events
-                .into_iter()
-                .map(NewEvent::new)
-                .zip(targets)
-                .collect()),
+            outcome: Ok(events.into_iter().map(NewEvent::new).zip(targets).collect()),
         }
     }
 
     /// Like [`of`](BatchDecision::of), but each event keeps the
-    /// [`Metadata`] the caller set on it.
+    /// [`Metadata`](crate::envelope::Metadata) the caller set on it.
     pub fn of_new_events(events: Vec<NewEvent<E>>, targets: Vec<StreamId>) -> Self {
         assert_eq!(
             events.len(),
@@ -542,9 +538,7 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
                 let mut by_stream: BTreeMap<StreamId, Vec<NewEvent<E>>> = BTreeMap::new();
                 for (event, stream) in routed {
                     if !self.streams.contains(&stream) {
-                        return self.violation(
-                            "the decision routed an event outside the boundary",
-                        );
+                        return self.violation("the decision routed an event outside the boundary");
                     }
                     match by_stream.entry(stream) {
                         Entry::Occupied(mut entry) => entry.get_mut().push(event),
@@ -1175,10 +1169,7 @@ mod tests {
                     .map(|i| env(&stream_id, 1 + i, AccountEvent::Deposited { amount: 1 }))
                     .collect();
                 BatchInput::Appended {
-                    committed: vec![CommittedStream {
-                        stream_id,
-                        events,
-                    }],
+                    committed: vec![CommittedStream { stream_id, events }],
                 }
             }),
             (1u64..3, 0u64..10).prop_map(|(stream, current)| BatchInput::Conflict {

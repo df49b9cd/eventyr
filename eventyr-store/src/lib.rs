@@ -107,7 +107,6 @@ pub mod driver;
 pub mod memory;
 pub mod metrics;
 pub mod repository;
-pub mod schema;
 pub mod snapshot_store;
 pub mod store;
 
@@ -119,10 +118,12 @@ pub mod prelude {
         drive_write_with_snapshots, drive_write_with_snapshots_blocking,
     };
     pub use crate::memory::InMemoryStore;
-    pub use crate::metrics::{Metrics, NoopMetrics};
-    pub use crate::repository::{AggregateRepository, CachedRepository, ExecutionError, ExecutionOutcome};
-    pub use crate::snapshot_store::{InMemorySnapshotStore, SnapshotStore};
-    pub use crate::store::{EventStore, StreamsAll, append_batch_fallback, expected_version_matches};
     #[cfg(feature = "tracing")]
     pub use crate::metrics::TracingMetrics;
+    pub use crate::metrics::{Metrics, NoopMetrics};
+    pub use crate::repository::{AggregateRepository, ExecutionError, ExecutionOutcome};
+    pub use crate::snapshot_store::{InMemorySnapshotStore, SnapshotStore};
+    pub use crate::store::{
+        EventStore, StreamsAll, append_batch_fallback, expected_version_matches,
+    };
 }

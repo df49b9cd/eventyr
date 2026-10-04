@@ -16,7 +16,7 @@
 //!   terms. The delta between the table and the implemented protocol is
 //!   this one implicit step, made explicit so it stays testable.
 //! - **`Slept`**: the machine has no clock, so [`Sleep`](SubscriptionAction::Sleep)
-//!   carries a machine-computed [`Duration`](core::time::Duration) as
+//!   carries a machine-computed [`Duration`] as
 //!   data and the driver reports [`Slept`](SubscriptionInput::Slept) after
 //!   it elapses.
 //! - **`Shutdown`**: graceful stop — drains the in-flight batch, acks,
@@ -45,7 +45,7 @@ use crate::vocabulary::Sequence;
 
 /// A subscription's resume position: the last globally-acked sequence.
 ///
-/// The newtype twin of [`Version::EMPTY`]: as an exclusive lower bound,
+/// The newtype twin of [`Version::EMPTY`](crate::vocabulary::Version::EMPTY): as an exclusive lower bound,
 /// [`ORIGIN`](Checkpoint::ORIGIN) means "from the very first event".
 /// New — not an alias for [`Sequence`] — so a checkpoint is never
 /// confused with raw envelopes' sequences at call sites.

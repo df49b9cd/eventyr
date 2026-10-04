@@ -59,9 +59,11 @@ pub mod names {
     pub const SNAPSHOTS: &str = "eventyr_snapshots_total";
     /// Events the projector applied (the read path's forward progress).
     pub const PROJECTED_EVENTS: &str = "eventyr_projected_events_total";
-    /// The lag at the last ack: the distance from the stored tip to the
-    /// acked checkpoint, as known to that interaction (gauge).
-    pub const PROJECTION_LAG: &str = "eventyr_projection_lag";
+    /// The global-sequence span one projector fetch covered: last
+    /// fetched sequence minus the fetch's checkpoint, zero on an empty
+    /// (caught-up) poll (gauge). Not lag behind the store's head — the
+    /// driver never reads the head.
+    pub const PROJECTION_FETCH_SPAN: &str = "eventyr_projection_fetch_span";
     /// One append's latency (histogram).
     pub const APPEND_LATENCY: &str = "eventyr_append_seconds";
     /// One projector batch's latency (histogram).

@@ -89,9 +89,11 @@ pub mod prelude {
     pub use crate::bus::{EventBus, Subscription};
     pub use crate::checkpoint::{CheckpointStore, InMemoryCheckpointStore};
     pub use crate::runner::{Projection, Projector, drive_projector, drive_projector_with_metrics};
-    pub use crate::saga::{SagaDispatch, SagaProjection, drive_saga};
+    pub use crate::saga::{SagaProjection, drive_saga};
     pub use crate::source::{StoreSubscription, SubscriptionSource};
-    pub use eventyr_core::saga::{Saga, SagaAction, SagaCommand, SagaInput, SagaMachine, SagaOutcome};
+    pub use eventyr_core::saga::{
+        Saga, SagaAction, SagaCommand, SagaInput, SagaMachine, SagaOutcome,
+    };
     pub use eventyr_core::subscription::{
         Batch, Checkpoint, SubscriptionAction, SubscriptionInput, SubscriptionMachine,
         SubscriptionOutcome, SubscriptionPolicy,

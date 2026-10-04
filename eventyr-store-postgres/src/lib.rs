@@ -23,7 +23,6 @@
 
 #[cfg(feature = "snapshots")]
 pub mod snapshots;
-pub mod codec;
 pub mod store;
 pub mod views;
 
@@ -105,10 +104,9 @@ fn parse_conflict_hint(code: &str, hint: Option<&str>) -> Option<(Option<String>
     // `"{stream_id}:{version}"` splits on the last colon; a bare
     // `"{version}"` has none.
     match hint.rsplit_once(':') {
-        Some((stream_id, version)) => Some((
-            Some(stream_id.to_string()),
-            version.trim().parse().ok()?,
-        )),
+        Some((stream_id, version)) => {
+            Some((Some(stream_id.to_string()), version.trim().parse().ok()?))
+        }
         None => Some((None, hint.parse().ok()?)),
     }
 }
