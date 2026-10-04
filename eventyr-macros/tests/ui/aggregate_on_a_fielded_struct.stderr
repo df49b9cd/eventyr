@@ -1,0 +1,5 @@
+error: Aggregate must be derived on a unit struct — the aggregate type is a namespace, not a state holder; put the fields on the state type
+ --> tests/ui/aggregate_on_a_fielded_struct.rs:7:8
+  |
+7 | struct WithFields {
+  |        ^^^^^^^^^^

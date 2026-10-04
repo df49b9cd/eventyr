@@ -11,9 +11,14 @@ keywords = ["event-sourcing", "cqrs", "event-store", "sans-io", "ddd"]
 workspace = true
 
 [features]
-default = ["time"]
+default = ["time", "macros", "store"]
 # Carries `Metadata::timestamp` through the re-exported core.
 time = ["eventyr-core/time"]
+# Re-exports the derive macros through the re-exported core.
+macros = ["eventyr-core/macros"]
+# Re-exports the store side: ports, in-memory store, driver, repository.
+store = ["dep:eventyr-store"]
 
 [dependencies]
 eventyr-core = { workspace = true }
+eventyr-store = { workspace = true, optional = true }

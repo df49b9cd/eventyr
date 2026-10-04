@@ -7,7 +7,7 @@ use eventyr_core::testing::account::{
     Account, AccountCommand, AccountError, AccountEvent, AccountId,
 };
 use eventyr_store::prelude::*;
-use futures::TryStreamExt;
+use futures::{Stream, TryStreamExt};
 
 // -- helpers -------------------------------------------------------------
 
@@ -91,7 +91,7 @@ async fn domain_rejection_leaves_the_stream_untouched() {
 }
 
 #[tokio::test]
-async fn concurrent_executions_all_land_contiguously() {
+async fn interleaved_executions_all_land_contiguously() {
     let repo = repository();
     let id = AccountId(3);
 
@@ -99,7 +99,7 @@ async fn concurrent_executions_all_land_contiguously() {
         .await
         .expect("open");
 
-    // Three concurrent deposits on one task: the in-memory store never
+    // Three deposits racing on one task: the in-memory store never
     // yields, so these interleave at await points only — but whatever
     // the interleaving, all three must land with contiguous versions
     // and no lost updates.
@@ -281,4 +281,57 @@ async fn repository_exposes_the_store_for_reads() {
     let events = stream_of(repo.store(), 5).await;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event, AccountEvent::Opened { owner: "me".into() });
+}
+
+// -- failure routing -------------------------------------------------------
+
+/// A store whose reads fail: proves load errors travel through the
+/// machine as `Failed` — the same shape as append errors — instead of
+/// bypassing the protocol.
+struct LoadFails;
+
+impl EventStore for LoadFails {
+    type Event = AccountEvent;
+
+    async fn append(
+        &self,
+        _stream_id: &StreamId,
+        _expected: ExpectedVersion,
+        events: Vec<NewEvent<AccountEvent>>,
+    ) -> Result<Vec<EventEnvelope<AccountEvent>>, StoreError> {
+        Ok(events
+            .into_iter()
+            .map(|_| EventEnvelope {
+                sequence: Sequence::new(1),
+                stream_id: StreamId::from("account-6"),
+                version: Version::new(1),
+                event: AccountEvent::Deposited { amount: 0 },
+                metadata: Metadata::default(),
+            })
+            .collect())
+    }
+
+    fn stream(
+        &self,
+        _stream_id: &StreamId,
+        _from: Version,
+    ) -> impl Stream<Item = Result<EventEnvelope<AccountEvent>, StoreError>> + Send {
+        futures::stream::iter(vec![Err(StoreError::Unavailable)])
+    }
+}
+
+#[tokio::test]
+async fn a_load_failure_surfaces_as_the_failed_outcome() {
+    let repo = AggregateRepository::<Account, LoadFails>::new(LoadFails, RetryPolicy::default());
+
+    let error = repo
+        .execute(AccountId(6), AccountCommand::Deposit { amount: 10 })
+        .await
+        .expect_err("the load fails");
+    // The machine saw the failure and ended the interaction itself —
+    // the driver never bypassed the protocol.
+    assert!(matches!(
+        error,
+        ExecutionError::Store(StoreError::Unavailable)
+    ));
 }

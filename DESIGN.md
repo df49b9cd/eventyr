@@ -163,13 +163,13 @@ The write path is *not* a pure function: load → fold → decide → append can
 
 ```rust
 /// What the machine wants the driver to do.
-pub enum WriteAction<E> {
+pub enum WriteAction<E, Err> {
     /// Read the stream (from `from`, exclusive) to rebuild state.
     LoadStream { stream_id: StreamId, from: Version },
     /// Append events, guarded by the expected version.
     Append { stream_id: StreamId, expected: ExpectedVersion, events: Vec<NewEvent<E>> },
-    /// Terminal: the command's outcome.
-    Done(ExecutionOutcome),
+    /// Terminal: the interaction's outcome.
+    Done(WriteOutcome<E, Err>),
 }
 
 /// What the driver reports back to the machine.
@@ -184,9 +184,9 @@ pub struct WriteMachine<A: Aggregate> { /* state: phase, folded state, retries *
 
 impl<A: Aggregate> WriteMachine<A> {
     /// Begin: returns the first action (always `LoadStream`).
-    pub fn start(&mut self) -> WriteAction<A::Event>;
+    pub fn start(&mut self) -> WriteAction<A::Event, A::Error>;
     /// Consume a driver result, transition, and emit the next action.
-    pub fn handle(&mut self, input: WriteInput<A::Event>) -> WriteAction<A::Event>;
+    pub fn handle(&mut self, input: WriteInput<A::Event>) -> WriteAction<A::Event, A::Error>;
 }
 ```
 
@@ -200,18 +200,20 @@ The separation of concerns is the point: **the aggregate decides *what* (domain 
 
 ```rust
 pub trait EventStore {
-    type Event;
+    type Event: Send;
 
     /// Append is transactional: all events or none.
-    async fn append(
+    fn append(
         &self,
         stream_id: &StreamId,
         expected: ExpectedVersion,
         events: Vec<NewEvent<Self::Event>>,
-    ) -> Result<AppendOutcome, StoreError>;
+    ) -> impl Future<Output = Result<Vec<EventEnvelope<Self::Event>>, StoreError>> + Send;
 
     /// Stream events of one aggregate, from `from` (exclusive) onward.
-    async fn stream(
+    /// The method is synchronous (it constructs the stream); the store
+    /// does its I/O as the stream is polled.
+    fn stream(
         &self,
         stream_id: &StreamId,
         from: Version,
@@ -222,7 +224,7 @@ pub trait EventStore {
 /// A store that can't provide it can still implement `EventStore`
 /// (aggregate persistence); subscriptions require `StreamsAll`.
 pub trait StreamsAll: EventStore {
-    async fn stream_all(
+    fn stream_all(
         &self,
         from: Sequence,
     ) -> impl Stream<Item = Result<EventEnvelope<Self::Event>, StoreError>> + Send;
@@ -241,20 +243,24 @@ A driver is a boring loop: perform the action, feed the result back. 0.1 ships t
 
 ```rust
 /// Async driver over any `EventStore` (tokio, smol, anything).
+/// Every store error — load or append — travels through the machine as
+/// `Failed`, so `WriteOutcome::Failed` is the one failure shape callers
+/// see: the machine owns the protocol, not the driver.
 pub async fn drive_write<A, S>(
     machine: &mut WriteMachine<A>,
     store: &S,
-) -> Result<ExecutionOutcome<A::Event>, StoreError>
+) -> WriteOutcome<A::Event, A::Error>
 where
     A: Aggregate,
     S: EventStore<Event = A::Event>;
 
 /// Test driver: scripted inputs, recorded actions — no store at all.
 /// Returns every action the machine emitted, ending with `Done(outcome)`.
-pub fn drive_write_scripted<A>(
+/// Pure, so it lives in `eventyr-core::testing`, not the store crate.
+pub fn drive_scripted<A>(
     machine: &mut WriteMachine<A>,
-    script: &[WriteInput<A::Event>],
-) -> Vec<WriteAction<A::Event>>;
+    script: impl IntoIterator<Item = WriteInput<A::Event>>,
+) -> Vec<WriteAction<A::Event, A::Error>>;
 
 /// Blocking driver for CLI/embedded use — 0.4, with the embedded stores.
 pub fn drive_write_blocking<A, S>(...);
@@ -280,8 +286,8 @@ where
     /// Load → fold → decide → append, with optimistic-concurrency retry.
     pub async fn execute(
         &self,
-        id: &A::Id,
-        command: &A::Command,
+        id: A::Id,
+        command: A::Command,
     ) -> Result<ExecutionOutcome<A::Event>, ExecutionError<A>> {
         let mut machine = WriteMachine::new(id, command, self.retry_policy);
         drive_write(&mut machine, &self.store).await
@@ -340,13 +346,11 @@ Formally, the aggregate is itself a single-step state machine — `apply` *is* i
 
 ## 8. Derive macros (eventyr-macros)
 
-`#[derive(Aggregate)]` on the state struct generates:
+`#[derive(Aggregate)]` sits on the aggregate *marker* struct (a unit struct — the aggregate type is a namespace, not a state holder) and wires the `Aggregate` impl by convention: `NAME` is the snake_cased struct name, `Id`/`Event`/`Command`/`Error` follow the `{Ident}...` position convention, `State` is `Self` (point `state` at a type for the marker-plus-state shape), `initial` is `Default::default()` — or `Self` when a unit struct is its own state — and `apply`/`decide` delegate to same-module free functions. Every convention is overridable with `#[eventyr(...)]` attributes (`name`, `id`, `state`, `event`, `event_enum`, `command`, `error`, `initial`, `apply`, `decide`, `crate`); `crate` retargets the generated code at the umbrella crate (the serde `crate = "..."` pattern), and `initial` sees the id as `id`.
 
-- the `Aggregate` impl (wiring `NAME`, `Id`/`Event`/`Command`/`Error`, and `initial` via `#[eventyr(...)]` attributes),
-- the event enum if requested (`#[eventyr(event = "BankEvent")]`), with serde glue,
-- `From` impls between event-enum variants and payload structs (thalo's `Event` derive).
+`#[eventyr(events(Opened, Deposited))]` generates the event enum from payload structs (the sourcery pattern): one newtype variant per payload, a `From<Payload>` conversion for building events in `decide`, and an `EventName` impl naming each variant after its payload. Name it with `event_enum = BankEvent` (default: `{Ident}Event`); the `Event` type follows the enum. The reverse conversion is a `match` — the point of a concrete enum.
 
-Everything is hand-writable; the macro is sugar. `#[derive(EventName)]` gives stable event type names for storage without reflection.
+Everything is hand-writable; the macro is sugar. `#[derive(EventName)]` gives stable event type names for storage without reflection — pin historical names with `#[eventyr(name = "...")]` on the variant (or on the struct, for the single-payload form). Diagnostics are trybuild-verified: unknown or duplicate attributes, non-unit structs, and non-path `decide` all fail with one clear error, not a wall of follow-ons.
 
 ## 9. Postgres store sketch
 
@@ -370,9 +374,9 @@ The `UNIQUE` constraint's backing index serves the per-stream lookups; no separa
 ## 10. Testing story
 
 - **Pure core = table-driven tests.** `decide`/`apply` test with plain asserts, no mocks, no async, no store. Given/when/then helpers in `eventyr::testing`.
-- **Machines = transition tests.** Each machine gets exhaustive transition tests: a `Vec` of inputs → expected action sequence (what `drive_write_scripted` returns). Conflict-retry, at-least-once redelivery, and checkpoint resume are all tested as pure data — the tests that are hardest to write against a real store become trivial. This is the sans-IO payoff: the concurrency-critical 10% of the library gets the strongest verification, not the weakest.
+- **Machines = transition tests.** Each machine gets exhaustive transition tests: a `Vec` of inputs → expected action sequence (what `drive_scripted` returns). Conflict-retry, at-least-once redelivery, and checkpoint resume are all tested as pure data — the tests that are hardest to write against a real store become trivial. This is the sans-IO payoff: the concurrency-critical 10% of the library gets the strongest verification, not the weakest.
 - **In-memory store** doubles as the acceptance-test store; contract tests (a `StoreContract` test-suite trait, eventcore-testing style) that any third-party store must pass to claim compatibility.
-- **`TestScenario`**: `given(events).when(command).then(events)` — the API that makes the library feel good, borrowed from eventcore's testing crate.
+- **`TestScenario`** (0.2): `given(events).when(command).then(events)` — the API that makes the library feel good, borrowed from eventcore's testing crate.
 - **Verification discipline** (mnesis's bar): proptest for machine invariants (e.g. "a machine that receives `Appended` always emits `Done`", "checkpoint never regresses"), `miri` in CI for the `no_std` core, `trybuild` for macro diagnostics.
 
 ## 11. What we take from each library
@@ -393,8 +397,8 @@ The `UNIQUE` constraint's backing index serves the per-stream lookups; no separa
 
 ## 12. Roadmap
 
-- **0.1** — core traits + protocol vocabulary, `WriteMachine` with transition tests, in-memory store, async + scripted drivers, repository wrapper, `TestScenario`, derive macros.
-- **0.2** — Postgres store + migrations, upcasters, checkpointed subscriptions (`ProjectorMachine`).
+- **0.1** — core traits + protocol vocabulary, `WriteMachine` with transition tests, in-memory store, async + scripted drivers, repository wrapper, derive macros.
+- **0.2** — Postgres store + migrations, upcasters, checkpointed subscriptions (`ProjectorMachine`), `TestScenario` (`given(events).when(command).then(events)`).
 - **0.3** — projection runner, snapshot support (opt-in, `SnapshotMachine`), `EventBus` trait.
 - **0.4+** — multi-stream commands (eventcore-style), embedded stores (fjall/sled) + the blocking driver, contract-test crate.
 

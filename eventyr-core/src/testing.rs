@@ -39,6 +39,7 @@ pub mod account {
     use core::fmt;
 
     use crate::aggregate::Aggregate;
+    use crate::event_name::EventName;
 
     /// The account instance's identifier.
     #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -180,6 +181,16 @@ pub mod account {
                     Ok(vec![AccountEvent::Withdrawn { amount: *amount }])
                 }
                 AccountCommand::CheckBalance => Ok(vec![]),
+            }
+        }
+    }
+
+    impl EventName for AccountEvent {
+        fn event_name(&self) -> &'static str {
+            match self {
+                Self::Opened { .. } => "Opened",
+                Self::Deposited { .. } => "Deposited",
+                Self::Withdrawn { .. } => "Withdrawn",
             }
         }
     }

@@ -21,47 +21,49 @@ use crate::store::EventStore;
 /// The loop performs each action the machine emits:
 ///
 /// - `LoadStream` → read the stream from the requested bound, collect
-///   the envelopes, report [`Loaded`](WriteInput::Loaded);
+///   the envelopes, report [`Loaded`](WriteInput::Loaded) — or
+///   [`Failed`](WriteInput::Failed) when the read errors;
 /// - `Append` → call [`append`](EventStore::append), reporting
-///   [`Appended`](WriteInput::Appended) or mapping a
-///   [`StoreError::Conflict`] to
-///   [`Conflict`](WriteInput::Conflict) and anything else to
-///   [`Failed`](WriteInput::Failed);
+///   [`Appended`](WriteInput::Appended), or mapping a
+///   [`StoreError::Conflict`] to [`Conflict`](WriteInput::Conflict)
+///   and anything else to [`Failed`](WriteInput::Failed);
 /// - `Done` → stop and return the outcome.
 ///
-/// A store error that is neither a conflict nor fatal-by-construction
-/// ends the interaction as [`Failed`](WriteOutcome::Failed) — the
-/// machine decides what is retryable, not the driver.
+/// Every store error — load or append — travels through the machine as
+/// [`Failed`](WriteInput::Failed), so
+/// [`Failed`](WriteOutcome::Failed) is the one failure shape callers
+/// see: the machine owns the protocol, not the driver.
 pub async fn drive_write<A, S>(
     machine: &mut WriteMachine<A>,
     store: &S,
-) -> Result<WriteOutcome<A::Event, A::Error>, StoreError>
+) -> WriteOutcome<A::Event, A::Error>
 where
     A: Aggregate,
     S: EventStore<Event = A::Event>,
 {
     let mut action = machine.start();
     loop {
-        match action {
+        action = match action {
             WriteAction::LoadStream { stream_id, from } => {
-                let events: Vec<EventEnvelope<A::Event>> =
-                    store.stream(&stream_id, from).try_collect().await?;
-                action = machine.handle(WriteInput::Loaded { events });
+                let loaded: Result<Vec<EventEnvelope<A::Event>>, StoreError> =
+                    store.stream(&stream_id, from).try_collect().await;
+                match loaded {
+                    Ok(events) => machine.handle(WriteInput::Loaded { events }),
+                    Err(error) => machine.handle(WriteInput::Failed(error)),
+                }
             }
             WriteAction::Append {
                 stream_id,
                 expected,
                 events,
-            } => {
-                action = match store.append(&stream_id, expected, events).await {
-                    Ok(committed) => machine.handle(WriteInput::Appended { committed }),
-                    Err(StoreError::Conflict { current }) => {
-                        machine.handle(WriteInput::Conflict { current })
-                    }
-                    Err(error) => machine.handle(WriteInput::Failed(error)),
-                };
-            }
-            WriteAction::Done(outcome) => return Ok(outcome),
-        }
+            } => match store.append(&stream_id, expected, events).await {
+                Ok(committed) => machine.handle(WriteInput::Appended { committed }),
+                Err(StoreError::Conflict { current }) => {
+                    machine.handle(WriteInput::Conflict { current })
+                }
+                Err(error) => machine.handle(WriteInput::Failed(error)),
+            },
+            WriteAction::Done(outcome) => return outcome,
+        };
     }
 }

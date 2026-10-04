@@ -10,6 +10,5 @@ keywords = ["event-sourcing", "postgres", "sqlx"]
 [lints]
 workspace = true
 
-[dependencies]
-eventyr-core = { workspace = true }
-eventyr-store = { path = "../eventyr-store", version = "0.1.0" }
+# Dependencies arrive with the crate itself (0.2): eventyr-core for the
+# vocabulary, eventyr-store for the EventStore port, sqlx for Postgres.

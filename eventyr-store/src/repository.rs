@@ -105,7 +105,7 @@ where
     /// Events are appended with empty metadata. Correlation and
     /// causation ids are not yet reachable through this path — a
     /// metadata-aware variant arrives with 0.2; until then, hand-drive
-    /// the [`WriteMachine`](eventyr_core::write::WriteMachine) to
+    /// the [`WriteMachine`] to
     /// enrich events.
     pub async fn execute(
         &self,
@@ -114,10 +114,10 @@ where
     ) -> Result<ExecutionOutcome<A::Event>, ExecutionError<A>> {
         let mut machine = WriteMachine::<A>::new(id, command, self.retry_policy);
         match drive_write(&mut machine, &self.store).await {
-            Ok(WriteOutcome::Committed(events)) => Ok(ExecutionOutcome::Committed(events)),
-            Ok(WriteOutcome::Noop) => Ok(ExecutionOutcome::Noop),
-            Ok(WriteOutcome::Rejected(error)) => Err(ExecutionError::Domain(error)),
-            Ok(WriteOutcome::Failed(error)) | Err(error) => Err(ExecutionError::Store(error)),
+            WriteOutcome::Committed(events) => Ok(ExecutionOutcome::Committed(events)),
+            WriteOutcome::Noop => Ok(ExecutionOutcome::Noop),
+            WriteOutcome::Rejected(error) => Err(ExecutionError::Domain(error)),
+            WriteOutcome::Failed(error) => Err(ExecutionError::Store(error)),
         }
     }
 }

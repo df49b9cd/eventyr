@@ -15,8 +15,13 @@ default = []
 # Carries `Metadata::timestamp` (`Option<OffsetDateTime>`). Off here, on in the
 # umbrella crate — the rest of the core needs no runtime at all.
 time = ["dep:time"]
+# Re-exports the derive macros from `eventyr-macros`, so eventyr-core is the
+# one dependency a derive user needs. Off by default: the core stays
+# dependency-free unless you ask for the sugar.
+macros = ["dep:eventyr-macros"]
 
 [dependencies]
+eventyr-macros = { workspace = true, optional = true }
 time = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]

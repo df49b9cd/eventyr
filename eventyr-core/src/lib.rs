@@ -1,14 +1,23 @@
 //! # eventyr-core
 //!
 //! The pure sans-IO core of event sourcing: the [`Aggregate`] trait, the
-//! protocol vocabulary ([`StreamId`], [`Version`], [`Sequence`],
-//! [`ExpectedVersion`]), and the [`WriteMachine`] — the state machine
-//! that runs the load → fold → decide → append write path.
+//! protocol vocabulary ([`vocabulary::StreamId`], [`vocabulary::Version`],
+//! [`vocabulary::Sequence`], [`vocabulary::ExpectedVersion`]), and the
+//! [`write::WriteMachine`] — the state machine that runs the
+//! load → fold → decide → append write path.
 //!
 //! Nothing here performs I/O, sleeps, or knows what a runtime is: the crate
 //! is `no_std + alloc` with zero required dependencies. Drivers (async,
 //! blocking, or scripted) live in the store-side crates; the scripted one —
 //! being pure — is right here in [`testing`].
+//!
+//! ## Derives
+//!
+//! Behind the `macros` feature (off here, default-on in the umbrella
+//! crate), the [prelude] also carries `#[derive(Aggregate)]` and
+//! `#[derive(EventName)]` from `eventyr-macros` — convention wiring for
+//! the trait above. The feature stays off by default so the core keeps
+//! its zero-dependency build unless you ask for the sugar.
 //!
 //! ## A taste
 //!
@@ -94,9 +103,27 @@
 
 extern crate alloc;
 
+// The derives, re-exported so `eventyr-core` is the one dependency a
+// derive user needs. Generated code targets `::eventyr_core` paths (the
+// serde pattern), so the re-export and the macro crate agree on the name.
+#[cfg(feature = "macros")]
+pub use eventyr_macros::{Aggregate, EventName};
+
+/// Implementation details shared with the derive macros — not public API.
+///
+/// The macros route the types their generated code names through this
+/// module (the serde `__private` pattern), so their output resolves in
+/// any user crate — `std` or `no_std + alloc` — without imports.
+#[doc(hidden)]
+pub mod __private {
+    /// [`Vec`](alloc::vec::Vec), for generated `decide` signatures.
+    pub use alloc::vec::Vec;
+}
+
 pub mod aggregate;
 pub mod envelope;
 pub mod error;
+pub mod event_name;
 pub mod testing;
 pub mod upcast;
 pub mod vocabulary;
@@ -108,7 +135,13 @@ pub mod prelude {
     pub use crate::aggregate::{Aggregate, AggregateId};
     pub use crate::envelope::{EventEnvelope, Metadata, NewEvent};
     pub use crate::error::{ProtocolError, StoreError, UpcastError};
+    pub use crate::event_name::EventName;
     pub use crate::upcast::{RawEvent, Upcaster};
     pub use crate::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
     pub use crate::write::{RetryPolicy, WriteAction, WriteInput, WriteMachine, WriteOutcome};
+
+    // The derives (macro namespace — they coexist with the same-named
+    // traits above, which live in the type namespace).
+    #[cfg(feature = "macros")]
+    pub use crate::{Aggregate, EventName};
 }

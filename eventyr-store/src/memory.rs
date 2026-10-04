@@ -20,7 +20,7 @@ use crate::store::{EventStore, StreamsAll};
 
 struct Inner<E> {
     /// Envelopes per stream, in stream order.
-    streams: HashMap<String, Vec<EventEnvelope<E>>>,
+    streams: HashMap<StreamId, Vec<EventEnvelope<E>>>,
     /// Every envelope, in global (append) order.
     global: Vec<EventEnvelope<E>>,
 }
@@ -89,7 +89,7 @@ where
         let mut inner = self.lock();
         let current = inner
             .streams
-            .get(stream_id.as_str())
+            .get(stream_id)
             .map_or(0, |stream| stream.len() as u64);
 
         let matches = match expected {
@@ -105,6 +105,10 @@ where
 
         let base_sequence = inner.global.len() as u64;
         let mut committed = Vec::with_capacity(events.len());
+        // Split the guard's fields so the stream vec and the global vec
+        // can be written in the same loop.
+        let Inner { streams, global } = &mut *inner;
+        let stream = streams.entry(stream_id.clone()).or_default();
         for (index, new_event) in events.into_iter().enumerate() {
             let envelope = EventEnvelope {
                 sequence: Sequence::new(base_sequence + index as u64 + 1),
@@ -113,12 +117,8 @@ where
                 event: new_event.event,
                 metadata: new_event.metadata,
             };
-            inner
-                .streams
-                .entry(stream_id.as_str().to_string())
-                .or_default()
-                .push(envelope.clone());
-            inner.global.push(envelope.clone());
+            stream.push(envelope.clone());
+            global.push(envelope.clone());
             committed.push(envelope);
         }
         Ok(committed)
@@ -132,7 +132,7 @@ where
         let inner = self.lock();
         let events: Vec<EventEnvelope<E>> = inner
             .streams
-            .get(stream_id.as_str())
+            .get(stream_id)
             .map(|stream| {
                 stream
                     .iter()

@@ -1,0 +1,5 @@
+error: eventyr events(...) lists the payload types: events(Opened, Deposited)
+ --> tests/ui/empty_events.rs:6:11
+  |
+6 | #[eventyr(events())]
+  |           ^^^^^^

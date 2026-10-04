@@ -1,0 +1,5 @@
+error: duplicate eventyr attribute `events`
+ --> tests/ui/duplicate_events.rs:6:27
+  |
+6 | #[eventyr(events(Opened), events(Closed))]
+  |                           ^^^^^^

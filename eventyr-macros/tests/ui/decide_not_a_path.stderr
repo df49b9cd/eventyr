@@ -1,0 +1,5 @@
+error: eventyr decide expects a function path
+ --> tests/ui/decide_not_a_path.rs:6:20
+  |
+6 | #[eventyr(decide = 1 + 1)]
+  |                    ^

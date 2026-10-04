@@ -1,14 +1,15 @@
 //! # eventyr-store
 //!
-//! The store side of event sourcing: the [`EventStore`] and [`StreamsAll`]
-//! ports, an in-memory implementation for tests and examples, the async
-//! [`drive_write`] driver, and the [`AggregateRepository`] — the ergonomic
-//! entry point that hides the machine behind one method.
+//! The store side of event sourcing: the [`store::EventStore`] and
+//! [`store::StreamsAll`] ports, an in-memory implementation for tests
+//! and examples, the async [`driver::drive_write`] driver, and the
+//! [`repository::AggregateRepository`] — the ergonomic entry point
+//! that hides the machine behind one method.
 //!
-//! The traits are runtime-agnostic: `append` returns a [`Future`], the
-//! streams are [`Stream`]s, and nothing here names tokio. The in-memory
-//! store is synchronous under a lock; the Postgres store (0.2) will do its
-//! work in the future and stream.
+//! The traits are runtime-agnostic: `append` returns a future, the
+//! streams are async streams, and nothing here names tokio. The
+//! in-memory store is synchronous under a lock; the Postgres store
+//! (0.2) will do its work in the future and stream.
 //!
 //! ## A taste
 //!

@@ -18,6 +18,8 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 eventyr-core = { path = "eventyr-core", version = "0.1.0" }
+eventyr-macros = { path = "eventyr-macros", version = "0.1.0" }
+eventyr-store = { path = "eventyr-store", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -49,7 +49,8 @@ pub struct Version(u64);
 impl Version {
     /// The version of an empty (or absent) stream: before any event.
     ///
-    /// As an exclusive lower bound it means "from the beginning".
+    /// As an exclusive lower bound it means "from the beginning" — the
+    /// stream-side twin of [`Sequence::START`].
     pub const EMPTY: Self = Self(0);
 
     /// Construct a version from its raw position.
@@ -75,7 +76,7 @@ pub struct Sequence(u64);
 
 impl Sequence {
     /// Before the first event; as an exclusive lower bound, "read
-    /// everything".
+    /// everything" — the global-side twin of [`Version::EMPTY`].
     pub const START: Self = Self(0);
 
     /// Construct a sequence from its raw position.
