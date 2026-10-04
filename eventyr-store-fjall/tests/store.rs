@@ -163,3 +163,13 @@ fn blocking_driver_commits_through_the_embedded_store() {
 
     let _ = dir;
 }
+
+#[test]
+fn fjall_store_passes_the_query_append_contract() {
+    eventyr_store_testing::query_append_contract(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        std::mem::forget(dir);
+        store
+    });
+}

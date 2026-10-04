@@ -114,8 +114,9 @@ pub mod prelude {
     //! The store side: ports, in-memory store, driver, repository.
 
     pub use crate::driver::{
-        drive_write, drive_write_batch, drive_write_batch_blocking, drive_write_blocking,
-        drive_write_with_snapshots, drive_write_with_snapshots_blocking,
+        drive_boundary, drive_boundary_blocking, drive_write, drive_write_batch,
+        drive_write_batch_blocking, drive_write_blocking, drive_write_with_snapshots,
+        drive_write_with_snapshots_blocking,
     };
     pub use crate::memory::InMemoryStore;
     #[cfg(feature = "tracing")]
@@ -124,6 +125,6 @@ pub mod prelude {
     pub use crate::repository::{AggregateRepository, ExecutionError, ExecutionOutcome};
     pub use crate::snapshot_store::{InMemorySnapshotStore, SnapshotStore};
     pub use crate::store::{
-        EventStore, StreamsAll, append_batch_fallback, expected_version_matches,
+        EventStore, QueryAppend, StreamsAll, append_batch_fallback, expected_version_matches,
     };
 }

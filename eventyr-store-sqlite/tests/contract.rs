@@ -57,3 +57,8 @@ fn sqlite_store_passes_the_snapshot_contract() {
         SqliteSnapshotStore::new(&store).expect("snapshots")
     });
 }
+
+#[test]
+fn sqlite_store_passes_the_query_append_contract() {
+    eventyr_store_testing::query_append_contract(|| SqliteStore::open_in_memory().expect("open"));
+}

@@ -3,11 +3,12 @@
 use std::sync::{Arc, Mutex};
 
 use eventyr_core::batch::{CommittedStream, StreamAppend};
+use eventyr_core::boundary::{AppendCondition, Query, Tagged};
 use eventyr_core::envelope::{EventEnvelope, Metadata, NewEvent};
 use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
-use eventyr_store::store::{EventStore, StreamsAll};
+use eventyr_store::store::{EventStore, QueryAppend, StreamsAll};
 use futures::Stream;
 use futures::stream::iter;
 
@@ -33,7 +34,8 @@ const EVENT_COLUMNS: &str =
     "global_sequence, stream_id, stream_version, payload, causation_id, correlation_id";
 
 /// An embedded [`EventStore`] and [`StreamsAll`] over SQLite, via
-/// rusqlite.
+/// rusqlite — and, for [`Tagged`] events, [`QueryAppend`] (0.7.1),
+/// answered by scanning the log.
 ///
 /// Synchronous under one mutex: the port's future signatures resolve
 /// immediately, and a `Mutex<Connection>` serializes writers the way
@@ -212,6 +214,59 @@ where
     Ok(committed)
 }
 
+/// Every envelope after `from` (exclusive), in global order — the body
+/// of `stream_all`, and the scan behind the query reads.
+///
+/// SQLite has no identity columns to burn on rollback: gaps come from
+/// deleted rows or failed transactions, neither of which the schema
+/// allows — the port's gap-tolerance contract rides free.
+fn read_after<E>(
+    conn: &rusqlite::Connection,
+    from: Sequence,
+) -> Vec<Result<EventEnvelope<E>, StoreError>>
+where
+    E: serde::de::DeserializeOwned,
+{
+    let sql = format!(
+        "SELECT {EVENT_COLUMNS} FROM events WHERE global_sequence > ?1 \
+         ORDER BY global_sequence"
+    );
+    conn.prepare(&sql)
+        .map_err(SqliteStoreError::into_store)
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![from.as_u64() as i64], read_row)
+                .map_err(SqliteStoreError::into_store)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(SqliteStoreError::into_store)
+        })
+        .map(|rows| rows.into_iter().map(EventEnvelope::try_from).collect())
+        .unwrap_or_else(|error| vec![Err(error)])
+}
+
+/// The envelopes after `from` that `query` selects, matched on the
+/// decoded event. Tags are a pure function of the payload, so a tag
+/// column written at append time would be wrong for every event stored
+/// before it existed; the scan is correct on any history.
+fn read_query<E>(
+    conn: &rusqlite::Connection,
+    query: &Query,
+    from: Sequence,
+) -> Vec<Result<EventEnvelope<E>, StoreError>>
+where
+    E: serde::de::DeserializeOwned + EventName + Tagged,
+{
+    if query.items.is_empty() {
+        return Vec::new();
+    }
+    read_after(conn, from)
+        .into_iter()
+        .filter(|result| match result {
+            Ok(envelope) => query.selects(&envelope.event),
+            Err(_) => true,
+        })
+        .collect()
+}
+
 impl<E> EventStore for SqliteStore<E>
 where
     E: serde::Serialize + serde::de::DeserializeOwned + EventName + Clone + Send + Sync,
@@ -291,25 +346,52 @@ where
         &self,
         from: Sequence,
     ) -> impl Stream<Item = Result<EventEnvelope<E>, StoreError>> + Send {
-        let conn = self.lock();
-        let sql = format!(
-            "SELECT {EVENT_COLUMNS} FROM events WHERE global_sequence > ?1 \
-             ORDER BY global_sequence"
-        );
-        // SQLite has no identity columns to burn on rollback: gaps come
-        // from deleted rows or failed transactions neither of which the
-        // schema allows — the port's gap-tolerance contract rides free.
-        let events: Vec<Result<EventEnvelope<E>, StoreError>> = conn
-            .prepare(&sql)
-            .map_err(SqliteStoreError::into_store)
-            .and_then(|mut stmt| {
-                stmt.query_map(rusqlite::params![from.as_u64() as i64], read_row)
-                    .map_err(SqliteStoreError::into_store)?
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .map_err(SqliteStoreError::into_store)
-            })
-            .map(|rows| rows.into_iter().map(EventEnvelope::try_from).collect())
-            .unwrap_or_else(|error| vec![Err(error)]);
-        iter(events)
+        iter(read_after(&self.lock(), from))
+    }
+}
+
+impl<E> QueryAppend for SqliteStore<E>
+where
+    E: serde::Serialize + serde::de::DeserializeOwned + EventName + Tagged + Clone + Send + Sync,
+{
+    fn read(
+        &self,
+        query: &Query,
+        after: Sequence,
+    ) -> impl Stream<Item = Result<EventEnvelope<E>, StoreError>> + Send {
+        iter(read_query(&self.lock(), query, after))
+    }
+
+    /// Check the condition and write in one `IMMEDIATE` transaction:
+    /// SQLite's write lock is taken before the check reads, so no
+    /// writer — through this store, a clone, or another connection to
+    /// the same file — can commit between the check and the write.
+    async fn append_if(
+        &self,
+        appends: Vec<StreamAppend<E>>,
+        condition: AppendCondition,
+    ) -> Result<Vec<CommittedStream<E>>, StoreError> {
+        let mut conn = self.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(SqliteStoreError::into_store)?;
+        let mut latest = None;
+        for envelope in read_query::<E>(&tx, &condition.query, condition.after) {
+            latest = Some(envelope?.sequence);
+        }
+        if let Some(sequence) = latest {
+            return Err(StoreError::QueryConflict { sequence });
+        }
+        let appends: Vec<(StreamId, ExpectedVersion, Vec<NewEvent<E>>)> = appends
+            .into_iter()
+            .map(|a| (a.stream_id, a.expected, a.events))
+            .collect();
+        let committed = append_within(&tx, &appends)?;
+        tx.commit().map_err(SqliteStoreError::into_store)?;
+        Ok(appends
+            .into_iter()
+            .zip(committed)
+            .map(|((stream_id, _, _), events)| CommittedStream { stream_id, events })
+            .collect())
     }
 }

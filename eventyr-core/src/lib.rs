@@ -122,6 +122,7 @@ pub mod __private {
 
 pub mod aggregate;
 pub mod batch;
+pub mod boundary;
 pub mod envelope;
 pub mod error;
 pub mod event_name;
@@ -142,6 +143,10 @@ pub mod prelude {
     pub use crate::batch::{
         AggregateFold, BatchAction, BatchDecision, BatchInput, BatchMachine, BatchOutcome,
         CommittedStream, Decide, Fold, NoFold, StreamAppend,
+    };
+    pub use crate::boundary::{
+        AppendCondition, BoundaryAction, BoundaryDecision, BoundaryInput, BoundaryMachine,
+        BoundaryOutcome, Decision, Query, QueryItem, Tag, Tagged,
     };
     pub use crate::envelope::{EventEnvelope, Metadata, NewEvent};
     pub use crate::error::{ProtocolError, StoreError, UpcastError};

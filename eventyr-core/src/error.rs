@@ -23,6 +23,13 @@ pub enum StoreError {
         /// The conflicting stream's actual version at append time.
         current: Version,
     },
+    /// A boundary append's [`AppendCondition`](crate::boundary::AppendCondition)
+    /// failed: an event matching its query was committed at `sequence`,
+    /// after the condition's position. The boundary machine may retry.
+    QueryConflict {
+        /// The highest matching position the store saw.
+        sequence: crate::vocabulary::Sequence,
+    },
     /// Transient failure (connection lost, timeout). Retrying the whole
     /// interaction is the caller's business; the machine does not retry
     /// I/O.
@@ -41,6 +48,12 @@ impl fmt::Display for StoreError {
                 }
                 None => write!(f, "version conflict: stream is at {current}"),
             },
+            Self::QueryConflict { sequence } => {
+                write!(
+                    f,
+                    "append condition failed: a matching event exists at {sequence}"
+                )
+            }
             Self::Unavailable => f.write_str("store unavailable"),
             Self::Other(source) => write!(f, "store failure: {source}"),
         }

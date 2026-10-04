@@ -4,7 +4,9 @@
 //! [`EventStore`](eventyr_store::store::EventStore) /
 //! [`StreamsAll`](eventyr_store::store::StreamsAll) (and, with the
 //! opt-in [`snapshot_contract`], every
-//! [`SnapshotStore`](eventyr_store::snapshot_store::SnapshotStore))
+//! [`SnapshotStore`](eventyr_store::snapshot_store::SnapshotStore), and
+//! with the opt-in [`query_append_contract`] every
+//! [`QueryAppend`](eventyr_store::store::QueryAppend))
 //! implementation must pass to claim compatibility with the eventyr
 //! protocol — the eventcore-testing idea, applied to eventyr's ports.
 //!
@@ -34,10 +36,12 @@
 
 mod batch_store;
 mod event_store;
+mod query_append;
 mod snapshot_store;
 mod streams_all;
 
 pub use batch_store::event_store_batch_contract;
 pub use event_store::{ContractEvent, event_store_contract};
+pub use query_append::query_append_contract;
 pub use snapshot_store::snapshot_contract;
 pub use streams_all::streams_all_contract;
