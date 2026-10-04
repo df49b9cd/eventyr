@@ -39,6 +39,7 @@ futures = { version = "0.3", default-features = false, features = ["alloc", "std
 time = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+eventyr-subscription = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 eventyr-store-testing = { workspace = true }

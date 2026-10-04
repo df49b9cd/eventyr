@@ -9,17 +9,19 @@ use std::future::Future;
 use std::path::Path;
 
 use eventyr_core::batch::{CommittedStream, StreamAppend};
+use eventyr_core::boundary::{AppendCondition, Query, Tagged};
 use eventyr_core::envelope::{EventEnvelope, Metadata, NewEvent};
 use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
-use eventyr_store::store::{EventStore, StreamsAll};
+use eventyr_store::store::{EventStore, QueryAppend, StreamsAll};
 use futures::Stream;
 use sqlx::postgres::PgPool;
 
 use crate::PgStoreError;
 
-/// An [`EventStore`] over Postgres, via sqlx, for one event enum `E`.
+/// An [`EventStore`] over Postgres, via sqlx, for one event enum `E` —
+/// and, for [`Tagged`] events, [`QueryAppend`] (0.7.1).
 ///
 /// Shareable and cloneable (it wraps a [`PgPool`]): the pool owns the
 /// connection count; the store holds no other state.
@@ -198,6 +200,114 @@ fn expectation_args(expected: ExpectedVersion) -> (i16, i64) {
     }
 }
 
+/// Take every appended stream's advisory lock, sorted, before writing
+/// anything — concurrent batches over overlapping streams queue on the
+/// same first lock instead of deadlocking.
+async fn lock_streams<E>(
+    conn: &mut sqlx::PgConnection,
+    appends: &[StreamAppend<E>],
+) -> Result<(), StoreError> {
+    let mut ids: Vec<&str> = appends.iter().map(|a| a.stream_id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    for id in &ids {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(id)
+            .execute(&mut *conn)
+            .await
+            .map_err(PgStoreError::into_store)?;
+    }
+    Ok(())
+}
+
+/// Run each append's `append_events` inside the caller's open
+/// transaction, in input order.
+async fn append_all_tx<E>(
+    conn: &mut sqlx::PgConnection,
+    appends: Vec<StreamAppend<E>>,
+) -> Result<Vec<CommittedStream<E>>, StoreError>
+where
+    E: serde::Serialize + serde::de::DeserializeOwned + EventName,
+{
+    let mut committed = Vec::with_capacity(appends.len());
+    for append in appends {
+        let args = append_args(append.expected, append.events).map_err(StoreError::from)?;
+        let rows = append_events_tx(&mut *conn, append.stream_id.as_str(), args)
+            .await
+            .map_err(PgStoreError::into_store)?;
+        let events = rows
+            .into_iter()
+            .map(EventEnvelope::try_from)
+            .collect::<Result<Vec<_>, PgStoreError>>()
+            .map_err(StoreError::from)?;
+        committed.push(CommittedStream {
+            stream_id: append.stream_id,
+            events,
+        });
+    }
+    Ok(committed)
+}
+
+/// The SQL prefilter for a query: the stored names it can select, or
+/// `None` when some item accepts any type (no prefilter possible).
+fn query_types(query: &Query) -> Option<Vec<String>> {
+    let mut types = Vec::new();
+    for item in &query.items {
+        if item.types.is_empty() {
+            return None;
+        }
+        types.extend(item.types.iter().map(|name| (*name).to_string()));
+    }
+    types.sort_unstable();
+    types.dedup();
+    Some(types)
+}
+
+/// One page of the rows a query may select after `cursor`: every row,
+/// or only rows of the query's types when it names them all.
+async fn query_page<'c>(
+    conn: impl sqlx::PgExecutor<'c>,
+    types: Option<&[String]>,
+    cursor: i64,
+    page: i64,
+) -> Result<Vec<EventRow>, StoreError> {
+    let rows = match types {
+        Some(types) => {
+            let query = sqlx::AssertSqlSafe(format!(
+                "SELECT {EVENT_COLUMNS} FROM events \
+                 WHERE event_type = ANY($1) AND global_sequence > $2 \
+                 ORDER BY global_sequence LIMIT $3"
+            ));
+            sqlx::query_as::<_, EventRow>(query)
+                .bind(types)
+                .bind(cursor)
+                .bind(page)
+                .fetch_all(conn)
+                .await
+        }
+        None => {
+            let query = sqlx::AssertSqlSafe(format!(
+                "SELECT {EVENT_COLUMNS} FROM events WHERE global_sequence > $1 \
+                 ORDER BY global_sequence LIMIT $2"
+            ));
+            sqlx::query_as::<_, EventRow>(query)
+                .bind(cursor)
+                .bind(page)
+                .fetch_all(conn)
+                .await
+        }
+    };
+    rows.map_err(PgStoreError::into_store)
+}
+
+const QUERY_PAGE: i64 = 512;
+
+/// The advisory lock every append holds from drawing its global
+/// sequence until it commits (migration 0006): sequences become visible
+/// in order, so `stream_all` never shows a later one before an earlier
+/// one that will still commit. Must match the key in `append_events`.
+const COMMIT_ORDER_LOCK: i64 = 7_300_160_413_598_463_541;
+
 impl<E> EventStore for PgStore<E>
 where
     E: serde::Serialize + serde::de::DeserializeOwned + EventName + Clone + Send + Sync,
@@ -251,36 +361,8 @@ where
             let mut conn = pool.acquire().await.map_err(PgStoreError::into_store)?;
             let mut tx = conn.begin().await.map_err(PgStoreError::into_store)?;
 
-            // Lock every stream, sorted, before writing anything —
-            // concurrent batches over overlapping streams queue on the
-            // same first lock instead of deadlocking.
-            let mut ids: Vec<&str> = appends.iter().map(|a| a.stream_id.as_str()).collect();
-            ids.sort_unstable();
-            ids.dedup();
-            for id in &ids {
-                sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(PgStoreError::into_store)?;
-            }
-
-            let mut committed = Vec::with_capacity(appends.len());
-            for append in appends {
-                let args = append_args(append.expected, append.events).map_err(StoreError::from)?;
-                let rows = append_events_tx(&mut tx, append.stream_id.as_str(), args)
-                    .await
-                    .map_err(PgStoreError::into_store)?;
-                let events = rows
-                    .into_iter()
-                    .map(EventEnvelope::try_from)
-                    .collect::<Result<Vec<_>, PgStoreError>>()
-                    .map_err(StoreError::from)?;
-                committed.push(CommittedStream {
-                    stream_id: append.stream_id,
-                    events,
-                });
-            }
+            lock_streams(&mut tx, &appends).await?;
+            let committed = append_all_tx(&mut tx, appends).await?;
             tx.commit().await.map_err(PgStoreError::into_store)?;
             Ok(committed)
         }
@@ -361,6 +443,113 @@ where
                 }
             }
         })
+    }
+}
+
+impl<E> QueryAppend for PgStore<E>
+where
+    E: serde::Serialize + serde::de::DeserializeOwned + EventName + Tagged + Clone + Send + Sync,
+{
+    /// Page through the rows of the query's types (all rows when an
+    /// item accepts any type), matching tags on the decoded event.
+    /// Tags are a pure function of the payload, so matching the decoded
+    /// event is correct on any history — including rows written before
+    /// the event type grew a tag.
+    fn read(
+        &self,
+        query: &Query,
+        after: Sequence,
+    ) -> impl Stream<Item = Result<EventEnvelope<E>, StoreError>> + Send {
+        let pool = self.pool.clone();
+        let query = query.clone();
+        Box::pin(async_stream::stream! {
+            if query.items.is_empty() {
+                return;
+            }
+            let types = query_types(&query);
+            let mut cursor = after.as_u64().try_into().unwrap_or(i64::MAX);
+            loop {
+                let rows = match query_page(&pool, types.as_deref(), cursor, QUERY_PAGE).await {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+                let page_len = rows.len();
+                for row in rows {
+                    cursor = row.global_sequence;
+                    match EventEnvelope::<E>::try_from(row) {
+                        Ok(envelope) if query.selects(&envelope.event) => yield Ok(envelope),
+                        Ok(_) => {}
+                        Err(error) => yield Err(StoreError::from(error)),
+                    }
+                }
+                if page_len < QUERY_PAGE as usize {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// One transaction: the appended streams' advisory locks (sorted,
+    /// as `append_batch` takes them), then the commit-order lock
+    /// (migration 0006), then the condition check, then the writes.
+    ///
+    /// Every append holds the commit-order lock from drawing its
+    /// sequence until it commits, so once this transaction holds it, no
+    /// matching event is in flight: the check sees every committed event,
+    /// and nothing can commit between the check and the write. Without
+    /// it, a READ COMMITTED check reads past an uncommitted matching row
+    /// and oversells. The lock order (stream locks, then the commit-order
+    /// lock) is the one every append takes, so no two writers deadlock.
+    fn append_if(
+        &self,
+        appends: Vec<StreamAppend<E>>,
+        condition: AppendCondition,
+    ) -> impl Future<Output = Result<Vec<CommittedStream<E>>, StoreError>> + Send {
+        let pool = self.pool.clone();
+        async move {
+            use sqlx::Acquire;
+            let mut conn = pool.acquire().await.map_err(PgStoreError::into_store)?;
+            let mut tx = conn.begin().await.map_err(PgStoreError::into_store)?;
+
+            lock_streams(&mut tx, &appends).await?;
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(COMMIT_ORDER_LOCK)
+                .execute(&mut *tx)
+                .await
+                .map_err(PgStoreError::into_store)?;
+
+            if !condition.query.items.is_empty() {
+                let types = query_types(&condition.query);
+                let mut cursor: i64 = condition.after.as_u64().try_into().unwrap_or(i64::MAX);
+                let mut latest = None;
+                loop {
+                    let rows = query_page(&mut *tx, types.as_deref(), cursor, QUERY_PAGE).await?;
+                    let page_len = rows.len();
+                    for row in rows {
+                        cursor = row.global_sequence;
+                        let envelope =
+                            EventEnvelope::<E>::try_from(row).map_err(StoreError::from)?;
+                        if condition.query.selects(&envelope.event) {
+                            latest = Some(envelope.sequence);
+                        }
+                    }
+                    if page_len < QUERY_PAGE as usize {
+                        break;
+                    }
+                }
+                if let Some(sequence) = latest {
+                    // Dropping `tx` rolls back and releases every lock.
+                    return Err(StoreError::QueryConflict { sequence });
+                }
+            }
+
+            let committed = append_all_tx(&mut tx, appends).await?;
+            tx.commit().await.map_err(PgStoreError::into_store)?;
+            Ok(committed)
+        }
     }
 }
 

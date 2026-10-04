@@ -15,6 +15,9 @@ use futures::executor::block_on;
 
 use eventyr_core::aggregate::Aggregate;
 use eventyr_core::batch::{BatchAction, BatchInput, BatchMachine, BatchOutcome, Decide};
+use eventyr_core::boundary::{
+    BoundaryAction, BoundaryInput, BoundaryMachine, BoundaryOutcome, Decision,
+};
 use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
 use eventyr_core::snapshot::HasSnapshotState;
@@ -22,7 +25,7 @@ use eventyr_core::write::{WriteAction, WriteInput, WriteMachine, WriteOutcome};
 
 use crate::metrics::{Metrics, names};
 use crate::snapshot_store::SnapshotStore;
-use crate::store::EventStore;
+use crate::store::{EventStore, QueryAppend};
 
 /// Drives `machine` against `store` until it finishes, returning its
 /// terminal outcome.
@@ -379,4 +382,87 @@ where
     S: EventStore<Event = E>,
 {
     block_on(drive_write_batch(machine, store))
+}
+
+/// Drives a [`BoundaryMachine`] against a [`QueryAppend`] store until it
+/// finishes (0.7.1):
+///
+/// - `Read` → [`read`](QueryAppend::read) the query from the bound,
+///   reporting [`Read`](BoundaryInput::Read) or
+///   [`Failed`](BoundaryInput::Failed);
+/// - `Append` → [`append_if`](QueryAppend::append_if), reporting
+///   [`Appended`](BoundaryInput::Appended), or mapping the store error
+///   through `BoundaryInput::from` — a
+///   [`QueryConflict`](StoreError::QueryConflict) is the retry path,
+///   anything else [`Failed`](BoundaryInput::Failed);
+/// - `Done` → stop and return the outcome.
+pub async fn drive_boundary<D, S>(
+    machine: &mut BoundaryMachine<D>,
+    store: &S,
+) -> BoundaryOutcome<D::Event, D::Error>
+where
+    D: Decision,
+    S: QueryAppend<Event = D::Event>,
+{
+    drive_boundary_with_metrics(machine, store, &crate::metrics::NoopMetrics).await
+}
+
+/// [`drive_boundary`] with metrics (0.5.3): the guarded append reports
+/// a latency, a conflict-tick on a failed condition, and the count of
+/// committed events on commit — the same instruments as the batch
+/// driver.
+pub async fn drive_boundary_with_metrics<D, S>(
+    machine: &mut BoundaryMachine<D>,
+    store: &S,
+    metrics: &(dyn Metrics + Send + Sync),
+) -> BoundaryOutcome<D::Event, D::Error>
+where
+    D: Decision,
+    S: QueryAppend<Event = D::Event>,
+{
+    let mut action = machine.start();
+    loop {
+        action = match action {
+            BoundaryAction::Read { query, after } => {
+                let read: Result<Vec<EventEnvelope<D::Event>>, StoreError> =
+                    store.read(&query, after).try_collect().await;
+                machine.handle(match read {
+                    Ok(events) => BoundaryInput::Read { events },
+                    Err(error) => BoundaryInput::Failed(error),
+                })
+            }
+            BoundaryAction::Append { appends, condition } => {
+                let start = std::time::Instant::now();
+                match store.append_if(appends, condition).await {
+                    Ok(committed) => {
+                        metrics.histogram(names::APPEND_LATENCY, start.elapsed());
+                        let count: u64 = committed.iter().map(|c| c.events.len() as u64).sum();
+                        metrics.counter(names::APPENDS, count);
+                        machine.handle(BoundaryInput::Appended { committed })
+                    }
+                    Err(error) => {
+                        if matches!(error, StoreError::QueryConflict { .. }) {
+                            metrics.counter(names::CONFLICTS, 1);
+                        }
+                        machine.handle(BoundaryInput::from(error))
+                    }
+                }
+            }
+            BoundaryAction::Done(outcome) => return outcome,
+        };
+    }
+}
+
+/// The blocking [`drive_boundary`]: drives `machine` to its outcome
+/// without an async runtime, parking the thread through the store's
+/// futures.
+pub fn drive_boundary_blocking<D, S>(
+    machine: &mut BoundaryMachine<D>,
+    store: &S,
+) -> BoundaryOutcome<D::Event, D::Error>
+where
+    D: Decision,
+    S: QueryAppend<Event = D::Event>,
+{
+    block_on(drive_boundary(machine, store))
 }

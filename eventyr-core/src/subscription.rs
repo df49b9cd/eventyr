@@ -202,9 +202,19 @@ pub enum SubscriptionAction<E> {
     /// Caught up or backing off; the driver waits `for_`, then reports
     /// [`Slept`](SubscriptionInput::Slept). The duration is the machine's
     /// decision; only the wait performs I/O (a clock).
+    ///
+    /// `reason` tells the driver whether the wait may end early: an
+    /// [`Idle`](SleepReason::Idle) wait exists only because nothing new
+    /// was visible, so a driver that learns of a commit (0.7.2's commit
+    /// signal) may report `Slept` at once; a
+    /// [`Backoff`](SleepReason::Backoff) is the retry delay after a
+    /// failure and must run its course — new events are no reason to
+    /// hammer a failing projection.
     Sleep {
         /// How long to wait.
         for_: Duration,
+        /// Why the machine is waiting.
+        reason: SleepReason,
     },
     /// Terminal. Normal operation never reaches this — subscriptions are
     /// perennial; only a fatal store error, a protocol violation, a
@@ -212,6 +222,17 @@ pub enum SubscriptionAction<E> {
     /// [`stop_at_catch_up`](SubscriptionPolicy::stop_at_catch_up)
     /// policy ends a subscription.
     Done(SubscriptionOutcome),
+}
+
+/// Why a subscription [`Sleep`](SubscriptionAction::Sleep)s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SleepReason {
+    /// Caught up: the last poll was empty. A wake-up on commit may end
+    /// the wait early.
+    Idle,
+    /// Backing off after a failed apply or ack. The wait runs its
+    /// course.
+    Backoff,
 }
 
 /// What the driver reports back to the machine.
@@ -422,6 +443,7 @@ impl<E: Clone> SubscriptionMachine<E> {
                     self.phase = Phase::Sleeping;
                     SubscriptionAction::Sleep {
                         for_: self.policy.idle_sleep,
+                        reason: SleepReason::Idle,
                     }
                 }
             }
@@ -507,6 +529,7 @@ impl<E: Clone> SubscriptionMachine<E> {
         self.phase = Phase::Sleeping;
         SubscriptionAction::Sleep {
             for_: self.policy.retry_sleep,
+            reason: SleepReason::Backoff,
         }
     }
 
@@ -715,7 +738,7 @@ mod tests {
         });
         assert!(matches!(
             action,
-            SubscriptionAction::Sleep { for_ } if for_ == Duration::from_millis(100)
+            SubscriptionAction::Sleep { for_, reason: SleepReason::Idle } if for_ == Duration::from_millis(100)
         ));
         assert_eq!(m.checkpoint(), Checkpoint::ORIGIN);
     }
@@ -753,7 +776,7 @@ mod tests {
         });
         assert!(matches!(
             action,
-            SubscriptionAction::Sleep { for_ } if for_ == Duration::from_secs(1)
+            SubscriptionAction::Sleep { for_, reason: SleepReason::Backoff } if for_ == Duration::from_secs(1)
         ));
         // The checkpoint never moved: the offending event redelivers.
         assert_eq!(m.checkpoint(), Checkpoint::new(Sequence::new(1)));
@@ -784,7 +807,7 @@ mod tests {
         let action = m.handle(SubscriptionInput::AckFailed);
         assert!(matches!(
             action,
-            SubscriptionAction::Sleep { for_ } if for_ == Duration::from_secs(1)
+            SubscriptionAction::Sleep { for_, reason: SleepReason::Backoff } if for_ == Duration::from_secs(1)
         ));
         assert_eq!(m.checkpoint(), Checkpoint::ORIGIN);
         m.handle(SubscriptionInput::Slept);

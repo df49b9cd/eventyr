@@ -4,6 +4,8 @@
 //! [`StreamsAll`] adds the global ordered stream that projections and
 //! subscriptions require. A store that cannot provide a global stream can
 //! still implement `EventStore` — the split keeps honesty.
+//! [`QueryAppend`] is the opt-in port for dynamic consistency
+//! boundaries (0.7.1): read by query, append under a query condition.
 
 use core::future::Future;
 use std::vec::Vec;
@@ -11,8 +13,10 @@ use std::vec::Vec;
 use futures::Stream;
 
 use eventyr_core::batch::{CommittedStream, StreamAppend};
+use eventyr_core::boundary::{AppendCondition, Query, Tagged};
 use eventyr_core::envelope::{EventEnvelope, NewEvent};
 use eventyr_core::error::StoreError;
+use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 
 /// An append-only, ordered event log, readable per stream.
@@ -90,6 +94,50 @@ pub trait StreamsAll: EventStore {
         &self,
         from: Sequence,
     ) -> impl Stream<Item = Result<EventEnvelope<Self::Event>, StoreError>> + Send;
+}
+
+/// A store that can serve dynamic consistency boundaries (0.7.1): read
+/// the events a [`Query`] selects, and append guarded by an
+/// [`AppendCondition`] instead of (only) a stream version.
+///
+/// Opt-in, like [`StreamsAll`]: the store must index each event's
+/// stored name ([`EventName`]) and tags ([`Tagged`]) at append time —
+/// both are pure functions of the payload, so nothing new travels on
+/// the envelope.
+///
+/// The condition check and the write are one atomic step. Two appends
+/// whose conditions overlap must serialize: whichever commits second
+/// sees the first's events and fails. A store that cannot make that
+/// guarantee must not implement this trait.
+pub trait QueryAppend: StreamsAll
+where
+    Self::Event: EventName + Tagged,
+{
+    /// Stream every event `query` selects, committed after `after`
+    /// (exclusive), in global sequence order.
+    ///
+    /// The ordering and visibility rules of
+    /// [`stream_all`](StreamsAll::stream_all) apply.
+    fn read(
+        &self,
+        query: &Query,
+        after: Sequence,
+    ) -> impl Stream<Item = Result<EventEnvelope<Self::Event>, StoreError>> + Send;
+
+    /// Append the per-stream batches atomically if no event selected by
+    /// `condition.query` was committed after `condition.after`.
+    ///
+    /// A failed condition is [`StoreError::QueryConflict`] carrying the
+    /// highest matching sequence, and nothing is written. Each
+    /// [`StreamAppend`]'s own expectation is still checked
+    /// ([`StoreError::Conflict`] on violation) — the boundary machine
+    /// emits [`Any`](ExpectedVersion::Any), but the port does not
+    /// assume it.
+    fn append_if(
+        &self,
+        appends: Vec<StreamAppend<Self::Event>>,
+        condition: AppendCondition,
+    ) -> impl Future<Output = Result<Vec<CommittedStream<Self::Event>>, StoreError>> + Send;
 }
 
 /// The optimistic-concurrency check, once: whether a stream at
@@ -179,6 +227,35 @@ macro_rules! impl_port_delegation {
         }
     };
 }
+
+macro_rules! impl_query_delegation {
+    ($pointer:ty) => {
+        impl<S: QueryAppend + ?Sized> QueryAppend for $pointer
+        where
+            S::Event: EventName + Tagged,
+        {
+            fn read(
+                &self,
+                query: &Query,
+                after: Sequence,
+            ) -> impl Stream<Item = Result<EventEnvelope<Self::Event>, StoreError>> + Send {
+                (**self).read(query, after)
+            }
+
+            fn append_if(
+                &self,
+                appends: Vec<StreamAppend<Self::Event>>,
+                condition: AppendCondition,
+            ) -> impl Future<Output = Result<Vec<CommittedStream<Self::Event>>, StoreError>> + Send
+            {
+                (**self).append_if(appends, condition)
+            }
+        }
+    };
+}
+
+impl_query_delegation!(&S);
+impl_query_delegation!(std::sync::Arc<S>);
 
 impl_port_delegation!(&S);
 impl_port_delegation!(std::sync::Arc<S>);

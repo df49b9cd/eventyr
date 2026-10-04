@@ -8,11 +8,13 @@ use futures::stream::iter;
 use serde::{Deserialize, Serialize};
 
 use eventyr_core::batch::{CommittedStream, StreamAppend};
+use eventyr_core::boundary::{AppendCondition, Query, Tagged};
 use eventyr_core::envelope::{EventEnvelope, Metadata, NewEvent};
 use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
-use eventyr_store::store::{EventStore, StreamsAll};
+use eventyr_store::notify::{CommitSignal, LocalCommitListener, LocalCommitSignal};
+use eventyr_store::store::{EventStore, QueryAppend, StreamsAll};
 
 use crate::FjallStoreError;
 
@@ -47,7 +49,10 @@ struct StoredRow<E> {
     correlation_id: Option<String>,
 }
 
-/// An embedded [`EventStore`] and [`StreamsAll`] over fjall.
+/// An embedded [`EventStore`] and [`StreamsAll`] over fjall — and, for
+/// [`Tagged`] events, [`QueryAppend`] (0.7.1), answered by scanning the
+/// global log. Its [`CommitSignal`] (0.7.2) wakes subscribers on every
+/// commit made through this store or its clones.
 ///
 /// Shareable and cloneable (it wraps a [`fjall::SingleWriterTxDatabase`]):
 /// clones point at the same keyspaces. All writes go through one
@@ -67,6 +72,8 @@ pub struct FjallStore<E> {
     meta: SingleWriterTxKeyspace,
     /// The write-side serialization point (see the type's docs).
     write_lock: Mutex<()>,
+    /// Raised after every commit (0.7.2); shared by clones.
+    signal: LocalCommitSignal,
     _event: std::marker::PhantomData<fn() -> E>,
 }
 
@@ -79,6 +86,7 @@ impl<E> Clone for FjallStore<E> {
             global: self.global.clone(),
             meta: self.meta.clone(),
             write_lock: Mutex::new(()),
+            signal: self.signal.clone(),
             _event: std::marker::PhantomData,
         }
     }
@@ -107,6 +115,7 @@ impl<E> FjallStore<E> {
             global: keyspace.keyspace(PARTITION_GLOBAL, KeyspaceCreateOptions::default)?,
             meta: keyspace.keyspace(PARTITION_META, KeyspaceCreateOptions::default)?,
             write_lock: Mutex::new(()),
+            signal: LocalCommitSignal::new(),
             keyspace,
             _event: std::marker::PhantomData,
         })
@@ -167,7 +176,31 @@ impl<E> FjallStore<E> {
         // nothing.
         let _guard = self.lock();
         let mut tx = self.keyspace.write_tx();
+        let committed = self.write_in(&mut tx, appends)?;
+        tx.commit().map_err(engine)?;
+        self.notify_if_written(&committed);
+        Ok(committed)
+    }
 
+    /// Raise the commit signal when the commit wrote any event.
+    fn notify_if_written(&self, committed: &[WrittenStream<E>]) {
+        if committed.iter().any(|(_, events)| !events.is_empty()) {
+            self.signal.notify();
+        }
+    }
+
+    /// The body of [`write_batch`](Self::write_batch), inside a write
+    /// transaction the caller holds (and commits) under the write lock
+    /// — so a conditional append can check its condition in the same
+    /// transaction it writes in.
+    fn write_in(
+        &self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        appends: impl IntoIterator<Item = (StreamId, ExpectedVersion, Vec<NewEvent<E>>)>,
+    ) -> Result<Vec<WrittenStream<E>>, StoreError>
+    where
+        E: EventName + serde::Serialize,
+    {
         let appends: Vec<(StreamId, ExpectedVersion, Vec<NewEvent<E>>)> =
             appends.into_iter().collect();
 
@@ -257,7 +290,6 @@ impl<E> FjallStore<E> {
                 (next + sequence_offset).to_be_bytes(),
             );
         }
-        tx.commit().map_err(engine)?;
 
         Ok(committed)
     }
@@ -278,6 +310,70 @@ impl<E> FjallStore<E> {
             event: row.payload,
             metadata: Metadata::of_ids(row.causation_id, row.correlation_id),
         })
+    }
+}
+
+impl<E> FjallStore<E>
+where
+    E: serde::de::DeserializeOwned,
+{
+    /// Every envelope after `from` (exclusive), in global order, read
+    /// through `tx` — a snapshot for reads, the write transaction for a
+    /// conditional append's check.
+    fn scan_global(
+        &self,
+        tx: &impl Readable,
+        from: Sequence,
+    ) -> Vec<Result<EventEnvelope<E>, StoreError>> {
+        let lower = format!("{:016}", from.as_u64() + 1).into_bytes();
+        let mut upper = format!("{:016}", u64::MAX).into_bytes();
+        upper.push(0xff);
+        tx.range(&self.global, lower..upper)
+            .map(|guard| {
+                let pointer = guard.value().map_err(engine)?;
+                // The pointer is the `streams` key
+                // `"{stream_id}\0{version:016}"`: the row is at that
+                // key, the stream id before its separator.
+                let stream_id = pointer
+                    .iter()
+                    .position(|&byte| byte == 0)
+                    .map(|at| StreamId::from(String::from_utf8_lossy(&pointer[..at]).into_owned()));
+                match stream_id {
+                    Some(stream_id) => match tx.get(&self.streams, &pointer) {
+                        Ok(Some(bytes)) => self.decode(&bytes, &stream_id),
+                        Ok(None) => Err(corrupt("a global-sequence pointer resolved to no row")),
+                        Err(error) => Err(engine(error)),
+                    },
+                    None => Err(corrupt("a global-sequence key had no stream-id separator")),
+                }
+            })
+            .collect()
+    }
+
+    /// The envelopes after `from` that `query` selects — a scan of the
+    /// global log, matched on the decoded event. No tag index: tags are
+    /// a pure function of the payload, so an index built at append time
+    /// would miss every event written before it existed; scanning is
+    /// correct on any history.
+    fn scan_query(
+        &self,
+        tx: &impl Readable,
+        query: &Query,
+        from: Sequence,
+    ) -> Vec<Result<EventEnvelope<E>, StoreError>>
+    where
+        E: EventName + Tagged,
+    {
+        if query.items.is_empty() {
+            return Vec::new();
+        }
+        self.scan_global(tx, from)
+            .into_iter()
+            .filter(|result| match result {
+                Ok(envelope) => query.selects(&envelope.event),
+                Err(_) => true,
+            })
+            .collect()
     }
 }
 
@@ -377,31 +473,69 @@ where
     where
         E: serde::de::DeserializeOwned,
     {
-        let lower = format!("{:016}", from.as_u64() + 1).into_bytes();
-        let mut upper = format!("{:016}", u64::MAX).into_bytes();
-        upper.push(0xff);
-        let tx = self.keyspace.read_tx();
-        let events: Vec<Result<EventEnvelope<E>, StoreError>> = tx
-            .range(&self.global, lower..upper)
-            .map(|guard| {
-                let pointer = guard.value().map_err(engine)?;
-                // The pointer is the `streams` key
-                // `"{stream_id}\0{version:016}"`: the row is at that
-                // key, the stream id before its separator.
-                let stream_id = pointer
-                    .iter()
-                    .position(|&byte| byte == 0)
-                    .map(|at| StreamId::from(String::from_utf8_lossy(&pointer[..at]).into_owned()));
-                match stream_id {
-                    Some(stream_id) => match tx.get(&self.streams, &pointer) {
-                        Ok(Some(bytes)) => self.decode(&bytes, &stream_id),
-                        Ok(None) => Err(corrupt("a global-sequence pointer resolved to no row")),
-                        Err(error) => Err(engine(error)),
-                    },
-                    None => Err(corrupt("a global-sequence key had no stream-id separator")),
-                }
-            })
-            .collect();
-        iter(events)
+        iter(self.scan_global(&self.keyspace.read_tx(), from))
+    }
+}
+
+impl<E> QueryAppend for FjallStore<E>
+where
+    E: serde::Serialize + serde::de::DeserializeOwned + EventName + Tagged + Clone + Send + Sync,
+{
+    fn read(
+        &self,
+        query: &Query,
+        after: Sequence,
+    ) -> impl Stream<Item = Result<EventEnvelope<E>, StoreError>> + Send {
+        iter(self.scan_query(&self.keyspace.read_tx(), query, after))
+    }
+
+    /// Check the condition and write in one write transaction. fjall's
+    /// single-writer database hands out one write transaction at a time
+    /// (database-wide, across every clone of this store), and reads in
+    /// it see every committed write — so no append, conditional or not,
+    /// can commit between the check and the write, and overlapping
+    /// conditions serialize.
+    fn append_if(
+        &self,
+        appends: Vec<StreamAppend<E>>,
+        condition: AppendCondition,
+    ) -> impl std::future::Future<Output = Result<Vec<CommittedStream<E>>, StoreError>> + Send {
+        let this = self.clone();
+        async move {
+            let _guard = this.lock();
+            let mut tx = this.keyspace.write_tx();
+            let mut latest = None;
+            for envelope in this.scan_query(&tx, &condition.query, condition.after) {
+                latest = Some(envelope?.sequence);
+            }
+            if let Some(sequence) = latest {
+                return Err(StoreError::QueryConflict { sequence });
+            }
+            let committed = this.write_in(
+                &mut tx,
+                appends
+                    .into_iter()
+                    .map(|a| (a.stream_id, a.expected, a.events)),
+            )?;
+            tx.commit().map_err(engine)?;
+            this.notify_if_written(&committed);
+            Ok(committed
+                .into_iter()
+                .map(|(stream_id, events)| CommittedStream { stream_id, events })
+                .collect())
+        }
+    }
+}
+
+impl<E> CommitSignal for FjallStore<E>
+where
+    E: Send,
+{
+    type Listener = LocalCommitListener;
+
+    fn subscribe(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Self::Listener, StoreError>> + Send {
+        self.signal.subscribe()
     }
 }

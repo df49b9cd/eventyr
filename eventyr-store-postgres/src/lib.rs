@@ -21,6 +21,7 @@
 //! separate column — so payload-struct renames are free and historical
 //! payloads stay selectable by an upcaster.
 
+pub mod notify;
 #[cfg(feature = "snapshots")]
 pub mod snapshots;
 pub mod store;
@@ -36,6 +37,7 @@ use sqlx::postgres::PgDatabaseError;
 /// signal a version-conflict (its `hint` carries the actual version).
 const RAISE_EXCEPTION: &str = "P0001";
 
+pub use notify::PgCommitSignal;
 pub use store::PgStore;
 
 /// The crate-level error: store failures are [`StoreError`] once they

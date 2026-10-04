@@ -18,9 +18,10 @@ use eventyr_store::metrics::names::{PROJECTED_EVENTS, PROJECTION_FETCH_SPAN};
 use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
 use eventyr_core::subscription::{
-    SubscriptionAction, SubscriptionInput, SubscriptionMachine, SubscriptionOutcome,
+    SleepReason, SubscriptionAction, SubscriptionInput, SubscriptionMachine, SubscriptionOutcome,
     SubscriptionPolicy,
 };
+use eventyr_store::notify::{CommitListener, CommitSignal, NoSignal};
 
 use crate::checkpoint::CheckpointStore;
 use crate::source::SubscriptionSource;
@@ -130,8 +131,8 @@ pub async fn drive_projector_with_metrics<E, S, C, P, F, Fut>(
     name: &str,
     source: &S,
     checkpoints: &C,
-    mut projection: P,
-    mut sleep: F,
+    projection: P,
+    sleep: F,
     metrics: &(dyn eventyr_store::metrics::Metrics + Send + Sync),
 ) -> SubscriptionOutcome
 where
@@ -143,6 +144,55 @@ where
     Fut: Future<Output = ()>,
     E: Clone + Send,
 {
+    drive_projector_woken(
+        machine,
+        name,
+        source,
+        checkpoints,
+        projection,
+        sleep,
+        NoSignal,
+        metrics,
+    )
+    .await
+}
+
+/// [`drive_projector_with_metrics`] that also ends an *idle* sleep early
+/// when `wake` reports a commit (0.7.2) — a caught-up projector polls
+/// at once instead of after `idle_sleep`.
+///
+/// Arm `wake` (via [`CommitSignal::subscribe`])
+/// before calling: a commit after arming and before the first idle
+/// sleep is remembered, so none slips between a poll and the wait.
+/// Backoff sleeps ([`SleepReason::Backoff`]) ignore `wake` and run their
+/// course. A broken signal (`committed` returning `Err`) is dropped for
+/// the rest of the run and the driver falls back to its timer — the
+/// poll was authoritative all along.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the driver's ports, one argument each — the same shape as the other drivers"
+)]
+pub async fn drive_projector_woken<E, S, C, P, F, Fut, W>(
+    machine: &mut SubscriptionMachine<E>,
+    name: &str,
+    source: &S,
+    checkpoints: &C,
+    mut projection: P,
+    mut sleep: F,
+    wake: W,
+    metrics: &(dyn eventyr_store::metrics::Metrics + Send + Sync),
+) -> SubscriptionOutcome
+where
+    S: SubscriptionSource<Event = E>,
+    C: CheckpointStore,
+    P: Projection<Event = E>,
+    P::Error: core::fmt::Display,
+    F: FnMut(core::time::Duration) -> Fut,
+    Fut: Future<Output = ()>,
+    W: CommitListener,
+    E: Clone + Send,
+{
+    let mut wake = Some(wake);
     let mut action = machine.start();
     // The batch being applied, when `Applying` began — for the latency
     // histogram. The machine owns *what* to do; the driver owns timing it.
@@ -206,8 +256,30 @@ where
                     }
                 }
             }
-            SubscriptionAction::Sleep { for_ } => {
-                sleep(for_).await;
+            SubscriptionAction::Sleep { for_, reason } => {
+                let broken = match (reason, wake.as_mut()) {
+                    (SleepReason::Idle, Some(listener)) => {
+                        let timer = core::pin::pin!(sleep(for_));
+                        let woken = core::pin::pin!(listener.committed());
+                        match futures::future::select(timer, woken).await {
+                            futures::future::Either::Right((Err(_), timer)) => {
+                                // The signal broke: finish this wait on
+                                // the timer.
+                                timer.await;
+                                true
+                            }
+                            // Timer or wake-up: either way, poll now.
+                            _ => false,
+                        }
+                    }
+                    _ => {
+                        sleep(for_).await;
+                        false
+                    }
+                };
+                if broken {
+                    wake = None;
+                }
                 machine.handle(SubscriptionInput::Slept)
             }
             SubscriptionAction::Done(outcome) => return outcome,
@@ -250,12 +322,13 @@ where
 /// Owns a runner per §6 — that is to say, it owns *the machine*, not
 /// the loop: `run` is a future the caller spawns (e.g.
 /// `tokio::spawn(projector.run(..))`).
-pub struct Projector<S, C, P> {
+pub struct Projector<S, C, P, W = NoSignal> {
     source: S,
     checkpoints: C,
     projection: P,
     policy: SubscriptionPolicy,
     name: String,
+    wake: W,
 }
 
 impl<S, C, P> Projector<S, C, P> {
@@ -268,20 +341,44 @@ impl<S, C, P> Projector<S, C, P> {
             projection,
             policy: SubscriptionPolicy::default(),
             name: name.into(),
+            wake: NoSignal,
         }
     }
+}
 
+impl<S, C, P, W> Projector<S, C, P, W> {
     /// Tune the subscription's batch/idle/retry policy.
     pub fn with_policy(mut self, policy: SubscriptionPolicy) -> Self {
         self.policy = policy;
         self
     }
 
+    /// Wake on commits (0.7.2): when caught up, poll as soon as
+    /// `signal` reports a commit instead of after the idle sleep. The
+    /// idle sleep stays the fallback, so a lost wake-up costs latency,
+    /// never an event.
+    ///
+    /// Usually the store itself: `.wake_on(store.clone())` for the
+    /// in-memory, fjall, and SQLite stores, a
+    /// `PgCommitSignal` for Postgres.
+    pub fn wake_on<W2: CommitSignal>(self, signal: W2) -> Projector<S, C, P, W2> {
+        Projector {
+            source: self.source,
+            checkpoints: self.checkpoints,
+            projection: self.projection,
+            policy: self.policy,
+            name: self.name,
+            wake: signal,
+        }
+    }
+
     /// The name the checkpoint is stored under.
     pub fn name(&self) -> &str {
         &self.name
     }
+}
 
+impl<S, C, P> Projector<S, C, P, NoSignal> {
     /// Load the persisted checkpoint, then drive the subscription to
     /// completion, waiting via `sleep` between polls.
     pub async fn run<F, Fut>(self, sleep: F) -> Result<SubscriptionOutcome, StoreError>
@@ -294,15 +391,59 @@ impl<S, C, P> Projector<S, C, P> {
         Fut: Future<Output = ()>,
         P::Event: Clone + Send,
     {
+        self.drive(sleep, NoSignal).await
+    }
+}
+
+impl<S, C, P, W: CommitSignal> Projector<S, C, P, W> {
+    /// Arm the commit listener, load the persisted checkpoint, then
+    /// drive the subscription to completion — waiting via `sleep`
+    /// between polls, or less when a commit arrives first.
+    ///
+    /// The listener is armed before the first poll, so no commit can
+    /// fall between a poll and the wait that follows it.
+    pub async fn run_woken<F, Fut>(self, sleep: F) -> Result<SubscriptionOutcome, StoreError>
+    where
+        S: SubscriptionSource<Event = P::Event>,
+        C: CheckpointStore,
+        P: Projection,
+        P::Error: core::fmt::Display,
+        F: FnMut(core::time::Duration) -> Fut,
+        Fut: Future<Output = ()>,
+        P::Event: Clone + Send,
+    {
+        let listener = self.wake.subscribe().await?;
+        self.drive(sleep, listener).await
+    }
+}
+
+impl<S, C, P, W> Projector<S, C, P, W> {
+    async fn drive<F, Fut, L>(
+        self,
+        sleep: F,
+        listener: L,
+    ) -> Result<SubscriptionOutcome, StoreError>
+    where
+        S: SubscriptionSource<Event = P::Event>,
+        C: CheckpointStore,
+        P: Projection,
+        P::Error: core::fmt::Display,
+        F: FnMut(core::time::Duration) -> Fut,
+        Fut: Future<Output = ()>,
+        P::Event: Clone + Send,
+        L: CommitListener,
+    {
         let resume = self.checkpoints.load(&self.name).await?;
         let mut machine = SubscriptionMachine::new(self.policy, resume);
-        Ok(drive_projector(
+        Ok(drive_projector_woken(
             &mut machine,
             &self.name,
             &self.source,
             &self.checkpoints,
             self.projection,
             sleep,
+            listener,
+            &eventyr_store::metrics::NoopMetrics,
         )
         .await)
     }

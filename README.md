@@ -19,14 +19,14 @@ user-implementable trait), no ORM, no DDD toolkit.
 | Crate | Contents | Status |
 |---|---|---|
 | `eventyr` | Umbrella: re-exports core plus, behind features, the store/subscription/projection sides, and a prelude | shipped |
-| `eventyr-core` | `Aggregate`, protocol vocabulary (`StreamId`/`Version`/`Sequence`/`ExpectedVersion`/`StoreError`/envelope/`Metadata`), `WriteMachine`, `SubscriptionMachine`, upcast vocabulary (`Upcaster`/`RawEvent`/`UpcastError`) — `no_std + alloc`, zero deps | shipped |
-| `eventyr-store` | `EventStore`/`StreamsAll` ports, `InMemoryStore`, `drive_write` driver, `AggregateRepository`, prelude | shipped |
+| `eventyr-core` | `Aggregate`, protocol vocabulary (`StreamId`/`Version`/`Sequence`/`ExpectedVersion`/`StoreError`/envelope/`Metadata`), `WriteMachine`, `BatchMachine`, `BoundaryMachine` (dynamic consistency boundaries: `Tag`/`Tagged`/`Query`/`Decision`), `SubscriptionMachine`, upcast vocabulary (`Upcaster`/`RawEvent`/`UpcastError`) — `no_std + alloc`, zero deps | shipped |
+| `eventyr-store` | `EventStore`/`StreamsAll` ports, the opt-in `QueryAppend` and `CommitSignal` ports, `InMemoryStore`, `drive_write` driver, `AggregateRepository`, prelude | shipped |
 | `eventyr-macros` | `#[derive(Aggregate)]`, `#[derive(EventName)]` — convention wiring, sugar not API | shipped |
 | `eventyr-store-postgres` | sqlx-based `EventStore`/`StreamsAll` (`PgStore`, `append_events` PL/pgSQL, DESIGN §9's single-table sketch made real) — a standalone crate, not an umbrella feature yet | shipped |
 | `eventyr-projection` | Read-path correctness layer: `UpcasterChain`/`ClosureUpcaster`, `UpcastingSource` (raw→typed), `RebuildPlan`/`SchemaVersion`/`checkpoint_key` | shipped |
-| `eventyr-subscription` | Catch-up runner: `Projection` trait, `Projector`/`drive_projector` (`drive_projector_blocking` too), `Fanout`, `CheckpointStore`/`InMemoryCheckpointStore`, `StoreSubscription`; `EventBus` trait behind its `bus` feature | shipped |
+| `eventyr-subscription` | Catch-up runner: `Projection` trait, `Projector`/`drive_projector` (`drive_projector_blocking` too; `wake_on`/`drive_projector_woken` poll on commit instead of after the idle sleep), `Fanout`, `CheckpointStore`/`InMemoryCheckpointStore`, `StoreSubscription`; `EventBus` trait behind its `bus` feature | shipped |
 | `eventyr-store-fjall` | Embedded `EventStore`/`StreamsAll` over fjall — transactional appends, no server, driveable without an async runtime | shipped |
-| `eventyr-store-testing` | The store contract: `event_store_contract` / `streams_all_contract` / `snapshot_contract`, self-tested against the in-memory store | shipped |
+| `eventyr-store-testing` | The store contract: `event_store_contract` / `streams_all_contract` / `snapshot_contract` / `query_append_contract` / `commit_signal_contract`, self-tested against the in-memory store | shipped |
 
 Postgres persistence is a standalone crate today; the umbrella pulls it in
 as its own feature. The embedded store arrives as `eventyr-store-fjall`,

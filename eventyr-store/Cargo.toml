@@ -20,8 +20,10 @@ tracing = ["dep:tracing", "eventyr-core/std"]
 [dependencies]
 eventyr-core = { workspace = true }
 futures = { version = "0.3", default-features = false, features = ["alloc", "executor"] }
+# The in-process commit signal (0.7.2): a multi-listener wake-up.
+event-listener = "5"
 tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }

@@ -193,7 +193,7 @@ fn apply_failed_redelivers_the_whole_batch() {
     // Fetch[0] → Apply(1)[1] → Apply(2)[2] → (ApplyFailed) Sleep[3].
     assert!(matches!(
         actions[3],
-        SubscriptionAction::Sleep { for_ } if for_ == SubscriptionPolicy::default().retry_sleep
+        SubscriptionAction::Sleep { for_, .. } if for_ == SubscriptionPolicy::default().retry_sleep
     ));
     assert!(matches!(
         actions.last(),
@@ -400,4 +400,151 @@ async fn a_source_error_surfaces_as_a_failed_outcome() {
         matches!(outcome, SubscriptionOutcome::Failed(StoreError::Other(_))),
         "a mid-batch source error is fatal, got {outcome:?}"
     );
+}
+
+/// 0.7.2: a caught-up projector woken by the store's commit signal
+/// applies a new event long before its idle sleep would end.
+#[tokio::test]
+async fn a_commit_wakes_an_idle_projector() {
+    use std::time::Duration;
+
+    let store = Arc::new(InMemoryStore::new());
+    populate(&store, &[10]).await;
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let projector = Projector::new(
+        "woken",
+        StoreSubscription::new(Arc::clone(&store)),
+        InMemoryCheckpointStore::new(),
+        Seen(seen.clone()),
+    )
+    // An idle sleep far longer than the test may take.
+    .with_policy(SubscriptionPolicy::new(
+        64,
+        Duration::from_secs(3600),
+        Duration::from_secs(1),
+    ))
+    .wake_on(Arc::clone(&store));
+    let run = tokio::spawn(projector.run_woken(tokio::time::sleep));
+
+    wait_until(&seen, 1).await;
+    store
+        .append(
+            &StreamId::from("account-2"),
+            ExpectedVersion::Empty,
+            vec![NewEvent::new(20)],
+        )
+        .await
+        .expect("append");
+    tokio::time::timeout(Duration::from_secs(5), wait_until(&seen, 2))
+        .await
+        .expect("the commit woke the projector well before its idle sleep ended");
+    assert_eq!(*seen.lock().expect("poisoned"), vec![1, 2]);
+    run.abort();
+}
+
+/// Without a signal the same projector would sleep its full idle time:
+/// the wake-up is what makes the difference above.
+#[tokio::test]
+async fn without_a_signal_an_idle_projector_waits_out_its_sleep() {
+    use std::time::Duration;
+
+    let store = Arc::new(InMemoryStore::new());
+    populate(&store, &[10]).await;
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let projector = Projector::new(
+        "unwoken",
+        StoreSubscription::new(Arc::clone(&store)),
+        InMemoryCheckpointStore::new(),
+        Seen(seen.clone()),
+    )
+    .with_policy(SubscriptionPolicy::new(
+        64,
+        Duration::from_secs(3600),
+        Duration::from_secs(1),
+    ));
+    let run = tokio::spawn(projector.run(tokio::time::sleep));
+
+    wait_until(&seen, 1).await;
+    store
+        .append(
+            &StreamId::from("account-2"),
+            ExpectedVersion::Empty,
+            vec![NewEvent::new(20)],
+        )
+        .await
+        .expect("append");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), wait_until(&seen, 2))
+            .await
+            .is_err(),
+        "no signal: the projector is still asleep"
+    );
+    run.abort();
+}
+
+/// A backoff is not cut short by commits: a failing projection is
+/// retried on its schedule, not hammered on every write.
+#[tokio::test]
+async fn a_commit_does_not_cut_a_backoff_short() {
+    use std::time::Duration;
+
+    struct FailOnce(Arc<Mutex<Vec<u64>>>, bool);
+    impl Projection for FailOnce {
+        type Event = u64;
+        type Error = &'static str;
+        async fn apply(&mut self, event: &EventEnvelope<u64>) -> Result<(), Self::Error> {
+            if !self.1 {
+                self.1 = true;
+                return Err("first apply fails");
+            }
+            self.0
+                .lock()
+                .expect("poisoned")
+                .push(event.sequence.as_u64());
+            Ok(())
+        }
+    }
+
+    let store = Arc::new(InMemoryStore::new());
+    populate(&store, &[10]).await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let projector = Projector::new(
+        "backoff",
+        StoreSubscription::new(Arc::clone(&store)),
+        InMemoryCheckpointStore::new(),
+        FailOnce(seen.clone(), false),
+    )
+    .with_policy(SubscriptionPolicy::new(
+        64,
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+    ))
+    .wake_on(Arc::clone(&store));
+    let run = tokio::spawn(projector.run_woken(tokio::time::sleep));
+
+    // The first apply failed; the projector is in a one-hour backoff.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    store
+        .append(
+            &StreamId::from("account-2"),
+            ExpectedVersion::Empty,
+            vec![NewEvent::new(20)],
+        )
+        .await
+        .expect("append");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), wait_until(&seen, 1))
+            .await
+            .is_err(),
+        "the backoff ran its course despite the commit"
+    );
+    run.abort();
+}
+
+async fn wait_until(seen: &Arc<Mutex<Vec<u64>>>, count: usize) {
+    while seen.lock().expect("poisoned").len() < count {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }

@@ -428,6 +428,7 @@ dependencies = [
 name = "eventyr-store"
 version = "0.1.0"
 dependencies = [
+ "event-listener",
  "eventyr-core",
  "futures",
  "tokio",
@@ -459,6 +460,7 @@ dependencies = [
  "eventyr-projection",
  "eventyr-store",
  "eventyr-store-testing",
+ "eventyr-subscription",
  "futures",
  "serde",
  "serde_json",
