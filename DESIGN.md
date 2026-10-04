@@ -405,6 +405,7 @@ The `UNIQUE` constraint's backing index serves the per-stream lookups; no separa
 - **0.4** — shipped: the blocking write driver (`drive_write_blocking` / `drive_write_with_snapshots_blocking` in `eventyr-store`, `drive_projector_blocking` in `eventyr-subscription`), the contract-test crate (`eventyr-store-testing`: `event_store_contract`, `streams_all_contract`, `snapshot_contract`, `event_store_batch_contract` — the eventcore-testing idea as a callable suite, self-tested against the in-memory store and wired to gate the Postgres and fjall stores), the embedded store (`eventyr-store-fjall`: fjall-backed `EventStore`/`StreamsAll`/`SnapshotStore`, serde in the store, no runtime needed to drive), and multi-stream commands (eventcore-style, below).
 
 - **0.5** — **shipped**: no new subsystem, four width pieces — (1) the upcaster registry (`eventyr_core::version_registry`), (2) metadata/correlation made load-bearing at the driver boundary (`with_metadata` on both machines; `execute_with_metadata` on the repository), (3) the `Metrics` port + `tracing` instrumentation behind the `metrics` feature, and (4) **the worked example**: `eventyr/examples/bank.rs` — one domain touching every shipped feature (a derived `Account` aggregate with `Optional` state and payload-shaped events, two metadata-carrying opens, a cross-account transfer on the batch machine, a `Projection` ledger rebuilt off the stream, and the `AmountV1` → `Deposited` rename upcast end to end), runnable as a binary and gated as a test. See below.
+- **0.6** — shipped: sagas, views, SQLite; see §13. **0.7** — planned: dynamic consistency boundaries, live push, inline views, erasure, and operational hardening; see §14.
 
 ### 0.4 multi-stream commands — the shape
 
@@ -479,3 +480,70 @@ The single structural gap. `esrs` ships first-class `Policies` (fire-and-forget 
 ### 0.6 — what it is *not*
 
 Still no framework. No HTTP, no lambda, no serverless demo app, no code-generated aggregates beyond the existing derive sugar — and no message-bus *implementation* even though `esrs` ships two. The pieces that shipped (0.6.1, 0.6.3, 0.6.4) are all seams, stores, or machines: they add surface where the field already proves the pattern, and they keep every new capability behind a trait the caller instantiates.
+
+## 14. Competitive scan II (2026-10) and roadmap 0.7
+
+§13 compared Eventyr with the aggregate-centric Rust crates. This pass widens the field: the newer Rust crates (`disintegrate`, `happenstance`, `eventcore`, `sourcery`, UmaDB's `umadb-dcb`) and the strongest tools in other ecosystems (Marten, KurrentDB, Eventuous, Emmett, Axon). They agree on one structural shift and several operational pieces that 0.6 does not have. §2 still holds. Message-bus producers and gateways (Eventuous, `esrs`), web-framework glue (Emmett, Eventuous), actor hosting (`kameo_es`), and server-side projection runtimes (KurrentDB's JS projections) were all seen again and are rejected again on the same grounds.
+
+0.7 is planned, not shipped. Items are in priority order, and each names the seam it lands on, because "seam, store, or machine — never a runtime" remains the bar.
+
+### 0.7.1 — Dynamic consistency boundaries as a machine
+
+The field has moved here. `disintegrate`, `happenstance` (built entirely on it), UmaDB, and Marten 9 all implement the Dynamic Consistency Boundary (DCB) specification. Events carry **tags**. A decision reads the events a **query** selects (event types × tags), folds them into whatever state it needs, and appends conditioned on *nothing matching that query having been appended since the read*. The consistency boundary is the query, chosen per decision. It can span what aggregates would separate, without a saga.
+
+Eventyr's `BatchMachine` (0.4) is the fixed-boundary special case: the caller names the streams and each stream is guarded by its own version. §12 rejected `eventcore`'s `StreamResolver` because a boundary computed by the store is not a machine concept. DCB does not contradict that, because the *caller* still writes the query. It only replaces "set of streams" with "set of matching events" as the unit of conflict.
+
+- **`eventyr-core::boundary`**: a sans-IO `BoundaryMachine`. `Read(query)` → fold the selected events in sequence order → `decide` → `Append { events, condition: (query, after: Sequence) }`. A conflict re-reads and re-decides, exactly like the write machine's retry. Also an optional **validation query** (disintegrate's refinement): a narrower query used for the append condition than for the fold, so an event that changes the state without invalidating the decision (a deposit during a withdrawal) does not force a retry.
+- **The port**: a separate `QueryAppend` trait (`read(query)`, `append_if(events, condition)`), plus `tags` on `NewEvent`/`EventEnvelope`. It is opt-in per store, the way `StreamsAll` is opt-in today. `EventStore` stays the minimum.
+- **Stores**: in-memory and fjall (one write transaction, already serial). SQLite (single writer). Postgres via tag rows guarded by a captured-version predicate at read-committed isolation, which is Marten's approach, rather than `SERIALIZABLE`. A `query_append_contract` in `eventyr-store-testing` gates all four.
+
+`Aggregate` and `BatchMachine` stay. A stream is the degenerate query "this stream's tag", so a store that implements `QueryAppend` can run all three machines.
+
+### 0.7.2 — Live push from a shipped store
+
+0.3 shipped `EventBus` as a trait, and no store implements it, so every projector polls. `disintegrate-postgres` has a `listener` feature, SierraDB's subscriptions switch from history to live events without a gap, and Emmett and Eventuous treat real-time subscriptions as table stakes. 0.7.2 implements the bus for Postgres (`LISTEN`/`NOTIFY` on append, behind a `listener` feature) and for the in-memory store (a broadcast channel). The bus's §6 contract is unchanged: a push is only a wake-up hint, the checkpoint poll stays authoritative, and a lost notification costs latency, never correctness.
+
+### 0.7.3 — Inline views: the transactional half of 0.6.3
+
+§13 promised a view "persisted transactionally with the command". 0.6.3 shipped the subscriber-driven half (`ViewProjection` run by a `Projector`), which is eventually consistent. Marten and Emmett call the other half *inline* projections, and `esrs` calls it `TransactionalEventHandler`: the view row is written in the same transaction as the append, so a read straight after the write sees it. 0.7.3 adds an `InlineView` option to the Postgres and SQLite stores. The store applies registered `View`s to the committed envelopes inside the append transaction, and a failing view rolls back the append. Same `View` fold, same `ViewStore` rows, so a view can move between inline and async without a rewrite. Emmett documents the caveat, and it carries over: inline *multi-stream* views can contend under concurrent writes, so the docs steer those to the async path.
+
+### 0.7.4 — Filtered reads on the global stream
+
+`StreamsAll::stream_all` returns every event. A projection that wants only `account-*` streams, or three event types, reads the whole log and discards the rest on the client. KurrentDB filters on the server by stream prefix or event type, and Marten and Emmett have `canHandle` / category filters. 0.7.4 adds `stream_all_filtered(from, filter)` with a default implementation that filters on the client, so existing stores keep compiling, and indexed overrides for Postgres and SQLite. KurrentDB's subtlety comes with it: when matches are sparse, a filtered read must still report how far it has *scanned*, so the subscription machine can checkpoint past long unmatched runs instead of re-scanning them after every restart.
+
+### 0.7.5 — Event ids and idempotent commands
+
+`EventEnvelope` has no stable event id. `SagaProjection` leaves idempotency "each command's to keep", but gives the command nothing to key on. `kameo_es` tracks causation for idempotency, and the DCB reference implementation of *Understanding Event Sourcing* (`eventsourcing_book`) makes saga-issued commands idempotent by carrying the triggering event's id. 0.7.5 adds an `event_id` to the envelope (assigned at append, persisted by every store, checked by the contract suite) and an optional idempotency key on an interaction: the repository records `(key → committed outcome)`, and a replayed key returns the recorded outcome instead of re-deciding. The saga runner stamps the triggering event's id as the key, so at-least-once redelivery becomes effectively-once at the command boundary.
+
+### 0.7.6 — Stream lifecycle and data erasure
+
+Eventyr cannot delete, archive, or expire a stream. `eventyr-projection::rebuild` defers retention to the stores, and none of them provide it. The field covers this from several angles. KurrentDB has soft delete, hard delete (tombstone), `TruncateBefore`, and `$maxAge`/`$maxCount`. Marten archives streams to a cold partition. Axon Data Protection and `commanded-shredder` offer **crypto-shredding**: personal fields are encrypted under a per-data-subject key held outside the log, and deleting the key erases them without rewriting history. 0.7.6 has two parts:
+
+- **Lifecycle on the port**: `delete_stream` (soft: reads return empty, appends continue from the old version; and tombstone: further appends are refused) and `truncate_before`, both optional and both covered by a new contract tier. Projections see a lifecycle marker in the global stream, not a silent gap, so a view can drop its row.
+- **Crypto-shredding as a codec layer**: this is where the withdrawn 0.6.2 seam returns, wired end to end as its withdrawal note requires. A `KeyStore` port (in-memory plus one SQL implementation) and an encrypting codec that wraps a store's payload serialization. Encryption happens on append and decryption on read. A shredded field decodes to a declared replacement value, never to an error, because erasure must not break rebuilds.
+
+### 0.7.7 — Poison events: parking instead of stalling
+
+The projector runner backs off and redelivers indefinitely, so one event that a projection cannot apply stalls that projection permanently. KurrentDB parks a message after `maxRetryCount`, and Eventuous wraps handlers in retry policies. 0.7.7 adds a `FailurePolicy` to `SubscriptionPolicy`. `Retry(n)` then `Park` records the event in a `ParkedStore` (in-memory plus SQL, alongside checkpoints) and advances. `Halt` keeps today's behavior and stays the default, because skipping an event is a correctness decision the caller must opt into. Parked events can be listed and replayed. This is a new `SubscriptionMachine` transition, not a second machine.
+
+### 0.7.8 — Reading state without a command
+
+`AggregateRepository` only executes commands, so there is no `load(id)` for a query handler, a debugging tool, or an integration test. Marten also loads as of a version or timestamp. 0.7.8 adds `load(id)` and `load_at(id, version)` on the repository (snapshot-seeded where configured), plus `load_until(id, timestamp)` when the `time` feature is on. No machine is needed: it is one fold, which §7 keeps out of the machine table.
+
+### 0.7.9 — Projector exclusivity and partitioned processing
+
+Nothing stops two copies of the same projector from running against one checkpoint and corrupting the read model. Emmett names this problem and documents a single-replica workaround. 0.7.9 adds a `ProjectorLease` port (Postgres advisory lock or lease row, an in-memory implementation for tests) that the driver acquires before driving and renews between batches. A lost lease stops the driver cleanly. Partitioned parallelism comes after it and is deferred until the lease ships: hash events by stream id across N members, each with its own checkpoint, like Eventuous's partitioned subscriptions and KurrentDB's consumer strategies. Eventuous's out-of-order *checkpoint commit handler* is not needed under that design and is rejected as a single-checkpoint alternative, because it trades a simple invariant for gap bookkeeping.
+
+### Smaller items
+
+- **Projection testing**: a given/when/then `ProjectionScenario` next to `Scenario`, and a `caught_up()` future on the driver, so tests wait on a condition instead of sleeping (Emmett's `whenCaughtUp()` and `PostgreSQLProjectionSpec`).
+- **Focused examples**: `bank.rs` stays the end-to-end proof. A few single-topic examples (a DCB decision, an inline view, a shredded field, a parked event) follow the pieces above as they ship, like `sourcery`'s example set.
+
+### Deferred
+
+- **Multi-tenancy** (Marten's conjoined tenancy and per-tenant partitions, Emmett's partitioned tables). It is real demand, but in Eventyr it is mostly a store concern: a tenant column, per-tenant sequences, and per-tenant checkpoints. It waits until a user needs it and DCB tags have shown whether a tenant should be a tag or a partition.
+- **More official stores** (MySQL/DynamoDB like `cqrs-es`, KurrentDB/MongoDB like Eventuous). 0.6.4's position stands: the contract suite is what keeps third-party stores safe, and Eventyr does not maintain a fifth database.
+
+### 0.7 — what it is *not*
+
+Still no framework. DCB is a machine and a port. Live push, inline views, filtered reads, lifecycle, and leases are store capabilities behind opt-in traits. Event ids, parking, and erasure extend vocabulary and policy that already exist. Nothing in 0.7 adds a runtime, a transport, or a daemon the caller does not drive.
