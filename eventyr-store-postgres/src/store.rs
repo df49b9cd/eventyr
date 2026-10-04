@@ -185,9 +185,10 @@ where
                 correlations.push(new_event.metadata.correlation_id);
             }
 
-            let query =
-                format!("SELECT {EVENT_COLUMNS} FROM append_events($1, $2, $3, $4, $5, $6, $7)");
-            let rows = sqlx::query_as::<_, EventRow>(&query)
+            let query = sqlx::AssertSqlSafe(format!(
+                "SELECT {EVENT_COLUMNS} FROM append_events($1, $2, $3, $4, $5, $6, $7)"
+            ));
+            let rows = sqlx::query_as::<_, EventRow>(query)
                 .bind(kind)
                 .bind(exact)
                 .bind(stream_id.as_str())
@@ -214,11 +215,11 @@ where
         let pool = self.pool.clone();
         let stream_id = stream_id.clone();
         Box::pin(async_stream::stream! {
-            let query = format!(
+            let query = sqlx::AssertSqlSafe(format!(
                 "SELECT {EVENT_COLUMNS} FROM events WHERE stream_id = $1 AND stream_version > $2 \
                  ORDER BY stream_version"
-            );
-            let rows = sqlx::query_as::<_, EventRow>(&query)
+            ));
+            let rows = sqlx::query_as::<_, EventRow>(query)
             .bind(stream_id.as_str())
             .bind(from.as_u64().try_into().unwrap_or(i64::MAX))
             .fetch_all(&pool)
@@ -252,11 +253,11 @@ where
             const PAGE: i64 = 512;
             let mut cursor = from.as_u64().try_into().unwrap_or(i64::MAX);
             loop {
-                let query = format!(
+                let query = sqlx::AssertSqlSafe(format!(
                     "SELECT {EVENT_COLUMNS} FROM events WHERE global_sequence > $1 \
                      ORDER BY global_sequence LIMIT $2"
-                );
-                let rows = sqlx::query_as::<_, EventRow>(&query)
+                ));
+                let rows = sqlx::query_as::<_, EventRow>(query)
                     .bind(cursor)
                     .bind(PAGE)
                     .fetch_all(&pool)

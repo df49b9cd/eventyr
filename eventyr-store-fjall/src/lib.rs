@@ -6,7 +6,8 @@
 //! to drive it (fjall is synchronous; this store's futures resolve
 //! immediately, so [`drive_write_blocking`] parks nothing).
 //!
-//! One keyspace, three partitions:
+//! One database, three keyspaces (fjall 3's name for fjall 2's
+//! "partitions"):
 //!
 //! - **`streams`** — `"{stream_id}\0{version:016}"` → the serialized
 //!   event row; the zero separator keeps stream ids prefix-safe.
@@ -20,13 +21,13 @@
 //!   same transaction; each appended event's key stores its global
 //!   sequence in the value, and a `from`-range is impossible without a
 //!   sequence→key index — so stream iteration carries the global order
-//!   per partition, and the `global` partition also keeps
+//!   per keyspace, and the `global` keyspace also keeps
 //!   `stream_id\0version` keys of every event under `"{seq:016}\0"`
 //!   prefixes so a `stream_all` read is one range scan in sequence
 //!   order.
 //!
 //! All of it is transaction-atomic: one `WriteTransaction` checks the
-//! head, writes every event into both partitions, advances the head,
+//! head, writes every event into both keyspaces, advances the head,
 //! and commits — so appends are all-or-nothing exactly as
 //! [`EventStore::append`] promises, and `stream_all` never observes a
 //! partial batch.
@@ -35,6 +36,9 @@
 //! [`StreamsAll`]: eventyr_store::store::StreamsAll
 //! [`drive_write_blocking`]: eventyr_store::driver::drive_write_blocking
 //! [`ExpectedVersion`]: eventyr_core::vocabulary::ExpectedVersion
+//! [`Any`]: eventyr_core::vocabulary::ExpectedVersion::Any
+//! [`Empty`]: eventyr_core::vocabulary::ExpectedVersion::Empty
+//! [`Exact`]: eventyr_core::vocabulary::ExpectedVersion::Exact
 
 #![warn(missing_docs)]
 

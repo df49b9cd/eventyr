@@ -19,7 +19,7 @@ snapshots = []
 [dependencies]
 eventyr-core = { workspace = true, features = ["serde"] }
 eventyr-store = { workspace = true }
-fjall = { version = "2", features = ["single_writer_tx"] }
+fjall = { version = "3" }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 thiserror = { version = "2", default-features = false }

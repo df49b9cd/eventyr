@@ -2,7 +2,7 @@
 
 use std::sync::Mutex;
 
-use fjall::{Config, PartitionCreateOptions, TxKeyspace, TxPartitionHandle};
+use fjall::{KeyspaceCreateOptions, Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace};
 use futures::Stream;
 use futures::stream::iter;
 use serde::{Deserialize, Serialize};
@@ -48,22 +48,22 @@ struct StoredRow<E> {
 
 /// An embedded [`EventStore`] and [`StreamsAll`] over fjall.
 ///
-/// Shareable and cloneable (it wraps a [`fjall::Keyspace`]): clones
-/// point at the same partitions. All writes go through one
-/// `WriteTransaction`, serialized by a mutex — fjall's
-/// `single_writer_tx` accepts one writer at a time, and the lock is
+/// Shareable and cloneable (it wraps a [`fjall::SingleWriterTxDatabase`]):
+/// clones point at the same keyspaces. All writes go through one
+/// `WriteTransaction`, serialized by a mutex — fjall's single-writer
+/// database accepts one writer at a time, and the lock is
 /// held only across synchronous fjall calls.
 ///
 /// Construct via [`open`](FjallStore::open) (defaults) or
 /// [`from_keyspace`](FjallStore::from_keyspace) (a configured
-/// keyspace). Clone it to share; the partitions open once, at
+/// database). Clone it to share; the keyspaces open once, at
 /// construction.
 pub struct FjallStore<E> {
-    keyspace: TxKeyspace,
-    streams: TxPartitionHandle,
-    heads: TxPartitionHandle,
-    global: TxPartitionHandle,
-    meta: TxPartitionHandle,
+    keyspace: SingleWriterTxDatabase,
+    streams: SingleWriterTxKeyspace,
+    heads: SingleWriterTxKeyspace,
+    global: SingleWriterTxKeyspace,
+    meta: SingleWriterTxKeyspace,
     /// The write-side serialization point (see the type's docs).
     write_lock: Mutex<()>,
     _event: std::marker::PhantomData<fn() -> E>,
@@ -90,20 +90,19 @@ impl<E> FjallStore<E> {
     /// every commit — the append transaction's atomicity survives a
     /// crash; a fsync failure surfaces as `Other(fjall::Error::...)`.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, FjallStoreError> {
-        let keyspace = Config::new(path).open_transactional()?;
+        let keyspace = SingleWriterTxDatabase::builder(path).open()?;
         Self::from_keyspace(keyspace)
     }
 
     /// Open the partitions on an already-configured transactional
-    /// keyspace — the caller owns cache size, compaction policy, blob
+    /// database — the caller owns cache size, compaction policy, blob
     /// thresholds, everything.
-    pub fn from_keyspace(keyspace: TxKeyspace) -> Result<Self, FjallStoreError> {
-        let options = PartitionCreateOptions::default();
+    pub fn from_keyspace(keyspace: SingleWriterTxDatabase) -> Result<Self, FjallStoreError> {
         Ok(Self {
-            streams: keyspace.open_partition(PARTITION_STREAMS, options.clone())?,
-            heads: keyspace.open_partition(PARTITION_HEADS, options.clone())?,
-            global: keyspace.open_partition(PARTITION_GLOBAL, options.clone())?,
-            meta: keyspace.open_partition(PARTITION_META, options)?,
+            streams: keyspace.keyspace(PARTITION_STREAMS, KeyspaceCreateOptions::default)?,
+            heads: keyspace.keyspace(PARTITION_HEADS, KeyspaceCreateOptions::default)?,
+            global: keyspace.keyspace(PARTITION_GLOBAL, KeyspaceCreateOptions::default)?,
+            meta: keyspace.keyspace(PARTITION_META, KeyspaceCreateOptions::default)?,
             write_lock: Mutex::new(()),
             keyspace,
             _event: std::marker::PhantomData,
@@ -288,10 +287,7 @@ where
         let tx = self.keyspace.read_tx();
         let events: Vec<Result<EventEnvelope<E>, StoreError>> = tx
             .range(&self.streams, lower..upper)
-            .map(|item| match item {
-                Ok((_, value)) => self.decode(&value, stream_id),
-                Err(error) => Err(engine(error)),
-            })
+            .map(|guard| self.decode(&guard.value().map_err(engine)?, stream_id))
             .collect();
         iter(events)
     }
@@ -314,26 +310,23 @@ where
         let tx = self.keyspace.read_tx();
         let events: Vec<Result<EventEnvelope<E>, StoreError>> = tx
             .range(&self.global, lower..upper)
-            .map(|item| match item {
-                Ok((_, pointer)) => {
-                    // The pointer is the `streams` key
-                    // `"{stream_id}\0{version:016}"`: the row is at that
-                    // key, the stream id before its separator.
-                    let stream_id = pointer.iter().position(|&byte| byte == 0).map(|at| {
-                        StreamId::from(String::from_utf8_lossy(&pointer[..at]).into_owned())
-                    });
-                    match stream_id {
-                        Some(stream_id) => match tx.get(&self.streams, &pointer) {
-                            Ok(Some(bytes)) => self.decode(&bytes, &stream_id),
-                            Ok(None) => {
-                                Err(corrupt("a global-sequence pointer resolved to no row"))
-                            }
-                            Err(error) => Err(engine(error)),
-                        },
-                        None => Err(corrupt("a global-sequence key had no stream-id separator")),
-                    }
+            .map(|guard| {
+                let pointer = guard.value().map_err(engine)?;
+                // The pointer is the `streams` key
+                // `"{stream_id}\0{version:016}"`: the row is at that
+                // key, the stream id before its separator.
+                let stream_id = pointer
+                    .iter()
+                    .position(|&byte| byte == 0)
+                    .map(|at| StreamId::from(String::from_utf8_lossy(&pointer[..at]).into_owned()));
+                match stream_id {
+                    Some(stream_id) => match tx.get(&self.streams, &pointer) {
+                        Ok(Some(bytes)) => self.decode(&bytes, &stream_id),
+                        Ok(None) => Err(corrupt("a global-sequence pointer resolved to no row")),
+                        Err(error) => Err(engine(error)),
+                    },
+                    None => Err(corrupt("a global-sequence key had no stream-id separator")),
                 }
-                Err(error) => Err(engine(error)),
             })
             .collect();
         iter(events)
