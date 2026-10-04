@@ -69,3 +69,31 @@ fn sqlite_store_passes_the_commit_signal_contract() {
         SqliteStore::<ContractEvent>::open_in_memory().expect("open")
     });
 }
+
+/// The filtered-read contract needs a stored name that depends on the
+/// payload: even values are `"Even"`, odd ones `"Odd"`.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+struct ParityEvent(u64);
+
+impl EventName for ParityEvent {
+    fn event_name(&self) -> &'static str {
+        if self.0.is_multiple_of(2) {
+            "Even"
+        } else {
+            "Odd"
+        }
+    }
+}
+
+impl From<u64> for ParityEvent {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+#[test]
+fn sqlite_store_passes_the_filtered_read_contract() {
+    eventyr_store_testing::filtered_read_contract::<ParityEvent, _>(|| {
+        SqliteStore::<ParityEvent>::open_in_memory().expect("open")
+    });
+}

@@ -9,7 +9,7 @@ use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 use eventyr_store::notify::{CommitSignal, LocalCommitListener, LocalCommitSignal};
-use eventyr_store::store::{EventStore, QueryAppend, StreamsAll};
+use eventyr_store::store::{EventFilter, EventStore, FilteredRead, QueryAppend, StreamsAll};
 use futures::Stream;
 use futures::stream::iter;
 
@@ -408,6 +408,90 @@ where
         from: Sequence,
     ) -> impl Stream<Item = Result<EventEnvelope<E>, StoreError>> + Send {
         iter(read_after(&self.lock(), from))
+    }
+
+    /// Filter in the database (0.7.4): one connection, so the scan bound
+    /// and the matching rows come from the same state. The bound is the
+    /// `scan_limit`-th row after `from` (or the head, if nearer).
+    async fn stream_all_filtered(
+        &self,
+        from: Sequence,
+        filter: &EventFilter,
+        max: usize,
+        scan_limit: usize,
+    ) -> Result<FilteredRead<E>, StoreError> {
+        let conn = self.lock();
+        let from_i64 = from.as_u64() as i64;
+        let bound: Option<i64> = conn
+            .query_row(
+                "SELECT max(global_sequence) FROM ( \
+                     SELECT global_sequence FROM events WHERE global_sequence > ?1 \
+                     ORDER BY global_sequence LIMIT ?2)",
+                rusqlite::params![from_i64, scan_limit.max(1) as i64],
+                |row| row.get(0),
+            )
+            .map_err(SqliteStoreError::into_store)?;
+        let Some(bound) = bound else {
+            return Ok(FilteredRead {
+                events: Vec::new(),
+                scanned: from,
+            });
+        };
+        // Built from fixed fragments and numbered placeholders only;
+        // every filter value is a bound parameter.
+        let mut sql = format!(
+            "SELECT {EVENT_COLUMNS} FROM events WHERE global_sequence > ?1 AND global_sequence <= ?2"
+        );
+        let mut params: Vec<rusqlite::types::Value> = vec![from_i64.into(), bound.into()];
+        if !filter.stream_prefixes.is_empty() {
+            let clauses: Vec<String> = filter
+                .stream_prefixes
+                .iter()
+                .map(|prefix| {
+                    params.push(prefix.clone().into());
+                    // substr compares bytes exactly — LIKE would treat
+                    // `%`/`_` in a prefix as wildcards.
+                    format!(
+                        "substr(stream_id, 1, length(?{n})) = ?{n}",
+                        n = params.len()
+                    )
+                })
+                .collect();
+            sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
+        }
+        if !filter.event_types.is_empty() {
+            let placeholders: Vec<String> = filter
+                .event_types
+                .iter()
+                .map(|name| {
+                    params.push(name.clone().into());
+                    format!("?{}", params.len())
+                })
+                .collect();
+            sql.push_str(&format!(" AND event_type IN ({})", placeholders.join(", ")));
+        }
+        params.push((max as i64).into());
+        sql.push_str(&format!(
+            " ORDER BY global_sequence LIMIT ?{}",
+            params.len()
+        ));
+        let rows = conn
+            .prepare(&sql)
+            .and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params_from_iter(params), read_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(SqliteStoreError::into_store)?;
+        let full = rows.len() == max;
+        let events = rows
+            .into_iter()
+            .map(EventEnvelope::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let scanned = match events.last() {
+            Some(last) if full => last.sequence,
+            _ => Sequence::new(bound.max(0) as u64),
+        };
+        Ok(FilteredRead { events, scanned })
     }
 }
 

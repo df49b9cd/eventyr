@@ -92,7 +92,7 @@ pub mod prelude {
         Projection, Projector, drive_projector, drive_projector_with_metrics, drive_projector_woken,
     };
     pub use crate::saga::{SagaProjection, drive_saga};
-    pub use crate::source::{StoreSubscription, SubscriptionSource};
+    pub use crate::source::{FilteredSubscription, StoreSubscription, SubscriptionSource};
     pub use eventyr_core::saga::{
         Saga, SagaAction, SagaCommand, SagaInput, SagaMachine, SagaOutcome,
     };
@@ -101,4 +101,5 @@ pub mod prelude {
         SubscriptionOutcome, SubscriptionPolicy,
     };
     pub use eventyr_store::notify::{CommitListener, CommitSignal, LocalCommitSignal, NoSignal};
+    pub use eventyr_store::store::EventFilter;
 }

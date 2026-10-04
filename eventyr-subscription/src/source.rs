@@ -14,8 +14,9 @@ use futures::{StreamExt, TryStreamExt};
 
 use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
+use eventyr_core::event_name::EventName;
 use eventyr_core::subscription::{Batch, Checkpoint};
-use eventyr_store::store::StreamsAll;
+use eventyr_store::store::{EventFilter, StreamsAll};
 
 /// A pollable event source: the store-facing half of a subscription.
 ///
@@ -86,6 +87,65 @@ where
             .await?;
         let upper = events.last().map(|e| Checkpoint::new(e.sequence));
         Ok(Batch::new(events, upper))
+    }
+}
+
+/// A filtered subscription source (0.7.4): only the events `filter`
+/// selects, with the read's scan progress reported so the checkpoint
+/// moves past events the filter skipped.
+///
+/// Without the scan bound a projection over a sparse filter — one
+/// account's events in a busy log — checkpoints only at its own
+/// matches, and every restart re-reads everything since the last one.
+/// With it, each poll acks how far it looked.
+pub struct FilteredSubscription<S> {
+    store: S,
+    filter: EventFilter,
+    scan_limit: usize,
+}
+
+impl<S> FilteredSubscription<S> {
+    /// How many events one poll looks at, at most, by default.
+    pub const DEFAULT_SCAN_LIMIT: usize = 4096;
+
+    /// A source over `store` delivering what `filter` selects.
+    pub fn new(store: S, filter: EventFilter) -> Self {
+        Self {
+            store,
+            filter,
+            scan_limit: Self::DEFAULT_SCAN_LIMIT,
+        }
+    }
+
+    /// Builder-style: look at no more than `scan_limit` events per
+    /// poll (at least 1). A poll that finds nothing still reports its
+    /// progress, so the bound trades poll cost against polls per
+    /// unmatched run.
+    pub fn scan_limit(mut self, scan_limit: usize) -> Self {
+        self.scan_limit = scan_limit.max(1);
+        self
+    }
+
+    /// The wrapped store.
+    pub fn into_inner(self) -> S {
+        self.store
+    }
+}
+
+impl<S> SubscriptionSource for FilteredSubscription<S>
+where
+    S: StreamsAll + Send + Sync,
+    S::Event: Send + EventName,
+{
+    type Event = S::Event;
+
+    async fn fetch(&self, from: Checkpoint, max: usize) -> Result<Batch<Self::Event>, StoreError> {
+        let read = self
+            .store
+            .stream_all_filtered(from.as_sequence(), &self.filter, max, self.scan_limit)
+            .await?;
+        let upper = read.events.last().map(|e| Checkpoint::new(e.sequence));
+        Ok(Batch::new(read.events, upper).scanned_to(Checkpoint::new(read.scanned)))
     }
 }
 

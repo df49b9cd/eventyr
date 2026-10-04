@@ -37,6 +37,7 @@
 mod batch_store;
 mod commit_signal;
 mod event_store;
+mod filtered;
 mod query_append;
 mod snapshot_store;
 mod streams_all;
@@ -44,6 +45,7 @@ mod streams_all;
 pub use batch_store::event_store_batch_contract;
 pub use commit_signal::commit_signal_contract;
 pub use event_store::{ContractEvent, event_store_contract};
+pub use filtered::filtered_read_contract;
 pub use query_append::query_append_contract;
 pub use snapshot_store::snapshot_contract;
 pub use streams_all::streams_all_contract;

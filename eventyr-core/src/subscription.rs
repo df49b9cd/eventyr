@@ -103,6 +103,18 @@ pub struct Batch<E> {
     /// Highest sequence in `events`: the ack target. `None` exactly when
     /// `events` is empty (a caught-up poll acknowledges nothing).
     pub upper: Option<Checkpoint>,
+    /// How far a *filtered* source scanned (0.7.4): every sequence up to
+    /// here was delivered, filtered out, or is a permanent gap. `None`
+    /// for unfiltered sources, where the scan ends at `upper`.
+    ///
+    /// When it lies past `upper` the machine acks it instead, so a
+    /// projection over a sparse filter checkpoints past long unmatched
+    /// runs rather than re-scanning them after every restart. A batch
+    /// with no events but a scan past the checkpoint is acked without
+    /// applying anything. It must never lie below `upper`, and a source
+    /// may only report it under `StreamsAll`'s visibility rule — no
+    /// later sequence visible before an earlier one that will commit.
+    pub scanned: Option<Checkpoint>,
 }
 
 impl<E> Batch<E> {
@@ -111,6 +123,7 @@ impl<E> Batch<E> {
         Self {
             events: Vec::new(),
             upper: None,
+            scanned: None,
         }
     }
 
@@ -118,7 +131,18 @@ impl<E> Batch<E> {
     /// or `None` exactly when `events` is empty. The machine validates
     /// both invariants on arrival regardless.
     pub fn new(events: Vec<EventEnvelope<E>>, upper: Option<Checkpoint>) -> Self {
-        Self { events, upper }
+        Self {
+            events,
+            upper,
+            scanned: None,
+        }
+    }
+
+    /// Builder-style: the source scanned through `scanned` (see
+    /// [`scanned`](Self::scanned)).
+    pub fn scanned_to(mut self, scanned: Checkpoint) -> Self {
+        self.scanned = Some(scanned);
+        self
     }
 }
 
@@ -429,7 +453,30 @@ impl<E: Clone> SubscriptionMachine<E> {
             }
             last = sequence;
         }
+        // A filtered source may have scanned past its last delivery
+        // (0.7.4). The scan bound may not trail the deliveries, and a
+        // scan that went nowhere is no progress.
+        let scanned = match (batch.scanned, batch.upper) {
+            (Some(scanned), Some(upper)) if scanned < upper => {
+                return self.violation("`Fetched` reported a scan bound below its last event");
+            }
+            (Some(scanned), _) if scanned < self.acked => {
+                return self.violation("`Fetched` reported a scan bound behind the checkpoint");
+            }
+            (Some(scanned), _) if scanned > self.acked => Some(scanned),
+            _ => None,
+        };
         match (batch.events.is_empty(), batch.upper) {
+            (true, None) if scanned.is_some() => {
+                // Nothing matched, but the scan moved: ack it without
+                // applying anything.
+                self.upper = scanned;
+                self.stop_after_ack = self.phase == Phase::DrainingForStop;
+                self.phase = Phase::Acking;
+                SubscriptionAction::Ack {
+                    checkpoint: scanned.expect("matched on is_some"),
+                }
+            }
             (true, None) => {
                 if self.phase == Phase::DrainingForStop {
                     let checkpoint = self.acked;
@@ -449,7 +496,9 @@ impl<E: Clone> SubscriptionMachine<E> {
             }
             (false, Some(upper)) if upper.as_sequence().as_u64() == last => {
                 let draining_for_stop = self.phase == Phase::DrainingForStop;
-                self.upper = Some(upper);
+                // The ack target: the scan bound when it lies past the
+                // last event.
+                self.upper = Some(scanned.map_or(upper, |scanned| scanned.max(upper)));
                 self.pending = batch.events;
                 self.cursor = 0;
                 self.stop_after_ack = draining_for_stop;
@@ -1080,6 +1129,13 @@ mod tests {
                     batch: batch(events),
                 }
             }),
+            // Filtered polls (0.7.4): a scan bound anywhere, valid or not.
+            (arb_sequence(), 0usize..3, arb_sequence()).prop_map(|(start, len, scanned)| {
+                let events: Vec<_> = (0..len as u64).map(|i| envelope(start + i + 1)).collect();
+                SubscriptionInput::Fetched {
+                    batch: batch(events).scanned_to(Checkpoint::new(Sequence::new(scanned))),
+                }
+            }),
             Just(SubscriptionInput::Applied),
             Just(SubscriptionInput::ApplyFailed {
                 error: StoreError::other("boom"),
@@ -1091,6 +1147,126 @@ mod tests {
             Just(SubscriptionInput::Shutdown),
         ]
         .boxed()
+    }
+
+    // -- filtered sources (0.7.4) ---------------------------------------
+
+    fn at(sequence: u64) -> Checkpoint {
+        Checkpoint::new(Sequence::new(sequence))
+    }
+
+    #[test]
+    fn a_scan_past_the_last_event_is_acked() {
+        let mut m = machine();
+        m.start();
+        m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(3)]).scanned_to(at(40)),
+        });
+        let action = m.handle(SubscriptionInput::Applied);
+        assert!(matches!(
+            action,
+            SubscriptionAction::Ack { checkpoint } if checkpoint == at(40)
+        ));
+        m.handle(SubscriptionInput::Acked);
+        assert_eq!(m.checkpoint(), at(40));
+    }
+
+    #[test]
+    fn a_scan_with_no_matches_is_acked_without_applying() {
+        let mut m = machine();
+        m.start();
+        let action = m.handle(SubscriptionInput::Fetched {
+            batch: Batch::empty().scanned_to(at(500)),
+        });
+        assert!(matches!(
+            action,
+            SubscriptionAction::Ack { checkpoint } if checkpoint == at(500)
+        ));
+        let action = m.handle(SubscriptionInput::Acked);
+        assert!(matches!(
+            action,
+            SubscriptionAction::Fetch { from, .. } if from == at(500)
+        ));
+    }
+
+    #[test]
+    fn a_scan_that_went_nowhere_is_a_caught_up_poll() {
+        let mut m = SubscriptionMachine::<AccountEvent>::new(SubscriptionPolicy::default(), at(9));
+        m.start();
+        let action = m.handle(SubscriptionInput::Fetched {
+            batch: Batch::empty().scanned_to(at(9)),
+        });
+        assert!(matches!(
+            action,
+            SubscriptionAction::Sleep {
+                reason: SleepReason::Idle,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_failed_scan_ack_redelivers_from_the_old_checkpoint() {
+        let mut m = machine();
+        m.start();
+        m.handle(SubscriptionInput::Fetched {
+            batch: Batch::empty().scanned_to(at(500)),
+        });
+        m.handle(SubscriptionInput::AckFailed);
+        assert_eq!(m.checkpoint(), Checkpoint::ORIGIN);
+        let action = m.handle(SubscriptionInput::Slept);
+        assert!(matches!(
+            action,
+            SubscriptionAction::Fetch { from, .. } if from == Checkpoint::ORIGIN
+        ));
+    }
+
+    #[test]
+    fn a_shutdown_while_draining_acks_the_scan_then_stops() {
+        let mut m = machine();
+        m.start();
+        m.handle(SubscriptionInput::Fetched {
+            batch: Batch::empty(),
+        });
+        // Sleeping: the shutdown re-reads once.
+        m.handle(SubscriptionInput::Shutdown);
+        let action = m.handle(SubscriptionInput::Fetched {
+            batch: Batch::empty().scanned_to(at(70)),
+        });
+        assert!(matches!(action, SubscriptionAction::Ack { .. }));
+        let action = m.handle(SubscriptionInput::Acked);
+        assert!(matches!(
+            action,
+            SubscriptionAction::Fetch { .. } | SubscriptionAction::Done(_)
+        ));
+        if let SubscriptionAction::Fetch { .. } = action {
+            let action = m.handle(SubscriptionInput::Fetched {
+                batch: Batch::empty(),
+            });
+            assert!(matches!(
+                action,
+                SubscriptionAction::Done(SubscriptionOutcome::Stopped { checkpoint }) if checkpoint == at(70)
+            ));
+        }
+    }
+
+    #[test]
+    fn scan_bounds_that_break_the_rules_are_violations() {
+        // Below the batch's last event.
+        let mut m = machine();
+        m.start();
+        let action = m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(5)]).scanned_to(at(4)),
+        });
+        assert!(is_protocol_violation(&action));
+
+        // Behind the checkpoint.
+        let mut m = SubscriptionMachine::<AccountEvent>::new(SubscriptionPolicy::default(), at(10));
+        m.start();
+        let action = m.handle(SubscriptionInput::Fetched {
+            batch: Batch::empty().scanned_to(at(3)),
+        });
+        assert!(is_protocol_violation(&action));
     }
 
     proptest! {

@@ -405,7 +405,7 @@ The `UNIQUE` constraint's backing index serves the per-stream lookups; no separa
 - **0.4** — shipped: the blocking write driver (`drive_write_blocking` / `drive_write_with_snapshots_blocking` in `eventyr-store`, `drive_projector_blocking` in `eventyr-subscription`), the contract-test crate (`eventyr-store-testing`: `event_store_contract`, `streams_all_contract`, `snapshot_contract`, `event_store_batch_contract` — the eventcore-testing idea as a callable suite, self-tested against the in-memory store and wired to gate the Postgres and fjall stores), the embedded store (`eventyr-store-fjall`: fjall-backed `EventStore`/`StreamsAll`/`SnapshotStore`, serde in the store, no runtime needed to drive), and multi-stream commands (eventcore-style, below).
 
 - **0.5** — **shipped**: no new subsystem, four width pieces — (1) the upcaster registry (`eventyr_core::version_registry`), (2) metadata/correlation made load-bearing at the driver boundary (`with_metadata` on both machines; `execute_with_metadata` on the repository), (3) the `Metrics` port + `tracing` instrumentation behind the `metrics` feature, and (4) **the worked example**: `eventyr/examples/bank.rs` — one domain touching every shipped feature (a derived `Account` aggregate with `Optional` state and payload-shaped events, two metadata-carrying opens, a cross-account transfer on the batch machine, a `Projection` ledger rebuilt off the stream, and the `AmountV1` → `Deposited` rename upcast end to end), runnable as a binary and gated as a test. See below.
-- **0.6** — shipped: sagas, views, SQLite; see §13. **0.7** — in progress (0.7.1–0.7.3 shipped), planned: dynamic consistency boundaries, live push, inline views, erasure, and operational hardening; see §14.
+- **0.6** — shipped: sagas, views, SQLite; see §13. **0.7** — in progress (0.7.1–0.7.4 shipped), planned: dynamic consistency boundaries, live push, inline views, erasure, and operational hardening; see §14.
 
 ### 0.4 multi-stream commands — the shape
 
@@ -533,6 +533,14 @@ Emmett's contention caveat does not carry over to Postgres the way the plan abov
 ### 0.7.4 — Filtered reads on the global stream
 
 `StreamsAll::stream_all` returns every event. A projection that wants only `account-*` streams, or three event types, reads the whole log and discards the rest on the client. KurrentDB filters on the server by stream prefix or event type, and Marten and Emmett have `canHandle` / category filters. 0.7.4 adds `stream_all_filtered(from, filter)` with a default implementation that filters on the client, so existing stores keep compiling, and indexed overrides for Postgres and SQLite. KurrentDB's subtlety comes with it: when matches are sparse, a filtered read must still report how far it has *scanned*, so the subscription machine can checkpoint past long unmatched runs instead of re-scanning them after every restart.
+
+**Shipped.** `StreamsAll::stream_all_filtered(from, filter, max, scan_limit)` returns a `FilteredRead` with the selected events and `scanned`, the highest sequence the read looked at. `EventFilter` selects by stream-id prefix and stored event name (KurrentDB's two server-side filters, minus regular expressions). The default implementation filters `stream_all` on the client. Postgres and SQLite override it: they read the scan bound first (the `scan_limit`-th row after `from`, or the head if nearer), then the matching rows up to that bound. A commit landing between the two reads is therefore past the bound and is never skipped. Prefixes match byte for byte (`starts_with` on Postgres, `substr` on SQLite, never `LIKE`), so `%` and `_` in a stream id are ordinary characters.
+
+On the subscription side, `Batch` gained `scanned`. The machine acks it when it lies past the batch's last event, and a batch with no events but a scan past the checkpoint is acked without applying anything. A scan bound below the last event or behind the checkpoint is a protocol violation. `FilteredSubscription` is the source, and its `scan_limit` (4096 by default) bounds one poll's cost over a sparse filter.
+
+The scan bound leans on `StreamsAll`'s visibility rule: no sequence below it may become visible later. On Postgres that is 0006's commit-order lock. Before it, the scan bound would have been a second way to skip a late-committing event.
+
+`filtered_read_contract` gates the default (in-memory and fjall) and both overrides. An end-to-end driver test runs a projector over one matching event followed by 500 non-matching ones and checks that the persisted checkpoint is the head. With the scan bound dropped, it stays at sequence 1 and the test fails.
 
 ### 0.7.5 — Event ids and idempotent commands
 

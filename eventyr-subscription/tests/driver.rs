@@ -548,3 +548,76 @@ async fn wait_until(seen: &Arc<Mutex<Vec<u64>>>, count: usize) {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
+
+/// 0.7.4: a filtered projector checkpoints past events its filter
+/// skipped. Without the scan bound its checkpoint would stay at its
+/// last match, and every restart would re-read the unmatched tail.
+#[tokio::test]
+async fn a_filtered_projector_checkpoints_past_skipped_events() {
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    struct Named(u64);
+    impl eventyr_core::event_name::EventName for Named {
+        fn event_name(&self) -> &'static str {
+            "Named"
+        }
+    }
+
+    struct Count(Arc<Mutex<Vec<u64>>>);
+    impl Projection for Count {
+        type Event = Named;
+        type Error = core::convert::Infallible;
+        async fn apply(&mut self, event: &EventEnvelope<Named>) -> Result<(), Self::Error> {
+            self.0.lock().expect("poisoned").push(event.event.0);
+            Ok(())
+        }
+    }
+
+    let store = Arc::new(InMemoryStore::new());
+    store
+        .append(
+            &StreamId::from("account-1"),
+            ExpectedVersion::Empty,
+            vec![NewEvent::new(Named(1))],
+        )
+        .await
+        .expect("append");
+    let noise: Vec<_> = (0..500).map(|n| NewEvent::new(Named(n))).collect();
+    store
+        .append(&StreamId::from("order-1"), ExpectedVersion::Empty, noise)
+        .await
+        .expect("append");
+
+    let checkpoints = Arc::new(InMemoryCheckpointStore::new());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let outcome = Projector::new(
+        "accounts",
+        FilteredSubscription::new(
+            Arc::clone(&store),
+            EventFilter::all().stream_prefix("account-"),
+        )
+        .scan_limit(64),
+        Arc::clone(&checkpoints),
+        Count(seen.clone()),
+    )
+    .with_policy(SubscriptionPolicy::default().stop_at_catch_up())
+    .run(|_| future::ready(()))
+    .await
+    .expect("run");
+
+    assert_eq!(*seen.lock().expect("poisoned"), vec![1]);
+    let SubscriptionOutcome::CaughtUp { checkpoint } = outcome else {
+        panic!("expected CaughtUp, got {outcome:?}");
+    };
+    assert_eq!(
+        checkpoint,
+        Checkpoint::new(Sequence::new(501)),
+        "the checkpoint reached the head, not the last match"
+    );
+    assert_eq!(
+        CheckpointStore::load(&*checkpoints, "accounts")
+            .await
+            .expect("load"),
+        checkpoint,
+        "and it was persisted"
+    );
+}

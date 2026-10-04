@@ -94,6 +94,127 @@ pub trait StreamsAll: EventStore {
         &self,
         from: Sequence,
     ) -> impl Stream<Item = Result<EventEnvelope<Self::Event>, StoreError>> + Send;
+
+    /// Read up to `max` events after `from` that `filter` selects, and
+    /// report how far the read scanned (0.7.4).
+    ///
+    /// The [`FilteredRead`]'s `scanned` is the highest sequence the read
+    /// looked at — delivered, filtered out, or skipped as a gap — so a
+    /// subscription over a sparse filter can checkpoint past long
+    /// unmatched runs. The ordering and visibility rules of
+    /// [`stream_all`](Self::stream_all) apply to it too: nothing below
+    /// `scanned` may become visible later.
+    ///
+    /// The default filters on the client, over
+    /// [`stream_all`](Self::stream_all), looking at no more than
+    /// `scan_limit` events, so a read over a sparse filter returns
+    /// progress instead of walking the whole log. Stores that can
+    /// filter in the database override it.
+    fn stream_all_filtered(
+        &self,
+        from: Sequence,
+        filter: &EventFilter,
+        max: usize,
+        scan_limit: usize,
+    ) -> impl Future<Output = Result<FilteredRead<Self::Event>, StoreError>> + Send
+    where
+        Self::Event: EventName,
+    {
+        let filter = filter.clone();
+        let all = self.stream_all(from);
+        async move {
+            futures::pin_mut!(all);
+            let mut events = Vec::new();
+            let mut scanned = from;
+            let mut looked = 0usize;
+            while events.len() < max && looked < scan_limit {
+                let Some(envelope) = futures::StreamExt::next(&mut all).await else {
+                    break;
+                };
+                let envelope = envelope?;
+                looked += 1;
+                scanned = envelope.sequence;
+                if filter.selects(&envelope) {
+                    events.push(envelope);
+                }
+            }
+            Ok(FilteredRead { events, scanned })
+        }
+    }
+}
+
+/// Which events a filtered global read delivers (0.7.4): those whose
+/// stream id starts with one of `stream_prefixes` (any stream when
+/// empty) *and* whose stored name is one of `event_types` (any type
+/// when empty).
+///
+/// The two server-side filters KurrentDB offers, minus regular
+/// expressions: prefixes and names index well, and a projection that
+/// needs more selects on the client.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventFilter {
+    /// Accepted stream-id prefixes; empty accepts every stream.
+    pub stream_prefixes: Vec<String>,
+    /// Accepted stored event names ([`EventName`]); empty accepts every
+    /// type.
+    pub event_types: Vec<String>,
+}
+
+impl EventFilter {
+    /// The filter that selects every event.
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// Builder-style: accept streams starting with `prefix` (adding to
+    /// any prefixes already accepted).
+    pub fn stream_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.stream_prefixes.push(prefix.into());
+        self
+    }
+
+    /// Builder-style: accept events with these stored names (adding to
+    /// any already accepted).
+    pub fn event_types<I, T>(mut self, types: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        self.event_types.extend(types.into_iter().map(Into::into));
+        self
+    }
+
+    /// Whether the filter accepts every event.
+    pub fn is_all(&self) -> bool {
+        self.stream_prefixes.is_empty() && self.event_types.is_empty()
+    }
+
+    /// Whether an event of `event_type` on `stream_id` passes.
+    pub fn matches(&self, stream_id: &str, event_type: &str) -> bool {
+        (self.stream_prefixes.is_empty()
+            || self
+                .stream_prefixes
+                .iter()
+                .any(|prefix| stream_id.starts_with(prefix.as_str())))
+            && (self.event_types.is_empty()
+                || self.event_types.iter().any(|name| name == event_type))
+    }
+
+    /// Whether `envelope` passes.
+    pub fn selects<E: EventName>(&self, envelope: &EventEnvelope<E>) -> bool {
+        self.matches(envelope.stream_id.as_str(), envelope.event.event_name())
+    }
+}
+
+/// The answer to [`StreamsAll::stream_all_filtered`]: the selected
+/// events, and how far the read scanned.
+#[derive(Clone, Debug)]
+pub struct FilteredRead<E> {
+    /// The selected events, in global order.
+    pub events: Vec<EventEnvelope<E>>,
+    /// The highest sequence the read looked at (the read's `from` when
+    /// it looked at nothing). At least the last event's sequence.
+    pub scanned: Sequence,
 }
 
 /// A store that can serve dynamic consistency boundaries (0.7.1): read
@@ -223,6 +344,19 @@ macro_rules! impl_port_delegation {
                 from: Sequence,
             ) -> impl Stream<Item = Result<EventEnvelope<Self::Event>, StoreError>> + Send {
                 (**self).stream_all(from)
+            }
+
+            fn stream_all_filtered(
+                &self,
+                from: Sequence,
+                filter: &EventFilter,
+                max: usize,
+                scan_limit: usize,
+            ) -> impl Future<Output = Result<FilteredRead<Self::Event>, StoreError>> + Send
+            where
+                Self::Event: EventName,
+            {
+                (**self).stream_all_filtered(from, filter, max, scan_limit)
             }
         }
     };

@@ -358,11 +358,8 @@ async fn execute_with_metadata_stamps_every_committed_event() {
     repo.execute(AccountId(9), AccountCommand::Open { owner: "me".into() })
         .await
         .expect("open");
-    let metadata = eventyr_core::envelope::Metadata {
-        causation_id: Some("cmd-42".into()),
-        correlation_id: Some("request-7".into()),
-        ..Default::default()
-    };
+    let metadata =
+        eventyr_core::envelope::Metadata::of_ids(Some("cmd-42".into()), Some("request-7".into()));
     repo.execute_with_metadata(
         AccountId(9),
         AccountCommand::Deposit { amount: 5 },

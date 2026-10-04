@@ -429,3 +429,38 @@ fn a_later_sequence_never_commits_before_an_earlier_one() {
         assert!(sequences[0].1 < sequences[1].1);
     });
 }
+
+/// The filtered-read contract needs a stored name that depends on the
+/// payload: even values are `"Even"`, odd ones `"Odd"`.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+struct ParityEvent(u64);
+
+impl EventName for ParityEvent {
+    fn event_name(&self) -> &'static str {
+        if self.0.is_multiple_of(2) {
+            "Even"
+        } else {
+            "Odd"
+        }
+    }
+}
+
+impl From<u64> for ParityEvent {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+#[test]
+#[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
+fn pg_store_passes_the_filtered_read_contract() {
+    let url = std::env::var("EVENTYR_TEST_PG_URL")
+        .expect("EVENTYR_TEST_PG_URL must point at a real Postgres");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let _guard = runtime.enter();
+    eventyr_store_testing::filtered_read_contract::<ParityEvent, _>(|| fresh_store(&runtime, &url));
+}

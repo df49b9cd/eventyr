@@ -14,7 +14,7 @@ use eventyr_core::envelope::{EventEnvelope, Metadata, NewEvent};
 use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
-use eventyr_store::store::{EventStore, QueryAppend, StreamsAll};
+use eventyr_store::store::{EventFilter, EventStore, FilteredRead, QueryAppend, StreamsAll};
 use futures::Stream;
 use sqlx::postgres::PgPool;
 
@@ -566,6 +566,77 @@ where
                 }
             }
         })
+    }
+
+    /// Filter in the database (0.7.4). Two queries, one snapshot each:
+    /// the scan bound is the `scan_limit`-th row after `from` (or the
+    /// head, if nearer), and the events are the matching rows up to that
+    /// bound. The bound is read first, so a commit landing between the
+    /// queries is beyond it and is never skipped. The commit-order lock
+    /// (0006) is what makes "no later sequence before an earlier one"
+    /// hold for the bound itself.
+    ///
+    /// Prefixes match with `starts_with`, which uses the
+    /// `(stream_id, stream_version)` index for a single prefix; names
+    /// use the `(event_type, global_sequence)` index from 0005.
+    fn stream_all_filtered(
+        &self,
+        from: Sequence,
+        filter: &EventFilter,
+        max: usize,
+        scan_limit: usize,
+    ) -> impl Future<Output = Result<FilteredRead<E>, StoreError>> + Send {
+        let pool = self.pool.clone();
+        let filter = filter.clone();
+        async move {
+            let from_i64: i64 = from.as_u64().try_into().unwrap_or(i64::MAX);
+            let scan_limit = i64::try_from(scan_limit.max(1)).unwrap_or(i64::MAX);
+            let bound: Option<i64> = sqlx::query_scalar(
+                "SELECT max(global_sequence) FROM ( \
+                     SELECT global_sequence FROM events WHERE global_sequence > $1 \
+                     ORDER BY global_sequence LIMIT $2 \
+                 ) AS scan_window",
+            )
+            .bind(from_i64)
+            .bind(scan_limit)
+            .fetch_one(&pool)
+            .await
+            .map_err(PgStoreError::into_store)?;
+            let Some(bound) = bound else {
+                return Ok(FilteredRead {
+                    events: Vec::new(),
+                    scanned: from,
+                });
+            };
+            let max = i64::try_from(max).unwrap_or(i64::MAX);
+            let query = sqlx::AssertSqlSafe(format!(
+                "SELECT {EVENT_COLUMNS} FROM events \
+                 WHERE global_sequence > $1 AND global_sequence <= $2 \
+                   AND (cardinality($3::text[]) = 0 \
+                        OR EXISTS (SELECT 1 FROM unnest($3::text[]) AS p \
+                                   WHERE starts_with(stream_id, p))) \
+                   AND (cardinality($4::text[]) = 0 OR event_type = ANY($4)) \
+                 ORDER BY global_sequence LIMIT $5"
+            ));
+            let rows = sqlx::query_as::<_, EventRow>(query)
+                .bind(from_i64)
+                .bind(bound)
+                .bind(&filter.stream_prefixes)
+                .bind(&filter.event_types)
+                .bind(max)
+                .fetch_all(&pool)
+                .await
+                .map_err(PgStoreError::into_store)?;
+            let full = rows.len() as i64 == max;
+            let events = decode_rows::<E>(rows)?;
+            // A read that filled `max` stopped at its last event; one
+            // that did not looked at everything up to the bound.
+            let scanned = match events.last() {
+                Some(last) if full => last.sequence,
+                _ => Sequence::new(u64::try_from(bound).unwrap_or(0)),
+            };
+            Ok(FilteredRead { events, scanned })
+        }
     }
 }
 
