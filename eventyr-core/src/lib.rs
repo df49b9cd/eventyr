@@ -141,6 +141,7 @@ pub mod prelude {
         Batch, Checkpoint, SubscriptionAction, SubscriptionInput, SubscriptionMachine,
         SubscriptionOutcome, SubscriptionPolicy,
     };
+    pub use crate::testing::{Outcome, Scenario};
     pub use crate::upcast::{RawEvent, Upcaster};
     pub use crate::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
     pub use crate::write::{RetryPolicy, WriteAction, WriteInput, WriteMachine, WriteOutcome};

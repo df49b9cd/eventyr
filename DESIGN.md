@@ -376,7 +376,7 @@ The `UNIQUE` constraint's backing index serves the per-stream lookups; no separa
 - **Pure core = table-driven tests.** `decide`/`apply` test with plain asserts, no mocks, no async, no store. Given/when/then helpers in `eventyr::testing`.
 - **Machines = transition tests.** Each machine gets exhaustive transition tests: a `Vec` of inputs → expected action sequence (what `drive_scripted` returns). Conflict-retry, at-least-once redelivery, and checkpoint resume are all tested as pure data — the tests that are hardest to write against a real store become trivial. This is the sans-IO payoff: the concurrency-critical 10% of the library gets the strongest verification, not the weakest.
 - **In-memory store** doubles as the acceptance-test store; contract tests (a `StoreContract` test-suite trait, eventcore-testing style) that any third-party store must pass to claim compatibility.
-- **`TestScenario`** (0.2): `given(events).when(command).then(events)` — the API that makes the library feel good, borrowed from eventcore's testing crate.
+- **`TestScenario`** (0.2, shipped): `Scenario::given(id, events).when(command).then_events(events)` in `eventyr_core::testing`, re-exported through the prelude — pure domain tests with labeled assertion failures, borrowed from eventcore's testing crate.
 - **Verification discipline** (mnesis's bar): proptest for machine invariants (e.g. "a machine that receives `Appended` always emits `Done`", "checkpoint never regresses"), `miri` in CI for the `no_std` core, `trybuild` for macro diagnostics.
 
 ## 11. What we take from each library
@@ -398,7 +398,7 @@ The `UNIQUE` constraint's backing index serves the per-stream lookups; no separa
 ## 12. Roadmap
 
 - **0.1** — shipped. Core traits + protocol vocabulary, `WriteMachine` with transition tests, in-memory store, async + scripted drivers, repository wrapper, derive macros.
-- **0.2** — partially shipped: Postgres store + migrations (`eventyr-store-postgres`), upcasters (upcast vocabulary in core, chains and raw→typed sources in `eventyr-projection`), checkpointed subscriptions (`SubscriptionMachine`, the projector runner). Pending: `TestScenario` (`given(events).when(command).then(events)`).
+- **0.2** — partially shipped: Postgres store + migrations (`eventyr-store-postgres`), upcasters (upcast vocabulary in core, chains and raw→typed sources in `eventyr-projection`), checkpointed subscriptions (`SubscriptionMachine`, the projector runner). Also shipped: `TestScenario` (`Scenario`/`Outcome` in `eventyr_core::testing`).
 - **0.3** — partially shipped: the projection read path (upcaster chains, schema-versioned rebuilds), `EventBus` trait (behind `eventyr-subscription`'s `bus` feature). Pending: snapshot support (opt-in, `SnapshotMachine`). Single-feed fan-out to N projections on one checkpoint, if ever built, is a combinator over the existing `SubscriptionMachine` (`Fanout` multiplexing the one `Apply` action to N idempotent members) — never a new machine, and deferred until a "must advance together" use case justifies it.
 - **0.4+** — multi-stream commands (eventcore-style), embedded stores (fjall/sled) + the blocking driver, contract-test crate.
 
