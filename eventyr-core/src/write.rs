@@ -546,7 +546,10 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
             }
         } else {
             self.phase = Phase::Done;
-            WriteAction::Done(WriteOutcome::Failed(StoreError::Conflict { current }))
+            WriteAction::Done(WriteOutcome::Failed(StoreError::Conflict {
+                stream_id: Some(self.stream_id.clone()),
+                current,
+            }))
         }
     }
 
@@ -821,7 +824,7 @@ mod tests {
         });
         assert!(matches!(
             action,
-            WriteAction::Done(WriteOutcome::Failed(StoreError::Conflict { current }))
+            WriteAction::Done(WriteOutcome::Failed(StoreError::Conflict { current, .. }))
                 if current == Version::new(5)
         ));
     }

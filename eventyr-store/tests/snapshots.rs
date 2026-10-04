@@ -238,7 +238,7 @@ async fn snapshots_on_conflict_retry_still_converges() {
         .expect("the competitor commits");
 
     match store.append(&stream_id, expected, events).await {
-        Err(StoreError::Conflict { current }) => {
+        Err(StoreError::Conflict { current, .. }) => {
             assert_eq!(current, Version::new(3));
             let action = machine.handle(WriteInput::Conflict { current });
             // The retry reloads the delta from the folded version — the

@@ -194,7 +194,7 @@ async fn conflict_retry_commits_against_fresh_state() {
 
     // A's append now conflicts; the machine must reload the delta and
     // re-decide against the fresh balance.
-    let Err(StoreError::Conflict { current }) = store.append(&stream_id, expected, events).await
+    let Err(StoreError::Conflict { current, .. }) = store.append(&stream_id, expected, events).await
     else {
         unreachable!("the expectation no longer matches")
     };
@@ -260,7 +260,7 @@ async fn conflict_beyond_the_retry_budget_fails() {
         .expect("competing append wins the race");
 
     // ...and A's conflict is terminal: NEVER means no reload.
-    let Err(StoreError::Conflict { current }) = store.append(&stream_id, expected, events).await
+    let Err(StoreError::Conflict { current, .. }) = store.append(&stream_id, expected, events).await
     else {
         unreachable!("the expectation no longer matches")
     };
@@ -320,6 +320,14 @@ impl EventStore for LoadFails {
         _from: Version,
     ) -> impl Stream<Item = Result<EventEnvelope<AccountEvent>, StoreError>> + Send {
         futures::stream::iter(vec![Err(StoreError::Unavailable)])
+    }
+
+    // The batch path uses the same failing reads as the single one.
+    async fn append_batch(
+        &self,
+        appends: Vec<eventyr_core::batch::StreamAppend<AccountEvent>>,
+    ) -> Result<Vec<eventyr_core::batch::CommittedStream<AccountEvent>>, StoreError> {
+        eventyr_store::store::append_batch_fallback(self, appends).await
     }
 }
 

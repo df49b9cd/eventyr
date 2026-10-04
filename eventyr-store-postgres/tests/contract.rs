@@ -49,4 +49,5 @@ fn pg_store_passes_the_contract() {
     let make_store = || store.clone();
     eventyr_store_testing::event_store_contract::<ContractEvent, _>(make_store);
     eventyr_store_testing::streams_all_contract::<ContractEvent, _>(make_store);
+    eventyr_store_testing::event_store_batch_contract::<ContractEvent, _>(make_store);
 }

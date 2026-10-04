@@ -8,6 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::aggregate::Aggregate;
+use crate::batch::{BatchAction, BatchInput, BatchMachine, Decide};
 use crate::subscription::{SubscriptionAction, SubscriptionInput, SubscriptionMachine};
 use crate::write::{WriteAction, WriteInput, WriteMachine};
 
@@ -40,6 +41,20 @@ pub fn projector_scripted<E: Clone>(
     machine: &mut SubscriptionMachine<E>,
     script: impl IntoIterator<Item = SubscriptionInput<E>>,
 ) -> Vec<SubscriptionAction<E>> {
+    let mut actions = Vec::new();
+    actions.push(machine.start());
+    for input in script {
+        actions.push(machine.handle(input));
+    }
+    actions
+}
+
+/// The [`BatchMachine`] sibling of [`drive_scripted`]: feeds `script`
+/// verbatim, recording every action in order.
+pub fn batch_scripted<E, Err, D: Decide<E, Err>>(
+    machine: &mut BatchMachine<E, Err, D>,
+    script: impl IntoIterator<Item = BatchInput<E>>,
+) -> Vec<BatchAction<E, Err>> {
     let mut actions = Vec::new();
     actions.push(machine.start());
     for input in script {

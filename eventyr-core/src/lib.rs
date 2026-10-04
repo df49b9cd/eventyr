@@ -121,6 +121,7 @@ pub mod __private {
 }
 
 pub mod aggregate;
+pub mod batch;
 pub mod envelope;
 pub mod error;
 pub mod event_name;
@@ -135,6 +136,10 @@ pub mod prelude {
     //! The common vocabulary: import everything and define an aggregate.
 
     pub use crate::aggregate::{Aggregate, AggregateId};
+    pub use crate::batch::{
+        AggregateFold, BatchAction, BatchDecision, BatchInput, BatchMachine, BatchOutcome,
+        CommittedStream, Decide, Fold, NoFold, StreamAppend,
+    };
     pub use crate::envelope::{EventEnvelope, Metadata, NewEvent};
     pub use crate::error::{ProtocolError, StoreError, UpcastError};
     pub use crate::event_name::EventName;

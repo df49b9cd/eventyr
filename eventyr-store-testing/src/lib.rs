@@ -32,10 +32,12 @@
 //! machine-driven driver must be unable to tell a conforming store
 //! from the in-memory one.
 
+mod batch_store;
 mod event_store;
 mod snapshot_store;
 mod streams_all;
 
+pub use batch_store::event_store_batch_contract;
 pub use event_store::{ContractEvent, event_store_contract};
 pub use snapshot_store::snapshot_contract;
 pub use streams_all::streams_all_contract;

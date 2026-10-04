@@ -67,7 +67,7 @@ async fn append_read_conflict_stream_all() {
         .expect_err("the stream is no longer empty");
     assert!(matches!(
         conflict,
-        eventyr_core::error::StoreError::Conflict { current } if current == Version::new(1)
+        eventyr_core::error::StoreError::Conflict { current, .. } if current == Version::new(1)
     ));
 
     // 3. Exact matches the live max; the wrong exact value conflicts.
@@ -81,7 +81,7 @@ async fn append_read_conflict_stream_all() {
         .expect_err("the stream is at 1, not 5");
     assert!(matches!(
         conflict,
-        eventyr_core::error::StoreError::Conflict { current } if current == Version::new(1)
+        eventyr_core::error::StoreError::Conflict { current, .. } if current == Version::new(1)
     ));
 
     store

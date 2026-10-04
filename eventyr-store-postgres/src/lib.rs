@@ -63,18 +63,19 @@ impl PgStoreError {
     /// connection-level failure as [`StoreError::Unavailable`], anything
     /// else as fatal-by-construction.
     pub(crate) fn into_store(error: sqlx::Error) -> StoreError {
-        let conflict_current = error
+        let conflict = error
             .as_database_error()
             .and_then(|db| db.try_downcast_ref::<PgDatabaseError>())
             .and_then(|pg| parse_conflict_hint(pg.code(), pg.hint()));
-        Self::classify(conflict_current, error)
+        Self::classify(conflict, error)
     }
 
     /// The classification itself, split from the sqlx plumbing so the
     /// branches are unit-testable without a database.
-    fn classify(conflict_current: Option<u64>, error: sqlx::Error) -> StoreError {
-        match conflict_current {
-            Some(current) => StoreError::Conflict {
+    fn classify(conflict: Option<(Option<String>, u64)>, error: sqlx::Error) -> StoreError {
+        match conflict {
+            Some((stream_id, current)) => StoreError::Conflict {
+                stream_id: stream_id.map(eventyr_core::vocabulary::StreamId::from),
                 current: eventyr_core::vocabulary::Version::new(current),
             },
             None => match error {
@@ -88,13 +89,26 @@ impl PgStoreError {
 }
 
 /// The function raises a version conflict as `RAISE EXCEPTION ... USING
-/// HINT = <current-version>`; read the hint, not the message text. Any
-/// other SQLSTATE — or a hint that is not a version — is not a conflict.
-fn parse_conflict_hint(code: &str, hint: Option<&str>) -> Option<u64> {
+/// HINT = <hint>`; read the hint, not the message text. The hint is
+/// either `"{version}"` (the single-stream `append_events`) or
+/// `"{stream_id}:{version}"` (the batch function, which names the
+/// stream) — either way the store surfaces the stream it knows and the
+/// version it saw. Any other SQLSTATE — or a hint that is not a version
+/// — is not a conflict.
+fn parse_conflict_hint(code: &str, hint: Option<&str>) -> Option<(Option<String>, u64)> {
     if code != RAISE_EXCEPTION {
         return None;
     }
-    hint?.trim().parse().ok()
+    let hint = hint?.trim();
+    // `"{stream_id}:{version}"` splits on the last colon; a bare
+    // `"{version}"` has none.
+    match hint.rsplit_once(':') {
+        Some((stream_id, version)) => Some((
+            Some(stream_id.to_string()),
+            version.trim().parse().ok()?,
+        )),
+        None => Some((None, hint.parse().ok()?)),
+    }
 }
 
 impl From<PgStoreError> for StoreError {
@@ -109,8 +123,19 @@ mod tests {
 
     #[test]
     fn conflict_hint_only_for_raised_exception_with_numeric_hint() {
-        assert_eq!(parse_conflict_hint(RAISE_EXCEPTION, Some("1")), Some(1));
-        assert_eq!(parse_conflict_hint(RAISE_EXCEPTION, Some(" 42 ")), Some(42));
+        assert_eq!(
+            parse_conflict_hint(RAISE_EXCEPTION, Some("1")),
+            Some((None, 1))
+        );
+        assert_eq!(
+            parse_conflict_hint(RAISE_EXCEPTION, Some(" 42 ")),
+            Some((None, 42))
+        );
+        // A batch conflict's hint names the stream before the colon.
+        assert_eq!(
+            parse_conflict_hint(RAISE_EXCEPTION, Some("account-7:9")),
+            Some((Some("account-7".to_string()), 9))
+        );
         // The same hint on any other SQLSTATE is not a conflict.
         assert_eq!(parse_conflict_hint("23505", Some("1")), None);
         // A raised exception without a numeric hint carries no version.
@@ -121,8 +146,8 @@ mod tests {
     #[test]
     fn classify_conflict_reads_the_hint_version() {
         let before = sqlx::Error::RowNotFound;
-        match PgStoreError::classify(Some(7), before) {
-            StoreError::Conflict { current } => {
+        match PgStoreError::classify(Some((None, 7)), before) {
+            StoreError::Conflict { current, .. } => {
                 assert_eq!(current, eventyr_core::vocabulary::Version::new(7));
             }
             other => panic!("expected a conflict, got {other:?}"),

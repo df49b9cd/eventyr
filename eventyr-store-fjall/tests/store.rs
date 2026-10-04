@@ -51,6 +51,16 @@ fn fjall_store_passes_the_streams_all_contract() {
 }
 
 #[test]
+fn fjall_store_passes_the_append_batch_contract() {
+    eventyr_store_testing::event_store_batch_contract::<ContractEvent, _>(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FjallStore::<ContractEvent>::open(dir.path()).expect("open");
+        std::mem::forget(dir);
+        store
+    });
+}
+
+#[test]
 fn blocking_driver_commits_through_the_embedded_store() {
     use std::fmt;
 

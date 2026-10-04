@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use futures::Stream;
 use futures::stream::iter;
 
+use eventyr_core::batch::{CommittedStream, StreamAppend};
 use eventyr_core::envelope::{EventEnvelope, NewEvent};
 use eventyr_core::error::StoreError;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
@@ -32,6 +33,60 @@ impl<E> Default for Inner<E> {
             streams: HashMap::new(),
             global: Vec::new(),
         }
+    }
+}
+
+impl<E: Clone> Inner<E> {
+    fn current_version(&self, stream_id: &StreamId) -> u64 {
+        self.streams
+            .get(stream_id)
+            .map_or(0, |stream| stream.len() as u64)
+    }
+
+    /// Check the expectation against the stream and write the batch,
+    /// assigning stream and global positions. Caller holds the lock;
+    /// conflicts short-circuit before anything is written.
+    fn append_one(
+        &mut self,
+        stream_id: &StreamId,
+        expected: ExpectedVersion,
+        events: Vec<NewEvent<E>>,
+    ) -> Result<Vec<EventEnvelope<E>>, StoreError> {
+        let current = self.current_version(stream_id);
+        if !matches_expected(expected, current) {
+            return Err(StoreError::Conflict {
+                stream_id: Some(stream_id.clone()),
+                current: Version::new(current),
+            });
+        }
+
+        let base_sequence = self.global.len() as u64;
+        let mut committed = Vec::with_capacity(events.len());
+        // Split the fields so the stream vec and the global vec can be
+        // written in the same loop.
+        let Inner { streams, global } = self;
+        let stream = streams.entry(stream_id.clone()).or_default();
+        for (index, new_event) in events.into_iter().enumerate() {
+            let envelope = EventEnvelope {
+                sequence: Sequence::new(base_sequence + index as u64 + 1),
+                stream_id: stream_id.clone(),
+                version: Version::new(current + index as u64 + 1),
+                event: new_event.event,
+                metadata: new_event.metadata,
+            };
+            stream.push(envelope.clone());
+            global.push(envelope.clone());
+            committed.push(envelope);
+        }
+        Ok(committed)
+    }
+}
+
+fn matches_expected(expected: ExpectedVersion, current: u64) -> bool {
+    match expected {
+        ExpectedVersion::Any => true,
+        ExpectedVersion::Empty => current == 0,
+        ExpectedVersion::Exact(version) => current == version.as_u64(),
     }
 }
 
@@ -87,39 +142,35 @@ where
         events: Vec<NewEvent<E>>,
     ) -> Result<Vec<EventEnvelope<E>>, StoreError> {
         let mut inner = self.lock();
-        let current = inner
-            .streams
-            .get(stream_id)
-            .map_or(0, |stream| stream.len() as u64);
+        let stream_id = stream_id.clone();
+        let mut committed = inner.append_one(&stream_id, expected, events)?;
+        Ok(committed.split_off(0))
+    }
 
-        let matches = match expected {
-            ExpectedVersion::Any => true,
-            ExpectedVersion::Empty => current == 0,
-            ExpectedVersion::Exact(version) => current == version.as_u64(),
-        };
-        if !matches {
-            return Err(StoreError::Conflict {
-                current: Version::new(current),
-            });
+    /// Append the whole batch under the one lock — trivially atomic:
+    /// pass 1 checks every expectation, pass 2 writes. The global
+    /// sequence is assigned in input order across the batch.
+    async fn append_batch(
+        &self,
+        appends: Vec<StreamAppend<E>>,
+    ) -> Result<Vec<CommittedStream<E>>, StoreError> {
+        let mut inner = self.lock();
+        // Pass 1: every expectation, before anything is written.
+        for append in &appends {
+            let current = inner.current_version(&append.stream_id);
+            if !matches_expected(append.expected, current) {
+                return Err(StoreError::Conflict {
+                    stream_id: Some(append.stream_id.clone()),
+                    current: Version::new(current),
+                });
+            }
         }
-
-        let base_sequence = inner.global.len() as u64;
-        let mut committed = Vec::with_capacity(events.len());
-        // Split the guard's fields so the stream vec and the global vec
-        // can be written in the same loop.
-        let Inner { streams, global } = &mut *inner;
-        let stream = streams.entry(stream_id.clone()).or_default();
-        for (index, new_event) in events.into_iter().enumerate() {
-            let envelope = EventEnvelope {
-                sequence: Sequence::new(base_sequence + index as u64 + 1),
-                stream_id: stream_id.clone(),
-                version: Version::new(current + index as u64 + 1),
-                event: new_event.event,
-                metadata: new_event.metadata,
-            };
-            stream.push(envelope.clone());
-            global.push(envelope.clone());
-            committed.push(envelope);
+        // Pass 2: write, knowing the whole batch's expectations held.
+        let mut committed = Vec::with_capacity(appends.len());
+        for append in appends {
+            let stream_id = append.stream_id.clone();
+            let events = inner.append_one(&stream_id, append.expected, append.events)?;
+            committed.push(CommittedStream { stream_id, events });
         }
         Ok(committed)
     }
@@ -214,7 +265,7 @@ mod tests {
             .expect_err("stream is no longer empty");
         assert!(matches!(
             error,
-            StoreError::Conflict { current } if current == Version::new(1)
+            StoreError::Conflict { current, .. } if current == Version::new(1)
         ));
 
         // `Exact` with the wrong version.
@@ -227,7 +278,7 @@ mod tests {
         .expect_err("version does not match");
         assert!(matches!(
             error,
-            StoreError::Conflict { current } if current == Version::new(1)
+            StoreError::Conflict { current, .. } if current == Version::new(1)
         ));
 
         // `Exact` with the right version, and `Any`, both succeed.

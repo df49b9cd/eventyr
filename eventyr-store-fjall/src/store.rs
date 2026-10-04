@@ -7,6 +7,7 @@ use futures::Stream;
 use futures::stream::iter;
 use serde::{Deserialize, Serialize};
 
+use eventyr_core::batch::{CommittedStream, StreamAppend};
 use eventyr_core::envelope::{EventEnvelope, Metadata, NewEvent};
 use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
@@ -83,6 +84,8 @@ impl<E> Clone for FjallStore<E> {
     }
 }
 
+type WrittenStream<E> = (StreamId, Vec<EventEnvelope<E>>);
+
 impl<E> FjallStore<E> {
     /// Open (or create) a store at `path` with fjall's defaults.
     ///
@@ -144,6 +147,129 @@ impl<E> FjallStore<E> {
             .ok_or_else(|| corrupt("the sequence counter is not 8 bytes"))
     }
 
+    /// The append path, single- or multi-stream: one write transaction
+    /// checks every head, writes every event, advances the heads and
+    /// the sequence counter, and commits — all-or-nothing across the
+    /// whole batch, under the single-writer lock.
+    ///
+    /// `appends` yields `(stream_id, expected, events)`; the returned
+    /// vec pairs each input's stream with its committed envelopes, in
+    /// input order. The global sequence is assigned in input order.
+    fn write_batch(
+        &self,
+        appends: impl IntoIterator<Item = (StreamId, ExpectedVersion, Vec<NewEvent<E>>)>,
+    ) -> Result<Vec<WrittenStream<E>>, StoreError>
+    where
+        E: EventName + serde::Serialize,
+    {
+        // The whole interaction is one write transaction (single
+        // writer): check every head, then write everything, or write
+        // nothing.
+        let _guard = self.lock();
+        let mut tx = self.keyspace.write_tx();
+
+        let appends: Vec<(StreamId, ExpectedVersion, Vec<NewEvent<E>>)> =
+            appends.into_iter().collect();
+
+        // Pass 1: every head, before anything is written.
+        let mut currents = Vec::with_capacity(appends.len());
+        for (stream_id, expected, _) in &appends {
+            let current = match tx.get(&self.heads, stream_id.as_str()).map_err(engine)? {
+                Some(head) => u64::from_be_bytes(
+                    *head
+                        .first_chunk::<8>()
+                        .ok_or_else(|| corrupt("the head is not 8 bytes"))?,
+                ),
+                None => 0,
+            };
+            let matches = match expected {
+                ExpectedVersion::Any => true,
+                ExpectedVersion::Empty => current == 0,
+                ExpectedVersion::Exact(version) => current == version.as_u64(),
+            };
+            if !matches {
+                return Err(StoreError::Conflict {
+                    stream_id: Some(stream_id.clone()),
+                    current: Version::new(current),
+                });
+            }
+            currents.push(current);
+        }
+
+        let mut total_events = 0usize;
+        for (_, _, events) in &appends {
+            total_events += events.len();
+        }
+        let next = if total_events > 0 {
+            match tx.get(&self.meta, KEY_NEXT_SEQUENCE).map_err(engine)? {
+                Some(value) => self.read_next_sequence(&value)?,
+                None => 0,
+            }
+        } else {
+            // No events to write: the counter stays, the batch is a
+            // commit of nothing.
+            0
+        };
+
+        // Pass 2: write, knowing every expectation held.
+        let mut sequence_offset = 0u64;
+        let mut committed = Vec::with_capacity(appends.len());
+        for ((stream_id, _, events), current) in appends.into_iter().zip(currents) {
+            let mut envelopes = Vec::with_capacity(events.len());
+            for (index, event) in events.into_iter().enumerate() {
+                let version = Version::new(current + index as u64 + 1);
+                sequence_offset += 1;
+                let sequence = Sequence::new(next + sequence_offset);
+                let row = StoredRow {
+                    sequence: sequence.as_u64(),
+                    version: version.as_u64(),
+                    event_type: event.event.event_name().to_string(),
+                    payload: event.event,
+                    causation_id: event.metadata.causation_id.clone(),
+                    correlation_id: event.metadata.correlation_id.clone(),
+                };
+                let bytes = serde_json::to_vec(&row).map_err(corrupt)?;
+                let key = Self::stream_key(&stream_id, version);
+                tx.insert(&self.streams, key, bytes);
+                tx.insert(
+                    &self.global,
+                    format!("{:016}", sequence.as_u64()),
+                    Self::stream_key(&stream_id, version),
+                );
+                envelopes.push(EventEnvelope {
+                    sequence,
+                    stream_id: stream_id.clone(),
+                    version,
+                    event: row.payload,
+                    metadata: Metadata {
+                        causation_id: row.causation_id,
+                        correlation_id: row.correlation_id,
+                        ..Metadata::default()
+                    },
+                });
+            }
+            tx.insert(
+                &self.heads,
+                stream_id.as_str(),
+                (current + envelopes.len() as u64).to_be_bytes(),
+            );
+            committed.push((stream_id, envelopes));
+        }
+
+        // Advance the counter once, by the whole batch — and only when
+        // anything was written, so an empty batch leaves no trace.
+        if total_events > 0 {
+            tx.insert(
+                &self.meta,
+                KEY_NEXT_SEQUENCE,
+                (next + sequence_offset).to_be_bytes(),
+            );
+        }
+        tx.commit().map_err(engine)?;
+
+        Ok(committed)
+    }
+
     fn decode(&self, bytes: &[u8], stream_id: &StreamId) -> Result<EventEnvelope<E>, StoreError>
     where
         E: serde::de::DeserializeOwned,
@@ -192,86 +318,38 @@ where
         let this = self.clone();
         let stream_id = stream_id.clone();
         async move {
-            if events.is_empty() {
-                return Ok(Vec::new());
-            }
+            let mut committed =
+                this.write_batch(std::iter::once((stream_id, expected, events)))?;
+            // One append in the batch: the write already committed; the
+            // caller asked for the single stream's envelopes.
+            debug_assert_eq!(committed.len(), 1);
+            Ok(committed.remove(0).1)
+        }
+    }
 
-            // The whole interaction is one write transaction (single
-            // writer): check the head, then write everything, or write
-            // nothing.
-            let _guard = this.lock();
-            let mut tx = this.keyspace.write_tx();
-
-            let current = match tx.get(&this.heads, stream_id.as_str()).map_err(engine)? {
-                Some(head) => u64::from_be_bytes(
-                    *head
-                        .first_chunk::<8>()
-                        .ok_or_else(|| corrupt("the head is not 8 bytes"))?,
-                ),
-                None => 0,
-            };
-            let matches = match expected {
-                ExpectedVersion::Any => true,
-                ExpectedVersion::Empty => current == 0,
-                ExpectedVersion::Exact(version) => current == version.as_u64(),
-            };
-            if !matches {
-                return Err(StoreError::Conflict {
-                    current: Version::new(current),
-                });
-            }
-
-            let next = match tx.get(&this.meta, KEY_NEXT_SEQUENCE).map_err(engine)? {
-                Some(value) => this.read_next_sequence(&value)?,
-                None => 0,
-            };
-
-            let mut committed = Vec::with_capacity(events.len());
-            for (index, event) in events.into_iter().enumerate() {
-                let version = Version::new(current + index as u64 + 1);
-                let sequence = Sequence::new(next + index as u64 + 1);
-                let row = StoredRow {
-                    sequence: sequence.as_u64(),
-                    version: version.as_u64(),
-                    event_type: event.event.event_name().to_string(),
-                    payload: event.event,
-                    causation_id: event.metadata.causation_id.clone(),
-                    correlation_id: event.metadata.correlation_id.clone(),
-                };
-                let bytes = serde_json::to_vec(&row).map_err(corrupt)?;
-                let key = Self::stream_key(&stream_id, version);
-                tx.insert(&this.streams, key, bytes);
-                tx.insert(
-                    &this.global,
-                    format!("{:016}", sequence.as_u64()),
-                    Self::stream_key(&stream_id, version),
-                );
-                committed.push(EventEnvelope {
-                    sequence,
-                    stream_id: stream_id.clone(),
-                    version,
-                    event: row.payload,
-                    metadata: Metadata {
-                        causation_id: row.causation_id,
-                        correlation_id: row.correlation_id,
-                        ..Metadata::default()
-                    },
-                });
-            }
-
-            tx.insert(
-                &this.heads,
-                stream_id.as_str(),
-                (current + committed.len() as u64).to_be_bytes(),
-            );
-            tx.insert(
-                &this.meta,
-                KEY_NEXT_SEQUENCE,
-                (next + committed.len() as u64).to_be_bytes(),
-            );
-            tx.commit().map_err(engine)?;
-
-            Ok(committed)
+    /// Append the whole batch in one write transaction: every head
+    /// checked before any write, then every event written, the heads
+    /// and the sequence counter advanced, one commit — so the batch is
+    /// all-or-nothing exactly as
+    /// [`append_batch`](EventStore::append_batch) promises, and
+    /// `stream_all` never observes it partially.
+    fn append_batch(
+        &self,
+        appends: Vec<StreamAppend<E>>,
+    ) -> impl std::future::Future<Output = Result<Vec<CommittedStream<E>>, StoreError>> + Send {
+        let this = self.clone();
+        async move {
+            this.write_batch(
+                appends
+                    .into_iter()
+                    .map(|a| (a.stream_id, a.expected, a.events)),
+            )
+            .map(|appends| {
+                appends
+                    .into_iter()
+                    .map(|(stream_id, events)| CommittedStream { stream_id, events })
+                    .collect()
+            })
         }
     }
 

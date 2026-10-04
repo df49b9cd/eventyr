@@ -6,18 +6,20 @@ use core::fmt;
 
 use crate::vocabulary::Version;
 
-/// The failure kinds the write protocol distinguishes.
-///
-/// Store implementations map their concrete errors into these at the port
-/// boundary; [`Other`](StoreError::Other) carries the source along for
-/// diagnostics. [`Clone`]-able, so drivers can record every action and
-/// input they see.
+/// A store operation failed — a stream read, an append, or a
+/// snapshot read. (A snapshot read failing fails the interaction: the
+/// store just told the machine its reads are broken.)
 #[derive(Clone, Debug)]
 pub enum StoreError {
-    /// Optimistic-concurrency violation: the stream is at `current`, not
-    /// at the expected version. The write machine may retry.
+    /// Optimistic-concurrency violation: the append's target is at
+    /// `current`, not at the expected version. The write machine may
+    /// retry. `stream_id` names the conflicting stream when the store
+    /// knows it (a batch names it); a single-stream append leaves it
+    /// `None` — the caller already knows its stream.
     Conflict {
-        /// The stream's actual version at append time.
+        /// The conflicting stream, when the store knows it.
+        stream_id: Option<crate::vocabulary::StreamId>,
+        /// The conflicting stream's actual version at append time.
         current: Version,
     },
     /// Transient failure (connection lost, timeout). Retrying the whole
@@ -32,9 +34,12 @@ pub enum StoreError {
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Conflict { current } => {
-                write!(f, "version conflict: stream is at {current}")
-            }
+            Self::Conflict { stream_id, current } => match stream_id {
+                Some(stream_id) => {
+                    write!(f, "version conflict: {stream_id} is at {current}")
+                }
+                None => write!(f, "version conflict: stream is at {current}"),
+            },
             Self::Unavailable => f.write_str("store unavailable"),
             Self::Other(source) => write!(f, "store failure: {source}"),
         }

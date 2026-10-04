@@ -115,7 +115,7 @@ fn expectation_violations_conflict_with_the_current_version<
     let error = block_on(append(store, &stream, ExpectedVersion::Empty, &[2]))
         .expect_err("Empty on a non-empty stream must conflict");
     assert!(
-        matches!(error, StoreError::Conflict { current } if current == Version::new(1)),
+        matches!(error, StoreError::Conflict { current, .. } if current == Version::new(1)),
         "the conflict reports the current version, got {error:?}"
     );
 
@@ -128,7 +128,7 @@ fn expectation_violations_conflict_with_the_current_version<
     ))
     .expect_err("a wrong Exact version must conflict");
     assert!(
-        matches!(error, StoreError::Conflict { current } if current == Version::new(1)),
+        matches!(error, StoreError::Conflict { current, .. } if current == Version::new(1)),
         "the conflict reports the current version, got {error:?}"
     );
 

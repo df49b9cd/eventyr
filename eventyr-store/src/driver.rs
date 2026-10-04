@@ -14,6 +14,7 @@ use futures::TryStreamExt;
 use futures::executor::block_on;
 
 use eventyr_core::aggregate::Aggregate;
+use eventyr_core::batch::{BatchAction, BatchInput, BatchMachine, BatchOutcome, Decide};
 use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
 use eventyr_core::snapshot::HasSnapshotState;
@@ -79,7 +80,7 @@ where
                 events,
             } => match store.append(&stream_id, expected, events).await {
                 Ok(committed) => machine.handle(WriteInput::Appended { committed }),
-                Err(StoreError::Conflict { current }) => {
+                Err(StoreError::Conflict { current, .. }) => {
                     machine.handle(WriteInput::Conflict { current })
                 }
                 Err(error) => machine.handle(WriteInput::Failed(error)),
@@ -135,7 +136,7 @@ where
                 events,
             } => match store.append(&stream_id, expected, events).await {
                 Ok(committed) => machine.handle(WriteInput::Appended { committed }),
-                Err(StoreError::Conflict { current }) => {
+                Err(StoreError::Conflict { current, .. }) => {
                     machine.handle(WriteInput::Conflict { current })
                 }
                 Err(error) => machine.handle(WriteInput::Failed(error)),
@@ -192,3 +193,100 @@ where
 {
     block_on(drive_write_with_snapshots(machine, store, snapshots))
 }
+
+/// Drives a [`BatchMachine`] against `store` until it finishes,
+/// returning its terminal outcome.
+///
+/// The loop performs each action the machine emits:
+///
+/// - `LoadStreams` → read each requested stream from its requested
+///   bound, collect the envelopes, and answer with one
+///   [`Loaded`](BatchInput::Loaded) per stream — the machine re-emits
+///   `LoadStreams` for whatever is still outstanding, and the loop
+///   keeps answering until it transitions. The reads are sequential:
+///   the machine needs every one before it decides, so concurrency here
+///   would only complicate the driver;
+/// - `AppendBatch` → [`append_batch`](EventStore::append_batch),
+///   reporting [`Appended`](BatchInput::Appended), or mapping a
+///   [`StoreError::Conflict`](StoreError::Conflict) to
+///   [`Conflict`](BatchInput::Conflict) and anything else to
+///   [`Failed`](BatchInput::Failed);
+/// - `Done` → stop and return the outcome.
+///
+/// Every store error — load or append — travels through the machine as
+/// [`Failed`](BatchInput::Failed), so
+/// [`Failed`](BatchOutcome::Failed) is the one failure shape callers
+/// see: the machine owns the protocol, not the driver.
+pub async fn drive_write_batch<E, Err, D, S>(
+    machine: &mut BatchMachine<E, Err, D>,
+    store: &S,
+) -> BatchOutcome<E, Err>
+where
+    D: Decide<E, Err>,
+    S: EventStore<Event = E>,
+{
+    let mut action = machine.start();
+    loop {
+        action = match action {
+            BatchAction::LoadStreams { streams, from } => {
+                // Answer one stream at a time; the machine waits for
+                // every outstanding stream before deciding, re-emitting
+                // `LoadStreams` for the remainder after each — so the
+                // loop keeps answering until it transitions. On an
+                // error, report it and let the machine end.
+                let mut next = None;
+                for stream_id in streams {
+                    let from = from.get(&stream_id).copied().unwrap_or_default();
+                    let loaded: Result<Vec<EventEnvelope<E>>, StoreError> =
+                        store.stream(&stream_id, from).try_collect().await;
+                    let input = match loaded {
+                        Ok(events) => BatchInput::Loaded { stream_id: stream_id.clone(), events },
+                        Err(error) => BatchInput::Failed(error),
+                    };
+                    match machine.handle(input) {
+                        BatchAction::LoadStreams { .. } => {} // still loading
+                        action => {
+                            next = Some(action);
+                            break;
+                        }
+                    }
+                }
+                match next {
+                    Some(action) => action,
+                    // The machine kept re-emitting `LoadStreams` past the
+                    // last outstanding stream — a protocol violation,
+                    // surfaced the machine's way.
+                    None => machine.handle(BatchInput::Failed(StoreError::other(
+                        "the batch machine asked for more loads than it requested",
+                    ))),
+                }
+            }
+            BatchAction::AppendBatch { appends } => match store.append_batch(appends).await {
+                Ok(committed) => machine.handle(BatchInput::Appended { committed }),
+                Err(StoreError::Conflict { stream_id, current }) => {
+                    let stream = stream_id
+                        .or_else(|| machine.streams().first().cloned())
+                        .unwrap_or_default();
+                    machine.handle(BatchInput::Conflict { stream, current })
+                }
+                Err(error) => machine.handle(BatchInput::Failed(error)),
+            },
+            BatchAction::Done(outcome) => return outcome,
+        };
+    }
+}
+
+/// The blocking [`drive_write_batch`]: drives `machine` to its outcome
+/// without an async runtime, parking the thread through the store's
+/// futures.
+pub fn drive_write_batch_blocking<E, Err, D, S>(
+    machine: &mut BatchMachine<E, Err, D>,
+    store: &S,
+) -> BatchOutcome<E, Err>
+where
+    D: Decide<E, Err>,
+    S: EventStore<Event = E>,
+{
+    block_on(drive_write_batch(machine, store))
+}
+

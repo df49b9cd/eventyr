@@ -8,6 +8,7 @@
 use std::future::Future;
 use std::path::Path;
 
+use eventyr_core::batch::{CommittedStream, StreamAppend};
 use eventyr_core::envelope::{EventEnvelope, Metadata, NewEvent};
 use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
@@ -65,6 +66,60 @@ pub async fn migrate(pool: &PgPool) -> Result<(), PgStoreError> {
 /// column can't drift across the append/read/read-all queries.
 const EVENT_COLUMNS: &str =
     "global_sequence, stream_id, stream_version, payload, metadata, created_at";
+
+/// One `append_events` call's arguments: the expectation kind, the
+/// exact version, and the per-event arrays fanned out from one source
+/// of truth so the four stay correlated.
+type AppendArgs = (
+    i16,
+    i64,
+    Vec<String>,
+    Vec<serde_json::Value>,
+    Vec<Option<String>>,
+    Vec<Option<String>>,
+);
+
+fn append_args<E: serde::Serialize + EventName>(
+    expected: ExpectedVersion,
+    events: Vec<NewEvent<E>>,
+) -> Result<AppendArgs, PgStoreError> {
+    let (kind, exact) = expectation_args(expected);
+    let mut names = Vec::with_capacity(events.len());
+    let mut payloads = Vec::with_capacity(events.len());
+    let mut causations = Vec::with_capacity(events.len());
+    let mut correlations = Vec::with_capacity(events.len());
+    for new_event in events {
+        names.push(new_event.event.event_name().to_string());
+        payloads.push(serde_json::to_value(&new_event.event).map_err(PgStoreError::from)?);
+        causations.push(new_event.metadata.causation_id);
+        correlations.push(new_event.metadata.correlation_id);
+    }
+    Ok((kind, exact, names, payloads, causations, correlations))
+}
+
+/// Run one `append_events` call against `conn` within an open
+/// transaction.
+async fn append_events_tx(
+    conn: &mut sqlx::PgConnection,
+    stream_id: &str,
+    args: AppendArgs,
+) -> Result<Vec<EventRow>, sqlx::Error> {
+    let (kind, exact, names, payloads, causations, correlations) = args;
+    let query = sqlx::AssertSqlSafe(format!(
+        "SELECT {EVENT_COLUMNS} FROM append_events($1, $2, $3, $4, $5, $6, $7)"
+    ));
+    sqlx::query_as::<_, EventRow>(query)
+        .bind(kind)
+        .bind(exact)
+        .bind(stream_id)
+        .bind(&names[..])
+        .bind(&payloads[..])
+        .bind(&causations[..])
+        .bind(&correlations[..])
+        .fetch_all(conn)
+        .await
+}
+
 
 /// One row of the events table, as read back. The `payload` column holds
 /// `{variant, args}` (externally-tagged serde) (the stored event); `metadata` is the JSONB
@@ -168,35 +223,9 @@ where
             if events.is_empty() {
                 return Ok(Vec::new());
             }
-
-            let (kind, exact) = expectation_args(expected);
-
-            // One source of truth per event, fanned out into the four
-            // arrays the function takes — the correlation across the four
-            // stays in the type, not in four lockstep pushes.
-            let mut names = Vec::with_capacity(events.len());
-            let mut payloads = Vec::with_capacity(events.len());
-            let mut causations = Vec::with_capacity(events.len());
-            let mut correlations = Vec::with_capacity(events.len());
-            for new_event in events {
-                names.push(new_event.event.event_name().to_string());
-                payloads.push(serde_json::to_value(&new_event.event).map_err(PgStoreError::from)?);
-                causations.push(new_event.metadata.causation_id);
-                correlations.push(new_event.metadata.correlation_id);
-            }
-
-            let query = sqlx::AssertSqlSafe(format!(
-                "SELECT {EVENT_COLUMNS} FROM append_events($1, $2, $3, $4, $5, $6, $7)"
-            ));
-            let rows = sqlx::query_as::<_, EventRow>(query)
-                .bind(kind)
-                .bind(exact)
-                .bind(stream_id.as_str())
-                .bind(&names[..])
-                .bind(&payloads[..])
-                .bind(&causations[..])
-                .bind(&correlations[..])
-                .fetch_all(&pool)
+            let args = append_args(expected, events).map_err(StoreError::from)?;
+            let rows = append_events_tx(&mut *pool.acquire().await.map_err(PgStoreError::into_store)?,
+                stream_id.as_str(), args)
                 .await
                 .map_err(PgStoreError::into_store)?;
 
@@ -204,6 +233,60 @@ where
                 .map(EventEnvelope::try_from)
                 .collect::<Result<Vec<_>, PgStoreError>>()
                 .map_err(StoreError::from)
+        }
+    }
+
+    /// Append the whole batch in one transaction. The per-stream
+    /// advisory locks are first taken on every stream in sorted order
+    /// (so two conflicting batches over the same streams cannot
+    /// deadlock — they queue on the same first lock), then each
+    /// stream's `append_events` runs against one pooled connection
+    /// inside the open transaction: every expectation is checked by the
+    /// same function the single-stream path uses, and all locks are
+    /// held until the one commit — the batch is all-or-nothing across
+    /// streams.
+    fn append_batch(
+        &self,
+        appends: Vec<StreamAppend<E>>,
+    ) -> impl Future<Output = Result<Vec<CommittedStream<E>>, StoreError>> + Send {
+        let pool = self.pool.clone();
+        async move {
+            use sqlx::Acquire;
+            let mut conn = pool.acquire().await.map_err(PgStoreError::into_store)?;
+            let mut tx = conn.begin().await.map_err(PgStoreError::into_store)?;
+
+            // Lock every stream, sorted, before writing anything —
+            // concurrent batches over overlapping streams queue on the
+            // same first lock instead of deadlocking.
+            let mut ids: Vec<&str> = appends.iter().map(|a| a.stream_id.as_str()).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            for id in &ids {
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(PgStoreError::into_store)?;
+            }
+
+            let mut committed = Vec::with_capacity(appends.len());
+            for append in appends {
+                let args = append_args(append.expected, append.events).map_err(StoreError::from)?;
+                let rows = append_events_tx(&mut tx, append.stream_id.as_str(), args)
+                    .await
+                    .map_err(PgStoreError::into_store)?;
+                let events = rows
+                    .into_iter()
+                    .map(EventEnvelope::try_from)
+                    .collect::<Result<Vec<_>, PgStoreError>>()
+                    .map_err(StoreError::from)?;
+                committed.push(CommittedStream {
+                    stream_id: append.stream_id,
+                    events,
+                });
+            }
+            tx.commit().await.map_err(PgStoreError::into_store)?;
+            Ok(committed)
         }
     }
 
