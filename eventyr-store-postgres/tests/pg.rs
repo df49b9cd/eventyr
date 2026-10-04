@@ -1,7 +1,8 @@
 //! End-to-end against a real Postgres: append, conflict, read-back.
 //!
-//! Requires a database; `EVENTYR_TEST_PG_URL` points at it (CI runs a
-//! disposable container). Without the env var the test is skipped.
+//! Requires a database; `EVENTYR_TEST_PG_URL` points at it. The test is
+//! `#[ignore]`d by default — run it with `cargo test -- --ignored` once a
+//! Postgres is reachable (CI runs a disposable container and does this).
 
 use futures::TryStreamExt;
 use uuid::Uuid;
@@ -35,13 +36,10 @@ fn new_stream() -> StreamId {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 async fn append_read_conflict_stream_all() {
-    // The integration test needs a real Postgres; the workspace gate
-    // without `EVENTYR_TEST_PG_URL` skips it (CI runs the container).
-    let Ok(url) = std::env::var("EVENTYR_TEST_PG_URL") else {
-        eprintln!("eventyr-store-postgres test skipped: EVENTYR_TEST_PG_URL is not set");
-        return;
-    };
+    let url = std::env::var("EVENTYR_TEST_PG_URL")
+        .expect("EVENTYR_TEST_PG_URL must point at a real Postgres");
     let store = PgStore::connect(&url).await.expect("connect and migrate");
     let stream = new_stream();
 
@@ -203,8 +201,7 @@ async fn append_read_conflict_stream_all() {
     let meta = Metadata {
         causation_id: Some("cmd-42".into()),
         correlation_id: Some("corr-7".into()),
-        #[cfg(feature = "time")]
-        timestamp: None,
+        ..Metadata::default()
     };
     let evt = NewEvent {
         event: BankEvent::Deposited { amount: 5 },

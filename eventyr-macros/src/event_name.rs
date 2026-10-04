@@ -67,7 +67,6 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream, syn::Error> {
 
     Ok(expanded)
 }
-
 /// Parses the struct/enum-level `#[eventyr(...)]`: `name` and `crate`.
 fn parse_meta(attrs: &[Attribute]) -> Result<Meta, syn::Error> {
     let mut meta = Meta {

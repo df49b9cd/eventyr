@@ -106,17 +106,35 @@ where
             PgStoreError::CorruptRow(format!("the metadata does not decode: {error}"))
         })?;
 
+        // Positions must be non-negative — a negative one is corrupt
+        // data, not a number to wrap.
+        let invalid = |value: i64| {
+            PgStoreError::CorruptRow(format!("negative position in the log: {value}"))
+        };
+        // `Metadata::default()` fills `timestamp` — present only when
+        // core's `time` feature is on (it can be switched on by the
+        // umbrella crate without this crate's `time`; the constructor
+        // must not depend on that).
+        let metadata = Metadata {
+            causation_id: metadata.causation_id,
+            correlation_id: metadata.correlation_id,
+            ..Metadata::default()
+        };
+        #[cfg(feature = "time")]
+        let metadata = Metadata {
+            timestamp: Some(row.created_at),
+            ..metadata
+        };
         Ok(EventEnvelope {
-            sequence: Sequence::new(row.global_sequence.unsigned_abs()),
+            sequence: Sequence::new(
+                u64::try_from(row.global_sequence).map_err(|_| invalid(row.global_sequence))?,
+            ),
             stream_id: StreamId::from(row.stream_id),
-            version: Version::new(row.stream_version.unsigned_abs()),
+            version: Version::new(
+                u64::try_from(row.stream_version).map_err(|_| invalid(row.stream_version))?,
+            ),
             event,
-            metadata: Metadata {
-                causation_id: metadata.causation_id,
-                correlation_id: metadata.correlation_id,
-                #[cfg(feature = "time")]
-                timestamp: Some(row.created_at),
-            },
+            metadata,
         })
     }
 }

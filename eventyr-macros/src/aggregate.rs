@@ -62,7 +62,7 @@ use quote::{format_ident, quote};
 use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Expr, Fields, Ident, Path};
 
-use crate::attrs::{absolutize, assign, path_list};
+use crate::attrs::{self, absolutize, assign, path_list};
 use crate::naming::to_snake_case;
 
 /// Everything `#[derive(Aggregate)]` was told, with conventions filled
@@ -94,34 +94,19 @@ fn parse_wiring(input: &DeriveInput) -> Result<Wiring, syn::Error> {
             continue;
         }
         attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("name") {
-                let value = meta.value()?.parse::<syn::LitStr>()?;
-                assign(&mut wiring.name, "name", &meta, value.value())
-            } else if meta.path.is_ident("id") {
-                let value = meta.value()?.parse::<Path>()?;
-                assign(&mut wiring.id, "id", &meta, value)
-            } else if meta.path.is_ident("state") {
-                let value = meta.value()?.parse::<Path>()?;
-                assign(&mut wiring.state, "state", &meta, value)
-            } else if meta.path.is_ident("event") {
-                let value = meta.value()?.parse::<Path>()?;
-                assign(&mut wiring.event, "event", &meta, value)
-            } else if meta.path.is_ident("event_enum") {
-                let value = meta.value()?.parse::<syn::Ident>()?;
-                assign(&mut wiring.event_enum_name, "event_enum", &meta, value)
-            } else if meta.path.is_ident("command") {
-                let value = meta.value()?.parse::<Path>()?;
-                assign(&mut wiring.command, "command", &meta, value)
-            } else if meta.path.is_ident("error") {
-                let value = meta.value()?.parse::<Path>()?;
-                assign(&mut wiring.error, "error", &meta, value)
-            } else if meta.path.is_ident("initial") {
-                let value = meta.value()?.parse::<Expr>()?;
-                assign(&mut wiring.initial, "initial", &meta, value)
-            } else if meta.path.is_ident("apply") {
-                let value = meta.value()?.parse::<Path>()?;
-                assign(&mut wiring.apply, "apply", &meta, value)
-            } else if meta.path.is_ident("decide") {
+            if attrs::assign_parsed_lit(&mut wiring.name, "name", &meta)?
+                || attrs::assign_parsed(&mut wiring.id, "id", &meta)?
+                || attrs::assign_parsed(&mut wiring.state, "state", &meta)?
+                || attrs::assign_parsed(&mut wiring.event, "event", &meta)?
+                || attrs::assign_parsed(&mut wiring.event_enum_name, "event_enum", &meta)?
+                || attrs::assign_parsed(&mut wiring.command, "command", &meta)?
+                || attrs::assign_parsed(&mut wiring.error, "error", &meta)?
+                || attrs::assign_parsed(&mut wiring.initial, "initial", &meta)?
+                || attrs::assign_parsed(&mut wiring.apply, "apply", &meta)?
+            {
+                return Ok(());
+            }
+            if meta.path.is_ident("decide") {
                 let value = match meta.value()?.parse::<Expr>()? {
                     Expr::Path(path) => path.path,
                     other => {

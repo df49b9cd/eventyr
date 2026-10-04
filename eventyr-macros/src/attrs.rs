@@ -21,6 +21,37 @@ pub(crate) fn assign<T>(
     Ok(())
 }
 
+/// The uniform attribute arm — `key = <value parsed as T>`, recorded in
+/// `slot`. Returns `Ok(false)` when the attribute is not `key`, so callers
+/// can chain the special-cased and unknown-attribute arms after it.
+pub(crate) fn assign_parsed<T: syn::parse::Parse>(
+    slot: &mut Option<T>,
+    key: &str,
+    meta: &ParseNestedMeta<'_>,
+) -> Result<bool, Error> {
+    if !meta.path.is_ident(key) {
+        return Ok(false);
+    }
+    let value = meta.value()?.parse::<T>()?;
+    assign(slot, key, meta, value)?;
+    Ok(true)
+}
+
+/// The uniform `key = "..."` (string literal) arm — like
+/// [`assign_parsed`], but stores the literal's unquoted value.
+pub(crate) fn assign_parsed_lit(
+    slot: &mut Option<String>,
+    key: &str,
+    meta: &ParseNestedMeta<'_>,
+) -> Result<bool, Error> {
+    if !meta.path.is_ident(key) {
+        return Ok(false);
+    }
+    let value = meta.value()?.parse::<syn::LitStr>()?;
+    assign(slot, key, meta, value.value())?;
+    Ok(true)
+}
+
 /// Parses the comma-separated paths inside `key(...)`.
 pub(crate) fn path_list(meta: &ParseNestedMeta<'_>) -> Result<Vec<Path>, Error> {
     if !meta.input.peek(syn::token::Paren) {

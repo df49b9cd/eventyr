@@ -15,10 +15,11 @@
 //! error whose `hint` carries the conflict's actual version, mapped
 //! here to [`StoreError::Conflict`].
 //!
-//! Events serialize as `{ name: <EventName>, payload }`; the `name` is
-//! the event enum's [`EventName`](eventyr_core::event_name::EventName),
-//! so payload-struct renames are free and historical payloads stay
-//! readable by an upcaster.
+//! Each event persists as one row: `payload` holds the event enum's
+//! externally-tagged serde (`{variant: args}`), and `event_type` holds the
+//! enum variant's [`EventName`](eventyr_core::event_name::EventName) in a
+//! separate column — so payload-struct renames are free and historical
+//! payloads stay selectable by an upcaster.
 
 pub mod store;
 

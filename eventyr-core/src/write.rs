@@ -206,10 +206,10 @@ impl<A: Aggregate> WriteMachine<A> {
         if self.phase != Phase::Loading {
             return self.violation("`Loaded` outside the loading phase");
         }
-        // Validate before folding: the events must belong to this stream
+        // Validate while folding: the events must belong to this stream
         // and continue the sequence contiguously from the folded version.
         let mut expected = self.version.as_u64().saturating_add(1);
-        for envelope in &events {
+        for envelope in events {
             if envelope.stream_id != self.stream_id {
                 return self.violation("`Loaded` delivered events from another stream");
             }
@@ -217,8 +217,6 @@ impl<A: Aggregate> WriteMachine<A> {
                 return self.violation("`Loaded` delivered a non-contiguous sequence");
             }
             expected = expected.saturating_add(1);
-        }
-        for envelope in events {
             A::apply(&mut self.folded, &envelope.event);
             self.version = envelope.version;
         }
@@ -304,6 +302,7 @@ impl<A: Aggregate> WriteMachine<A> {
 mod tests {
     use super::*;
     use crate::envelope::{EventEnvelope, Metadata};
+    use crate::error::ProtocolError;
     use crate::testing::account::{Account, AccountCommand, AccountError, AccountEvent, AccountId};
     use crate::testing::drive_scripted;
     use crate::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
@@ -331,10 +330,10 @@ mod tests {
     }
 
     fn is_protocol_violation(action: &WriteAction<AccountEvent, AccountError>) -> bool {
-        matches!(
-            action,
-            WriteAction::Done(WriteOutcome::Failed(StoreError::Other(_)))
-        )
+        let WriteAction::Done(WriteOutcome::Failed(StoreError::Other(source))) = action else {
+            return false;
+        };
+        source.downcast_ref::<ProtocolError>().is_some()
     }
 
     // -- transitions -----------------------------------------------------

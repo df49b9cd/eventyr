@@ -61,64 +61,43 @@ pub trait StreamsAll: EventStore {
 }
 
 // Blanket impls: stores are shared (`Arc`, references), and the ports
-// must work through the smart pointer the caller chose.
+// must work through the smart pointer the caller chose. One macro
+// generates the delegation for each pointer type.
 
-impl<S: EventStore + ?Sized> EventStore for &S {
-    type Event = S::Event;
+macro_rules! impl_port_delegation {
+    ($pointer:ty) => {
+        impl<S: EventStore + ?Sized> EventStore for $pointer {
+            type Event = S::Event;
 
-    fn append(
-        &self,
-        stream_id: &StreamId,
-        expected: ExpectedVersion,
-        events: Vec<NewEvent<Self::Event>>,
-    ) -> impl Future<Output = Result<Vec<EventEnvelope<Self::Event>>, StoreError>> + Send {
-        (**self).append(stream_id, expected, events)
-    }
+            fn append(
+                &self,
+                stream_id: &StreamId,
+                expected: ExpectedVersion,
+                events: Vec<NewEvent<Self::Event>>,
+            ) -> impl Future<Output = Result<Vec<EventEnvelope<Self::Event>>, StoreError>> + Send
+            {
+                (**self).append(stream_id, expected, events)
+            }
 
-    fn stream(
-        &self,
-        stream_id: &StreamId,
-        from: Version,
-    ) -> impl Stream<Item = Result<EventEnvelope<Self::Event>, StoreError>> + Send {
-        (**self).stream(stream_id, from)
-    }
+            fn stream(
+                &self,
+                stream_id: &StreamId,
+                from: Version,
+            ) -> impl Stream<Item = Result<EventEnvelope<Self::Event>, StoreError>> + Send {
+                (**self).stream(stream_id, from)
+            }
+        }
+
+        impl<S: StreamsAll + ?Sized> StreamsAll for $pointer {
+            fn stream_all(
+                &self,
+                from: Sequence,
+            ) -> impl Stream<Item = Result<EventEnvelope<Self::Event>, StoreError>> + Send {
+                (**self).stream_all(from)
+            }
+        }
+    };
 }
 
-impl<S: StreamsAll + ?Sized> StreamsAll for &S {
-    fn stream_all(
-        &self,
-        from: Sequence,
-    ) -> impl Stream<Item = Result<EventEnvelope<Self::Event>, StoreError>> + Send {
-        (**self).stream_all(from)
-    }
-}
-
-impl<S: EventStore + ?Sized> EventStore for std::sync::Arc<S> {
-    type Event = S::Event;
-
-    fn append(
-        &self,
-        stream_id: &StreamId,
-        expected: ExpectedVersion,
-        events: Vec<NewEvent<Self::Event>>,
-    ) -> impl Future<Output = Result<Vec<EventEnvelope<Self::Event>>, StoreError>> + Send {
-        (**self).append(stream_id, expected, events)
-    }
-
-    fn stream(
-        &self,
-        stream_id: &StreamId,
-        from: Version,
-    ) -> impl Stream<Item = Result<EventEnvelope<Self::Event>, StoreError>> + Send {
-        (**self).stream(stream_id, from)
-    }
-}
-
-impl<S: StreamsAll + ?Sized> StreamsAll for std::sync::Arc<S> {
-    fn stream_all(
-        &self,
-        from: Sequence,
-    ) -> impl Stream<Item = Result<EventEnvelope<Self::Event>, StoreError>> + Send {
-        (**self).stream_all(from)
-    }
-}
+impl_port_delegation!(&S);
+impl_port_delegation!(std::sync::Arc<S>);
