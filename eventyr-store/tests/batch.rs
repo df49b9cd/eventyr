@@ -174,3 +174,31 @@ async fn the_blocking_driver_runs_the_same_protocol() {
         .expect("read");
     assert!(matches!(to[1].event, AccountEvent::Deposited { amount: 5 }));
 }
+
+#[tokio::test]
+async fn a_transfer_stamps_its_metadata_on_both_sides() {
+    let store = Arc::new(InMemoryStore::new());
+    open_and_fund(&store);
+
+    let metadata = eventyr_core::envelope::Metadata {
+        causation_id: Some("xfer-1".into()),
+        correlation_id: Some("request-9".into()),
+        ..Default::default()
+    };
+    let mut machine = transfer_machine(1, 2, 5).with_metadata(metadata.clone());
+    let outcome = drive_write_batch(&mut machine, &*store).await;
+    let BatchOutcome::Committed { .. } = outcome else {
+        panic!("the transfer must commit")
+    };
+    // Both streams' trailing events carry the interaction's metadata.
+    for stream in [stream_of(1), stream_of(2)] {
+        let events: Vec<_> = store
+            .stream(&stream, Version::EMPTY)
+            .try_collect()
+            .await
+            .expect("read");
+        let last = events.last().expect("a committed event");
+        assert_eq!(last.metadata.causation_id.as_deref(), Some("xfer-1"));
+        assert_eq!(last.metadata.correlation_id.as_deref(), Some("request-9"));
+    }
+}

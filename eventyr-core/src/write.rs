@@ -283,6 +283,11 @@ impl<A: Aggregate, S> SnapshotHooks<A, S> {
 pub struct WriteMachine<A: Aggregate, S = ()> {
     stream_id: StreamId,
     command: A::Command,
+    /// The metadata stamped onto every event this interaction emits.
+    /// Set once at construction (or via [`with_metadata`](Self::with_metadata));
+    /// the domain's `decide` never sees it — causation/correlation are
+    /// boundary concerns, not domain ones (0.5.2).
+    metadata: crate::envelope::Metadata,
     retry_policy: RetryPolicy,
     snapshots: Snapshots,
     retries_used: u32,
@@ -308,6 +313,7 @@ impl<A: Aggregate> WriteMachine<A, ()> {
         Self {
             stream_id: StreamId::for_aggregate::<A>(&id),
             command,
+            metadata: crate::envelope::Metadata::default(),
             retry_policy,
             snapshots: Snapshots::Off,
             retries_used: 0,
@@ -342,6 +348,7 @@ where
         Self {
             stream_id: StreamId::for_aggregate::<A>(&id),
             command,
+            metadata: crate::envelope::Metadata::default(),
             retry_policy,
             snapshots: Snapshots::On {
                 base_version: Version::EMPTY,
@@ -397,6 +404,21 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
     /// The stream this machine writes to.
     pub fn stream_id(&self) -> &StreamId {
         &self.stream_id
+    }
+
+    /// The metadata this machine stamps onto every event it emits.
+    pub fn metadata(&self) -> &crate::envelope::Metadata {
+        &self.metadata
+    }
+
+    /// Builder-style: set the metadata stamped on every emitted event
+    /// (0.5.2). Construct with [`new`](Self::new) /
+    /// [`with_snapshots`](Self::with_snapshots), then call this before
+    /// [`start`](Self::start). Causation/correlation are boundary
+    /// concerns — set here, never inside `decide`.
+    pub fn with_metadata(mut self, metadata: crate::envelope::Metadata) -> Self {
+        self.metadata = metadata;
+        self
     }
 
     /// The version folded so far (the loaded snapshot's version, plus
@@ -575,10 +597,21 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
                 } else {
                     ExpectedVersion::Exact(self.version)
                 };
+                // Stamp the interaction's metadata on every event the
+                // decision produced (0.5.2). The domain decided which
+                // events; the boundary decided *why* (correlation,
+                // causation).
+                let metadata = self.metadata.clone();
                 WriteAction::Append {
                     stream_id: self.stream_id.clone(),
                     expected,
-                    events: events.into_iter().map(NewEvent::new).collect(),
+                    events: events
+                        .into_iter()
+                        .map(|event| NewEvent {
+                            event,
+                            metadata: metadata.clone(),
+                        })
+                        .collect(),
                 }
             }
             Err(error) => {

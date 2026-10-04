@@ -152,9 +152,10 @@ where
     /// interaction is retried (reload the delta, re-fold, re-decide)
     /// until the retry budget is spent.
     ///
-    /// Events are appended with empty metadata. Correlation and
-    /// causation ids are not yet reachable through this path; until
-    /// then, hand-drive the [`WriteMachine`] to enrich events.
+    /// Events carry empty metadata; to stamp the request's correlation
+    /// (or the event's causation) on every event of the interaction,
+    /// call [`execute_with_metadata`](Self::execute_with_metadata) —
+    /// the 0.5.2 boundary seam.
     ///
     /// This is the snapshot-off path: on a snapshots-on repository,
     /// `execute_with_snapshots` runs the full snapshot protocol. The
@@ -167,7 +168,26 @@ where
         id: A::Id,
         command: A::Command,
     ) -> Result<ExecutionOutcome<A::Event>, ExecutionError<A>> {
-        let mut machine = WriteMachine::<A>::new(id, command, self.policy.retry);
+        self.execute_with_metadata(id, command, eventyr_core::envelope::Metadata::default())
+            .await
+    }
+
+    /// [`execute`](Self::execute) with the interaction's metadata stamped
+    /// on every emitted event (0.5.2).
+    ///
+    /// The repository drivers stamp `metadata` onto the machine's
+    /// `Append` events, so a caller can trace one request's events
+    /// (and their causes) without threading ids through the domain.
+    /// `decide` never sees them — causation/correlation are boundary
+    /// concerns, not the domain's.
+    pub async fn execute_with_metadata(
+        &self,
+        id: A::Id,
+        command: A::Command,
+        metadata: eventyr_core::envelope::Metadata,
+    ) -> Result<ExecutionOutcome<A::Event>, ExecutionError<A>> {
+        let mut machine = WriteMachine::<A>::new(id, command, self.policy.retry)
+            .with_metadata(metadata);
         match drive_write(&mut machine, &self.store).await {
             WriteOutcome::Committed { committed, .. } => Ok(ExecutionOutcome::Committed {
                 committed,
@@ -243,12 +263,33 @@ where
         id: A::Id,
         command: A::Command,
     ) -> Result<ExecutionOutcome<A::Event, A::State>, ExecutionError<A>> {
+        self.execute_with_snapshots_and_metadata(
+            id,
+            command,
+            eventyr_core::envelope::Metadata::default(),
+        )
+        .await
+    }
+
+    /// [`execute_with_snapshots`](Self::execute_with_snapshots) with the
+    /// interaction's metadata stamped on every emitted event (0.5.2).
+    pub async fn execute_with_snapshots_and_metadata(
+        &self,
+        id: A::Id,
+        command: A::Command,
+        metadata: eventyr_core::envelope::Metadata,
+    ) -> Result<ExecutionOutcome<A::Event, A::State>, ExecutionError<A>> {
         let policy = self
             .policy
             .snapshot
             .expect("with_snapshots sets the policy before this method is reachable");
-        let mut machine =
-            WriteMachine::<A, A::State>::with_snapshots(id, command, self.policy.retry, policy);
+        let mut machine = WriteMachine::<A, A::State>::with_snapshots(
+            id,
+            command,
+            self.policy.retry,
+            policy,
+        )
+        .with_metadata(metadata);
         match drive_write_with_snapshots(&mut machine, &self.store, &self.snapshots).await {
             WriteOutcome::Committed {
                 committed,

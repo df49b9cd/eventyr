@@ -346,3 +346,36 @@ async fn a_load_failure_surfaces_as_the_failed_outcome() {
         ExecutionError::Store(StoreError::Unavailable)
     ));
 }
+
+#[tokio::test]
+async fn execute_with_metadata_stamps_every_committed_event() {
+    let store = Arc::new(InMemoryStore::new());
+    let repo = AggregateRepository::<Account, _>::new(store.clone(), RetryPolicy::default());
+
+    // Open the account, then deposit with a request-scoped metadata set.
+    repo.execute(AccountId(9), AccountCommand::Open { owner: "me".into() })
+        .await
+        .expect("open");
+    let metadata = eventyr_core::envelope::Metadata {
+        causation_id: Some("cmd-42".into()),
+        correlation_id: Some("request-7".into()),
+        ..Default::default()
+    };
+    repo.execute_with_metadata(AccountId(9), AccountCommand::Deposit { amount: 5 }, metadata.clone())
+        .await
+        .expect("deposit");
+
+    let events: Vec<_> = store
+        .stream(
+            &StreamId::for_aggregate::<Account>(&AccountId(9)),
+            Version::EMPTY,
+        )
+        .try_collect()
+        .await
+        .expect("read");
+    // The second commit carried the metadata; the first (plain `execute`)
+    // carried none.
+    assert!(events[0].metadata.causation_id.is_none());
+    assert_eq!(events[1].metadata.causation_id.as_deref(), Some("cmd-42"));
+    assert_eq!(events[1].metadata.correlation_id.as_deref(), Some("request-7"));
+}

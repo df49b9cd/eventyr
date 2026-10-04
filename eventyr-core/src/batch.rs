@@ -327,6 +327,10 @@ pub struct BatchMachine<E, Err, D: Decide<E, Err>> {
     versions: BTreeMap<StreamId, Version>,
     /// The streams still expected to answer the current `LoadStreams`.
     pending: alloc::collections::BTreeSet<StreamId>,
+    /// The metadata stamped onto every event this interaction emits
+    /// (0.5.2): set by [`with_metadata`](Self::with_metadata), applied
+    /// to each `StreamAppend`'s events at emit time.
+    metadata: crate::envelope::Metadata,
 }
 
 impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
@@ -369,7 +373,17 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
             folded,
             versions,
             pending,
+            metadata: crate::envelope::Metadata::default(),
         }
+    }
+
+    /// Builder-style: the metadata stamped on every event this batch
+    /// emits (0.5.2), applied to each `StreamAppend` at emit time. Set
+    /// before [`start`](Self::start); causation/correlation are boundary
+    /// concerns, never the domain's.
+    pub fn with_metadata(mut self, metadata: crate::envelope::Metadata) -> Self {
+        self.metadata = metadata;
+        self
     }
 
     /// The first action: read every stream of the boundary from the
@@ -535,6 +549,10 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
                     }
                 }
                 self.phase = Phase::Appending;
+                // Stamp the interaction's metadata on every event the
+                // decision routed (0.5.2): the boundary decides the
+                // causation/correlation, not the domain.
+                let metadata = self.metadata.clone();
                 BatchAction::AppendBatch {
                     appends: by_stream
                         .into_iter()
@@ -548,8 +566,14 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
                                 Version::EMPTY => ExpectedVersion::Empty,
                                 version => ExpectedVersion::Exact(version),
                             },
+                            events: events
+                                .into_iter()
+                                .map(|event| NewEvent {
+                                    event: event.event,
+                                    metadata: metadata.clone(),
+                                })
+                                .collect(),
                             stream_id,
-                            events,
                         })
                         .collect(),
                 }
