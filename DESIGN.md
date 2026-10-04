@@ -441,3 +441,36 @@ Everything above is the means; the example is the proof the design holds in one 
 ### 0.5 — what it is *not*
 
 Still not a framework: no HTTP server, no message-bus drivers beyond the `EventBus` trait, no actor runtime (§2 stands). The four pieces are width (observability, a worked example, upcasting made real, metadata made load-bearing), not a second core. The next *structural* release, if there is one, is 0.6: process managers / sagas as a machine — events in, commands out, per §7 — deliberately deferred until the write and read sides have both shipped at least one production-grade store.
+
+## 13. Competitive scan (2026-10) and roadmap 0.6
+
+0.5 closed the write path, the read path, snapshots, multi-stream commands, upcasting, metadata, and metrics. The Rust field has since shifted: `thalo` is unmaintained (its README redirects to SierraDB/kameo_es); the actively-developed serious crates are `cqrs-es`, `esrs`, `eventually-rs`, `fmodel-rust`, and `kameo_es`. The scan below lists what each ships that 0.5 does not, and whether we take it, defer it, or reject it on §1/§2 grounds. Two deliberate gaps are *not* listed as 0.6 work because they contradict the identity:
+
+- **No framework takeover** — no HTTP server, no lambda/axum glue, no actor runtime (`cqrs-es`'s serverless bet, `kameo_es`'s actor hosting). §2 stands.
+- **No baked-in transports** — `esrs`'s Kafka/RabbitMQ buses are exactly the lock-in Eventyr's `EventBus`-as-trait seam refuses. A transport is an adapter outside the boundary, not a feature.
+
+Everything else on the competitors' list is fair game if it can be shipped as a seam, a store, or a machine — not a runtime.
+
+### 0.6.1 — Sagas / process managers as a machine
+
+The single structural gap. `esrs` ships first-class `Policies` (fire-and-forget event handlers that re-enter the write side) and `cqrs-es`/`fmodel` both model sagas. Eventyr has the *fixed-boundary* version of a process manager in `BatchMachine` (a command that atomically spans a known set of streams), but nothing *reactive*: no "when event X lands, issue command Y against stream Z" construct that survives restarts. 0.6.1 adds the `SagaMachine`: `Apply(event)` → `Emit(command, target-stream)` → `Ack(checkpoint)`,checkpoint-persistent so a crash between emit and ack re-delivers. It is one more row in the §7 table, driven by the existing subscription runner — never a daemon, never a runtime decision. This is the version of sagas that respects §2: the *protocol* ships, the transport stays the user's.
+
+### 0.6.2 — Two-layer schema decoupling (`Schema`/`Persistable` as a named seam)
+
+`esrs`'s one idea Eventyr has only implicitly: a first-class separation between `Aggregate::Event` and what is *stored*. Eventyr's story today is upcasting (`UpcasterRegistry`, `VersionedSource`) — strong on the rename/reshape axis — but the "stored row shape ≠ domain event shape" mapping (explicit serde rename, storage-only fields, drop-a-field) has no named trait. 0.6.2 adds a narrow `Codec`/`Schema` trait per store (not in core): the place where an event's persisted form is declared, so the registry's raw-payload work has a typed entry point instead of living only inside `eventyr-store-postgres`'s JSON columns. (This is the one piece of `esrs`'s opinionation worth importing; it costs no runtime.)
+
+### 0.6.3 — A read-model store adapter (`ViewRepository` equivalent)
+
+`cqrs-es`'s most-advertised read-side feature Eventyr entirely lacks: a per-aggregate materialized view, persisted transactionally with the command, in the same database. Eventyr's projection story is deliberately rebuild-first (fold the global stream, checkpoint, done) — which covers analytics and audit, but not the "look it up by id, fast, right after the write" query that makes a CQRS demo feel complete. 0.6.3 adds a `ViewStore` port (a projection whose state *is* a row) and one Postgres implementation, as an alternative read-path driver alongside `RebuildPlan`. Placement: `eventyr-projection`, never core — it is read-side glue per §3.
+
+### 0.6.4 — A second durable store: SQLite / the community-store seam
+
+`cqrs-es` ships Postgres, MySQL, and DynamoDB (plus community SQLite); `kameo_es` ships projections over Postgres/SQLite/MongoDB. Eventyr ships Postgres + fjall + in-memory — enough to prove the port, not enough to make "bring your own database" credible. 0.6.4 does *not* ship a third official store; it ships the thing that makes third-party stores safe: the SQLite reference port (`eventyr-store-sqlite`, against `rusqlite`/`sqlx-sqlite`) as a worked example of the contract-test suite, plus the `append_batch`/`StreamsAll` conformance tiers documented. The goal is the seam proven by two shipped databases, not a fourth one to maintain.
+
+### 0.6.5 — Aggregate-state caching as an opt-in policy
+
+`thalo` and `kameo_es` both advertise in-memory aggregate caching (LRU / actor-resident state) as a headline performance feature. Eventyr folds the (optionally snapshot-seeded) stream per command — correct and deterministic, but it means a hot aggregate pays a reload per write. 0.6.5 adds caching *as a snapshot-policy extension*, not a new state store: a `CachePolicy` on the repository that keeps the last-known `Snapshot` in-process and revalidates against the stream's version on write. It is snapshot promotion, not a second source of truth — the write machine already treats snapshots as read-side shortcuts, so the correctness story does not change.
+
+### 0.6 — what it is *not*
+
+Still no framework. No HTTP, no lambda, no serverless demo app, no code-generated aggregates beyond the existing derive sugar — and no message-bus *implementation* even though `esrs` ships two. The five pieces are all seams, stores, or machines: they add surface where the field already proves the pattern, and they keep every new capability behind a trait the caller instantiates.
