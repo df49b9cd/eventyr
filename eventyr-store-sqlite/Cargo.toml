@@ -1,0 +1,32 @@
+[package]
+name = "eventyr-store-sqlite"
+description = "SQLite event store for eventyr — embedded, zero-server, the contract-suite reference port."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["event-sourcing", "sqlite", "event-store"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# The `SnapshotStore` implementation over a second table. Off by
+# default: stores that only want the event log pay nothing.
+snapshots = []
+
+[dependencies]
+eventyr-core = { workspace = true, features = ["serde"] }
+eventyr-store = { workspace = true }
+rusqlite = { version = "0.34", features = ["bundled"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+thiserror = { version = "2", default-features = false }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+
+# dev-dependency on ourselves so the contract-suite tests can toggle
+# the feature (a crate's own --features don't reach `tests/`).
+[dev-dependencies]
+eventyr-store-sqlite = { path = ".", features = ["snapshots"] }
+eventyr-store-testing = { workspace = true }

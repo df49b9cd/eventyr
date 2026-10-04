@@ -63,3 +63,9 @@ pub use eventyr_store_postgres as postgres;
 /// it through `store::prelude::drive_write_blocking`).
 #[cfg(feature = "fjall")]
 pub use eventyr_store_fjall as fjall;
+
+/// The embedded store over SQLite (`rusqlite`, bundled) — the
+/// contract-suite reference port, behind `sqlite` (plus
+/// `sqlite_snapshots` for its snapshot store).
+#[cfg(feature = "sqlite")]
+pub use eventyr_store_sqlite as sqlite;
