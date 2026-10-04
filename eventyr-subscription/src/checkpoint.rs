@@ -3,7 +3,8 @@
 //!
 //! §6: "the projector runner persists the last-acked global sequence, so
 //! restarts resume without reprocessing." Checkpoints are keyed by
-//! subscription name (via [`Projector::named`](crate::runner::Projector::named)),
+//! subscription name (the first argument of
+//! [`Projector::new`](crate::runner::Projector::new)),
 //! so one store serves many projections.
 
 use std::collections::HashMap;

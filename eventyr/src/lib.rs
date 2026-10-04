@@ -12,8 +12,11 @@
 //! [`drive_write`](store::prelude::drive_write) driver, and the
 //! [`AggregateRepository`](store::prelude::AggregateRepository). The
 //! `subscription` feature re-exports the catch-up subscription side as
-//! [`subscription`]; the Postgres store and projection helpers arrive
-//! with 0.2 — see the design document for the roadmap.
+//! [`subscription`]. The workspace also ships `eventyr-store-postgres`
+//! (the durable `EventStore`/`StreamsAll` over Postgres) and
+//! `eventyr-projection` (projection helpers) as standalone crates; the
+//! umbrella pulls them in as their own features over time — see the
+//! design document for the roadmap.
 //!
 //! ```
 //! use eventyr::prelude::*;

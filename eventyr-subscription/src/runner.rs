@@ -70,6 +70,7 @@ where
     S: SubscriptionSource<Event = E>,
     C: CheckpointStore,
     P: Projection<Event = E>,
+    P::Error: core::fmt::Display,
     F: FnMut(core::time::Duration) -> Fut,
     Fut: Future<Output = ()>,
     E: Clone + Send,
@@ -84,9 +85,14 @@ where
                 }
             }
             SubscriptionAction::Apply { envelope } => {
+                let sequence = envelope.sequence;
                 match projection.apply(&envelope).await {
                     Ok(()) => machine.handle(SubscriptionInput::Applied),
-                    Err(_) => machine.handle(SubscriptionInput::ApplyFailed),
+                    Err(error) => machine.handle(SubscriptionInput::ApplyFailed {
+                        error: StoreError::other(format!(
+                            "projection applying sequence {sequence}: {error}"
+                        )),
+                    }),
                 }
             }
             SubscriptionAction::Ack { checkpoint } => {
@@ -149,6 +155,7 @@ impl<S, C, P> Projector<S, C, P> {
         S: SubscriptionSource<Event = P::Event>,
         C: CheckpointStore,
         P: Projection,
+        P::Error: core::fmt::Display,
         F: FnMut(core::time::Duration) -> Fut,
         Fut: Future<Output = ()>,
         P::Event: Clone + Send,

@@ -54,6 +54,16 @@ pub trait EventStore {
 pub trait StreamsAll: EventStore {
     /// Stream all events across streams, ordered by global sequence,
     /// from `from` (exclusive) onward.
+    ///
+    /// Sequences are strictly increasing but need not be contiguous:
+    /// stores backing the global sequence with an identity column
+    /// (e.g. Postgres `BIGSERIAL`) burn values on rolled-back appends,
+    /// so gaps are permanent and consumers (the subscription machine)
+    /// skip them. A store *must not* emit a later sequence before an
+    /// earlier one it will eventually deliver is durably visible — a
+    /// skipped gap must be a gap forever — so reads that race in-flight
+    /// appends must exclude uncommitted rows (the default
+    /// read-committed snapshot does).
     fn stream_all(
         &self,
         from: Sequence,

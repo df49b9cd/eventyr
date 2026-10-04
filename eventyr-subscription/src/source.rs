@@ -29,8 +29,13 @@ pub trait SubscriptionSource: Send + Sync {
     type Event: Send;
 
     /// Read up to `max` events with sequence > `from`, in global
-    /// sequence order, as a contiguous [`Batch`]. Fewer than `max`
-    /// events — down to zero — means "caught up".
+    /// sequence order, as a [`Batch`]. Fewer than `max` events — down
+    /// to zero — means "caught up". Contiguity is not required (see
+    /// [`Batch`]): identity-column sequences may carry permanent gaps,
+    /// and a poll must return what is durably visible now — the machine
+    /// skips gaps and acks only to the last delivered sequence. What is
+    /// required is strictly increasing sequences strictly after `from`,
+    /// and that `upper` is exactly the last delivered sequence.
     fn fetch(
         &self,
         from: Checkpoint,
@@ -61,7 +66,10 @@ impl<S> StoreSubscription<S> {
 
 /// Errors streaming past the returned batch are dropped with it: the
 /// next poll re-reads from the last ack, under the at-least-once
-/// contract.
+/// contract. Gaps in the upstream stream pass through untouched — the
+/// `StreamsAll` contract (see its docs) makes a gap permanently absent,
+/// and the machine skips it; only ordering violations break the
+/// protocol.
 impl<S: StreamsAll> SubscriptionSource for StoreSubscription<S>
 where
     S: Send + Sync,

@@ -86,7 +86,7 @@ Newtypes for the three position concepts — one representation everywhere (trai
 ```rust
 pub struct StreamId(String); // e.g. "bank_account-<uuid>"
 pub struct Version(u64);    // 1-based position within a stream
-pub struct Sequence(u64);   // global, store-assigned, monotonic
+pub struct Sequence(u64);   // global, store-assigned, monotonically increasing (gaps allowed: identity columns burn values on rolled-back appends)
 
 pub trait AggregateId: Clone + Eq + std::hash::Hash + std::fmt::Debug {}
 

@@ -6,6 +6,7 @@ use futures::future;
 use std::sync::{Arc, Mutex};
 
 use eventyr_core::envelope::{EventEnvelope, Metadata, NewEvent};
+use eventyr_core::error::StoreError;
 use eventyr_core::subscription::{
     Batch, Checkpoint, SubscriptionAction, SubscriptionInput, SubscriptionMachine,
     SubscriptionOutcome, SubscriptionPolicy,
@@ -171,7 +172,7 @@ fn apply_failed_redelivers_the_whole_batch() {
                 ),
             },
             SubscriptionInput::Applied,     // applied 1
-            SubscriptionInput::ApplyFailed, // failed 2
+            SubscriptionInput::ApplyFailed { error: StoreError::other("boom") }, // failed 2
             SubscriptionInput::Slept,
             SubscriptionInput::Fetched {
                 batch: Batch::new(

@@ -81,11 +81,24 @@ impl fmt::Display for Checkpoint {
 /// after the fetch bound. An empty batch never moves the checkpoint, so
 /// an idle subscription provably never stalls mid-batch or regresses.
 ///
+/// Sequences must be strictly increasing and strictly after the acked
+/// checkpoint — but they need not be contiguous. Stores backing the
+/// global sequence with a database identity column burn values on
+/// rolled-back appends, and a snapshot read can observe a later commit
+/// before an earlier one: a gap is treated as permanently absent and
+/// skipped, never stalled on. The at-least-once invariant is kept
+/// because the checkpoint moves only to the last *delivered* sequence:
+/// every sequence below the ack bound was either delivered or skipped
+/// as a gap it will never fill. (Stores therefore must not emit a later
+/// sequence before an earlier one is durably visible; see
+/// `StreamsAll`.)
+///
 /// Delivery is at-least-once: after a crash between apply and ack, the
 /// next poll after the last acked checkpoint re-delivers these events.
 #[derive(Clone, Debug)]
 pub struct Batch<E> {
-    /// The events, contiguous in global sequence after the poll bound.
+    /// The events, strictly increasing in global sequence after the poll
+    /// bound (gaps tolerated and skipped).
     pub events: Vec<EventEnvelope<E>>,
     /// Highest sequence in `events`: the ack target. `None` exactly when
     /// `events` is empty (a caught-up poll acknowledges nothing).
@@ -205,17 +218,26 @@ pub enum SubscriptionAction<E> {
 #[derive(Clone, Debug)]
 pub enum SubscriptionInput<E> {
     /// The answer to [`Fetch`](SubscriptionAction::Fetch): events
-    /// contiguous in global sequence after the requested checkpoint.
+    /// strictly increasing in global sequence after the requested
+    /// checkpoint (gaps tolerated and skipped — see [`Batch`]).
     Fetched {
         /// The fetched events and their upper bound.
         batch: Batch<E>,
     },
     /// The projection accepted the event.
     Applied,
-    /// The projection rejected the event. The machine sleeps and
+    /// The projection rejected the event, carrying a description of the
+    /// rejection so the driver can report it. The machine sleeps and
     /// re-fetches from the last ack, so the offending (and any later)
-    /// event redelivers — the at-least-once contract.
-    ApplyFailed,
+    /// event redelivers — the at-least-once contract. The machine does
+    /// not branch on `error`: the payload exists so a permanently
+    /// unprocessable (poison) event is diagnosable instead of looping
+    /// invisibly; the checkpointer/observer may count repeats and skip
+    /// or dead-letter them.
+    ApplyFailed {
+        /// Why the projection rejected the event, rendered for logging.
+        error: StoreError,
+    },
     /// The checkpoint write persisted.
     Acked,
     /// The checkpoint write failed. Same as an apply failure: sleep and
@@ -336,7 +358,7 @@ impl<E: Clone> SubscriptionMachine<E> {
         match input {
             SubscriptionInput::Fetched { batch } => self.on_fetched(batch),
             SubscriptionInput::Applied => self.on_applied(),
-            SubscriptionInput::ApplyFailed => self.on_apply_failed(),
+            SubscriptionInput::ApplyFailed { error } => self.on_apply_failed(error),
             SubscriptionInput::Acked => self.on_acked(),
             SubscriptionInput::AckFailed => self.on_ack_failed(),
             SubscriptionInput::Slept => self.on_slept(),
@@ -366,15 +388,25 @@ impl<E: Clone> SubscriptionMachine<E> {
         if !matches!(self.phase, Phase::Fetching | Phase::DrainingForStop) {
             return self.violation("`Fetched` outside the fetching phase");
         }
-        // Validate while applying bounds: sequences must be contiguous
-        // and strictly after the acked checkpoint, so a re-delivery bug
-        // in the store lands as a protocol violation, not corruption.
-        let mut expected = self.acked.as_sequence().as_u64().saturating_add(1);
+        // Validate while applying bounds: sequences must be strictly
+        // increasing and strictly after the acked checkpoint, so a
+        // re-delivery or mis-ordering bug in the store lands as a
+        // protocol violation, not corruption. Gaps are *not* a
+        // violation: stores backing the global sequence with an identity
+        // column burn values on rolled-back appends, and a gap is never
+        // delivered later and out of order, so skipping it keeps the
+        // at-least-once invariant — the checkpoint only advances past
+        // sequences that were delivered or will never arrive.
+        let floor = self.acked.as_sequence().as_u64();
+        let mut last = floor;
         for envelope in &batch.events {
-            if envelope.sequence.as_u64() != expected {
-                return self.violation("`Fetched` delivered a non-contiguous sequence");
+            let sequence = envelope.sequence.as_u64();
+            if sequence <= last {
+                return self.violation(
+                    "`Fetched` delivered a sequence not strictly increasing past the ack bound",
+                );
             }
-            expected = expected.saturating_add(1);
+            last = sequence;
         }
         match (batch.events.is_empty(), batch.upper) {
             (true, None) => {
@@ -393,7 +425,7 @@ impl<E: Clone> SubscriptionMachine<E> {
                     }
                 }
             }
-            (false, Some(upper)) if upper.as_sequence().as_u64() == expected - 1 => {
+            (false, Some(upper)) if upper.as_sequence().as_u64() == last => {
                 let draining_for_stop = self.phase == Phase::DrainingForStop;
                 self.upper = Some(upper);
                 self.pending = batch.events;
@@ -446,10 +478,13 @@ impl<E: Clone> SubscriptionMachine<E> {
         self.fetch()
     }
 
-    fn on_apply_failed(&mut self) -> SubscriptionAction<E> {
+    fn on_apply_failed(&mut self, _error: StoreError) -> SubscriptionAction<E> {
         if self.phase != Phase::Applying {
             return self.violation("`ApplyFailed` outside the applying phase");
         }
+        // The error is not the machine's to act on — the policy is
+        // always backoff-and-redeliver — but it has been carried this
+        // far so the driver reports the cause before the retry.
         self.drop_pending_and_sleep()
     }
 
@@ -688,7 +723,9 @@ mod tests {
             batch: batch(vec![envelope(2), envelope(3)]),
         });
         m.handle(SubscriptionInput::Applied);
-        let action = m.handle(SubscriptionInput::ApplyFailed);
+        let action = m.handle(SubscriptionInput::ApplyFailed {
+            error: StoreError::other("boom"),
+        });
         assert!(matches!(
             action,
             SubscriptionAction::Sleep { for_ } if for_ == Duration::from_secs(1)
@@ -868,11 +905,37 @@ mod tests {
     }
 
     #[test]
-    fn a_non_contiguous_batch_is_a_protocol_violation() {
+    fn a_batch_skipping_sequences_is_tolerated_and_acked_at_its_upper() {
+        // Stores backing the global sequence with an identity column
+        // burn values on rolled-back appends: a gap is permanently
+        // absent, and skipping it keeps the at-least-once invariant.
         let mut m = machine();
         m.start();
         let action = m.handle(SubscriptionInput::Fetched {
-            batch: batch(vec![envelope(2)]), // gap at 1
+            batch: batch(vec![envelope(2)]), // gap at 1: skipped
+        });
+        assert!(matches!(action, SubscriptionAction::Apply { .. }));
+        let action = m.handle(SubscriptionInput::Applied);
+        assert!(matches!(
+            action,
+            SubscriptionAction::Ack { checkpoint }
+                if checkpoint == Checkpoint::new(Sequence::new(2))
+        ));
+    }
+
+    #[test]
+    fn a_batch_at_or_below_the_ack_bound_is_a_protocol_violation() {
+        let mut m = machine();
+        m.start();
+        m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(1)]),
+        });
+        m.handle(SubscriptionInput::Applied);
+        m.handle(SubscriptionInput::Acked); // acked at 1
+        // A store that re-delivers the acked sequence inside a later
+        // batch breaks ordering, not contiguity: still a violation.
+        let action = m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(3), envelope(1)]),
         });
         assert!(is_protocol_violation(&action));
     }
@@ -963,7 +1026,9 @@ mod tests {
                 SubscriptionInput::Fetched { batch: batch(events) }
             }),
             Just(SubscriptionInput::Applied),
-            Just(SubscriptionInput::ApplyFailed),
+            Just(SubscriptionInput::ApplyFailed {
+                error: StoreError::other("boom"),
+            }),
             Just(SubscriptionInput::Acked),
             Just(SubscriptionInput::AckFailed),
             Just(SubscriptionInput::Slept),
