@@ -83,6 +83,7 @@ pub mod bus;
 pub mod checkpoint;
 pub mod lease;
 pub mod parked;
+pub mod projection_scenario;
 pub mod runner;
 pub mod saga;
 pub mod source;
@@ -96,9 +97,10 @@ pub mod prelude {
     pub use crate::checkpoint::{CheckpointStore, InMemoryCheckpointStore};
     pub use crate::lease::{InMemoryLeaseStore, LeaseError, LeasePolicy, NoLease, ProjectorLease};
     pub use crate::parked::{InMemoryParkedStore, NoParking, ParkedEvent, ParkedStore};
+    pub use crate::projection_scenario::{ProjectionOutcome, ProjectionScenario};
     pub use crate::runner::{
-        DriverPorts, Fanout, LeasedProjector, Projection, Projector, RunError, SkipRedelivered,
-        drive_projector, drive_projector_blocking, drive_projector_leased,
+        Catch, DriverPorts, Fanout, LeasedProjector, NoCatch, Projection, Projector, RunError,
+        SkipRedelivered, drive_projector, drive_projector_blocking, drive_projector_leased,
     };
     pub use crate::saga::{SagaProjection, drive_saga};
     pub use crate::source::{FilteredSubscription, StoreSubscription, SubscriptionSource};
