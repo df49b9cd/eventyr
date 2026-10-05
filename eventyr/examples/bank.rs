@@ -230,11 +230,21 @@ impl Tagged for AccountEvent {
 
 // -- the multi-stream transfer (0.4) --------------------------------
 
-/// A transfer between two accounts — the batch-machine decision.
+/// A transfer between two accounts — the batch-machine decision. The
+/// decider *is* the command (`Command = Self`), so one `Clone` serves
+/// both slots; the boundary (the two accounts' streams) is named once,
+/// by `AggregateBoundary`.
+#[derive(Clone)]
 struct Transfer {
     from: u64,
     to: u64,
     amount: u64,
+}
+
+impl AggregateBoundary<Account> for Transfer {
+    fn boundary(&self) -> Vec<AccountId> {
+        vec![AccountId(self.from), AccountId(self.to)]
+    }
 }
 
 impl Transfer {
@@ -242,34 +252,12 @@ impl Transfer {
         StreamId::for_aggregate::<Account>(&AccountId(id))
     }
 
-    /// The boundary names its streams twice (once for the loads, once
-    /// for the folds), so one constructor keeps the call honest.
+    /// `for_aggregates` (0.4+) derives the streams and the per-stream
+    /// folds from the boundary the decider itself names — the two-place
+    /// hand-wiring of `BatchMachine::new` (streams *and* a fold map, the
+    /// decider *and* its own command) was exactly that shape by hand.
     fn machine(&self, metadata: Metadata) -> BatchMachine<AccountEvent, AccountError, Transfer> {
-        BatchMachine::new(
-            vec![self.stream_of(self.from), self.stream_of(self.to)],
-            [self.from, self.to]
-                .iter()
-                .map(|&id| {
-                    (
-                        self.stream_of(id),
-                        Box::new(AggregateFold::<Account>(AccountId(id)))
-                            as Box<dyn Fold<AccountEvent>>,
-                    )
-                })
-                .collect(),
-            Transfer {
-                from: self.from,
-                to: self.to,
-                amount: self.amount,
-            },
-            Transfer {
-                from: self.from,
-                to: self.to,
-                amount: self.amount,
-            },
-            RetryPolicy::default(),
-        )
-        .with_metadata(metadata)
+        BatchMachine::for_aggregates(self, RetryPolicy::default()).with_metadata(metadata)
     }
 }
 

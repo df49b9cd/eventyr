@@ -454,7 +454,105 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
             earlier: BTreeMap::new(),
         }
     }
+}
 
+/// The aggregate instances a batch decider's command touches: how a
+/// symmetric decider its own command ([`Decide::Command = Self`]) names
+/// the whole [`BatchMachine`] boundary once.
+///
+/// Implement on a `Decide` type whose streams are all folds of the one
+/// aggregate `A`; [`BatchMachine::for_aggregates`] then derives the
+/// stream ids ([`StreamId::for_aggregate`]) and the [`AggregateFold`]
+/// map from these ids, so the boundary is stated exactly once. This is
+/// not a resolver — the caller still names the boundary, on the decider
+/// itself; it is only the two-places-typing that goes away.
+///
+/// Machines over write-only streams, mixed fold types, or a decider
+/// whose `Command` is a separate type construct with
+/// [`BatchMachine::new`] (or [`BatchMachine::from_decider`]) directly.
+pub trait AggregateBoundary<A: crate::aggregate::Aggregate> {
+    /// The instance ids whose streams form the boundary. May repeat and
+    /// be in any order; the machine sorts and deduplicates by stream.
+    /// Ids, not pairs: the stream id is a pure function of the id, so
+    /// nothing can mismatch.
+    fn boundary(&self) -> Vec<A::Id>;
+}
+
+impl<E, Err, D> BatchMachine<E, Err, D>
+where
+    D: Decide<E, Err, Command = D>,
+{
+    /// Begin an interaction over `streams`, with the decider serving as
+    /// its own command (`Command = Self`): one value, cloned into the
+    /// command slot, instead of naming it twice.
+    ///
+    /// The boundary is still spelled out; use this form when the folds
+    /// are not one aggregate's — a write-only stream, a bespoke
+    /// [`Fold`], a mixed boundary. When every stream folds the same
+    /// aggregate, [`for_aggregates`](Self::for_aggregates) derives this
+    /// call's `streams` and `folds` from the decider too.
+    pub fn from_decider(
+        decider: D,
+        streams: Vec<StreamId>,
+        folds: BTreeMap<StreamId, Box<dyn Fold<E>>>,
+        retry_policy: RetryPolicy,
+    ) -> Self
+    where
+        D: Clone,
+    {
+        let command = decider.clone();
+        Self::new(streams, folds, decider, command, retry_policy)
+    }
+
+    /// Begin an interaction whose boundary is the decider's
+    /// [`AggregateBoundary`]: every stream is the [`StreamId`] of one
+    /// `A` instance, folded by its [`AggregateFold`]. The decider names
+    /// the instance ids once; the stream vec and the fold map are
+    /// derived.
+    ///
+    /// ```
+    /// # use std::collections::BTreeMap;
+    /// # use eventyr_core::batch::{AggregateBoundary, BatchMachine, Decide, BatchDecision};
+    /// # use eventyr_core::vocabulary::StreamId;
+    /// # use eventyr_core::write::RetryPolicy;
+    /// # use eventyr_core::testing::account::{Account, AccountEvent, AccountError, AccountId};
+    /// # use core::any::Any;
+    /// # #[derive(Clone)]
+    /// # struct Transfer { from: u64, to: u64, amount: u64 }
+    /// # impl AggregateBoundary<Account> for Transfer {
+    /// #     fn boundary(&self) -> Vec<AccountId> { vec![AccountId(self.from), AccountId(self.to)] }
+    /// # }
+    /// # impl Decide<AccountEvent, AccountError> for Transfer {
+    /// #     type Command = Self;
+    /// #     fn decide(&self, _: &BTreeMap<StreamId, Box<dyn Any + Send>>, _: &Self)
+    /// #         -> BatchDecision<AccountEvent, AccountError> { BatchDecision::noop() }
+    /// # }
+    /// let transfer = Transfer { from: 1, to: 2, amount: 5 };
+    /// let machine: BatchMachine<AccountEvent, AccountError, Transfer> =
+    ///     BatchMachine::for_aggregates(&transfer, RetryPolicy::default());
+    /// ```
+    ///
+    /// Takes `&D` so the command value stays with the caller; the
+    /// machine clones it once via [`from_decider`](Self::from_decider).
+    pub fn for_aggregates<A>(decider: &D, retry_policy: RetryPolicy) -> Self
+    where
+        D: AggregateBoundary<A> + Clone,
+        A: crate::aggregate::Aggregate<Event = E> + 'static,
+        A::Id: Send,
+        A::State: Send + 'static,
+    {
+        let mut streams = Vec::new();
+        let mut folds: BTreeMap<StreamId, Box<dyn Fold<E>>> = BTreeMap::new();
+        for id in AggregateBoundary::<A>::boundary(decider) {
+            let stream = StreamId::for_aggregate::<A>(&id);
+            folds.insert(stream.clone(), Box::new(AggregateFold::<A>(id)));
+            streams.push(stream);
+        }
+        Self::from_decider(decider.clone(), streams, folds, retry_policy)
+    }
+}
+
+impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
     /// Builder-style: the metadata stamped on every event this batch
     /// emits (0.5.2), applied to each `StreamAppend` at emit time. Set
     /// before [`start`](Self::start); causation/correlation are boundary
@@ -689,6 +787,7 @@ pub(crate) mod transfer {
     }
 
     /// The transfer: withdraw `amount` from `from`, deposit it on `to`.
+    #[derive(Clone)]
     pub struct Transfer {
         /// The account to debit.
         pub from: u64,
@@ -746,6 +845,12 @@ pub(crate) mod transfer {
                     },
                 ),
             ])
+        }
+    }
+
+    impl super::AggregateBoundary<Account> for Transfer {
+        fn boundary(&self) -> Vec<AccountId> {
+            vec![AccountId(self.from), AccountId(self.to)]
         }
     }
 }
@@ -852,6 +957,54 @@ mod tests {
     }
 
     // -- idempotency keys (0.7.5) -----------------------------------------
+
+    #[test]
+    fn for_aggregates_names_the_same_boundary_as_new() {
+        let transfer = Transfer {
+            from: 1,
+            to: 2,
+            amount: 5,
+        };
+        let mut derived: BatchMachine<AccountEvent, TransferError, Transfer> =
+            BatchMachine::for_aggregates(&transfer, RetryPolicy::default());
+        let mut manual = transfer_machine(1, 2, 5, &[1, 2]);
+
+        // The first action is identical: one LoadStreams over exactly
+        // the boundary, sorted and deduplicated by stream.
+        let d0 = derived.start();
+        let m0 = manual.start();
+        let (
+            BatchAction::LoadStreams {
+                streams: ds,
+                from: df,
+            },
+            BatchAction::LoadStreams {
+                streams: ms,
+                from: mf,
+            },
+        ) = (&d0, &m0)
+        else {
+            panic!("both machines start by loading: {d0:?} / {m0:?}")
+        };
+        assert_eq!(ds, ms);
+        assert_eq!(df, mf);
+
+        // And so is the decision on the funded history: the same appends,
+        // each stream guarded by its own expected version.
+        let d_appends = load_funded(&mut derived);
+        let m_appends = load_funded(&mut manual);
+        let (BatchAction::AppendBatch { appends: d }, BatchAction::AppendBatch { appends: m }) =
+            (&d_appends, &m_appends)
+        else {
+            panic!("a funded transfer appends: {d_appends:?} / {m_appends:?}")
+        };
+        let shape = |a: &[StreamAppend<AccountEvent>]| {
+            a.iter()
+                .map(|s| (s.stream_id.clone(), s.expected))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(d), shape(m));
+    }
 
     #[test]
     fn a_replayed_batch_key_returns_the_earlier_commit() {

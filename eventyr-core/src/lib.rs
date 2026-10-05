@@ -151,8 +151,8 @@ pub mod prelude {
 
     pub use crate::aggregate::{Aggregate, AggregateId, Optional};
     pub use crate::batch::{
-        AggregateFold, BatchAction, BatchDecision, BatchInput, BatchMachine, BatchOutcome,
-        CommittedStream, Decide, Fold, NoFold, RoutedDecision, StreamAppend,
+        AggregateBoundary, AggregateFold, BatchAction, BatchDecision, BatchInput, BatchMachine,
+        BatchOutcome, CommittedStream, Decide, Fold, NoFold, RoutedDecision, StreamAppend,
     };
     pub use crate::boundary::{
         AppendCondition, BoundaryAction, BoundaryDecision, BoundaryInput, BoundaryMachine,
