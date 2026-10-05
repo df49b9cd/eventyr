@@ -118,3 +118,18 @@ pub enum ExpectedVersion {
     /// The stream must not exist yet.
     Empty,
 }
+
+impl ExpectedVersion {
+    /// The expectation for an append on top of a fold that reached
+    /// `version`: [`Empty`](ExpectedVersion::Empty) when it folded
+    /// nothing ([`Version::EMPTY`]), [`Exact`](ExpectedVersion::Exact)
+    /// otherwise. The one place the write, batch, and boundary paths
+    /// turn a folded version into a guard.
+    pub const fn after(version: Version) -> Self {
+        if version.as_u64() == Version::EMPTY.as_u64() {
+            Self::Empty
+        } else {
+            Self::Exact(version)
+        }
+    }
+}

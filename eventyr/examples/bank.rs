@@ -184,22 +184,22 @@ impl Decide<AccountEvent, AccountError> for Transfer {
         ) {
             return BatchDecision::reject(error);
         }
-        BatchDecision::of(
-            vec![
+        BatchDecision::of([
+            (
+                StreamId::for_aggregate::<Account>(&AccountId(command.from)),
                 Withdrawn {
                     amount: command.amount,
                 }
                 .into(),
+            ),
+            (
+                StreamId::for_aggregate::<Account>(&AccountId(command.to)),
                 Deposited {
                     amount: command.amount,
                 }
                 .into(),
-            ],
-            vec![
-                StreamId::for_aggregate::<Account>(&AccountId(command.from)),
-                StreamId::for_aggregate::<Account>(&AccountId(command.to)),
-            ],
-        )
+            ),
+        ])
     }
 }
 

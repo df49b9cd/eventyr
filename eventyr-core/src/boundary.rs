@@ -37,16 +37,15 @@
 //! from the event it describes.
 
 use alloc::string::String;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::batch::{CommittedStream, StreamAppend};
-use crate::envelope::{EventEnvelope, Metadata, NewEvent};
-use crate::error::{ProtocolError, StoreError};
+use crate::batch::{CommittedStream, Routed, RoutedDecision, StreamAppend};
+use crate::envelope::{EventEnvelope, Metadata};
+use crate::error::StoreError;
 use crate::event_name::EventName;
-use crate::vocabulary::{ExpectedVersion, Sequence, StreamId};
-use crate::write::RetryPolicy;
+use crate::vocabulary::{ExpectedVersion, Sequence};
+use crate::write::{RetryBudget, RetryPolicy};
 
 /// A domain identifier attached to an event: `"course:c-1"`,
 /// `"student:42"`. Queries select events by tag; the consistency
@@ -245,60 +244,21 @@ pub trait Decision {
     fn apply(&self, state: &mut Self::State, event: &Self::Event);
 
     /// Decide against the folded state: events routed to streams
-    /// ([`BoundaryDecision::of`], [`BoundaryDecision::to`]), a
-    /// rejection, or no change.
+    /// ([`RoutedDecision::of`], [`RoutedDecision::to`]), a rejection
+    /// ([`RoutedDecision::reject`]), or no change
+    /// ([`RoutedDecision::noop`]).
     fn decide(&self, state: &Self::State) -> BoundaryDecision<Self::Event, Self::Error>;
 }
 
-/// The result of [`Decision::decide`]: events routed to streams,
-/// a rejection, or no change.
+/// The [`RoutedDecision`] a [`Decision`] returns: events routed to
+/// streams, a rejection, or no change.
 ///
 /// Events still land in streams — the store is stream-shaped and every
 /// committed event has a stream and a version — but the streams carry
 /// no guard: consistency comes from the [`AppendCondition`], so each
-/// stream is appended with [`ExpectedVersion::Any`].
-pub struct BoundaryDecision<E, Err> {
-    outcome: Result<Vec<(NewEvent<E>, StreamId)>, Err>,
-}
-
-impl<E, Err> BoundaryDecision<E, Err> {
-    /// Accept: append `events`, each routed to the stream at the same
-    /// index of `targets` (the two vecs are the same length).
-    pub fn of(events: Vec<E>, targets: Vec<StreamId>) -> Self {
-        assert_eq!(
-            events.len(),
-            targets.len(),
-            "every event needs a target stream",
-        );
-        Self {
-            outcome: Ok(events.into_iter().map(NewEvent::new).zip(targets).collect()),
-        }
-    }
-
-    /// Accept: append every event to one stream.
-    pub fn to(stream: StreamId, events: Vec<E>) -> Self {
-        Self {
-            outcome: Ok(events
-                .into_iter()
-                .map(|event| (NewEvent::new(event), stream.clone()))
-                .collect()),
-        }
-    }
-
-    /// Reject the decision: a domain outcome, not a failure.
-    pub fn reject(error: Err) -> Self {
-        Self {
-            outcome: Err(error),
-        }
-    }
-
-    /// No change: nothing is appended.
-    pub fn noop() -> Self {
-        Self {
-            outcome: Ok(Vec::new()),
-        }
-    }
-}
+/// stream is appended with [`ExpectedVersion::Any`], and any stream may
+/// be a target.
+pub type BoundaryDecision<E, Err> = RoutedDecision<E, Err>;
 
 /// What the machine wants the driver to do.
 #[derive(Clone, Debug)]
@@ -388,7 +348,7 @@ pub enum BoundaryOutcome<E, Err> {
     Rejected(Err),
     /// The store failed — a conflict that exhausted the retry budget, a
     /// transient error, a fatal one, or a driver protocol violation
-    /// (see [`ProtocolError`]).
+    /// (see [`ProtocolError`](crate::error::ProtocolError)).
     Failed(StoreError),
 }
 
@@ -410,8 +370,7 @@ enum Phase {
 pub struct BoundaryMachine<D: Decision> {
     decision: D,
     query: Query,
-    retry_policy: RetryPolicy,
-    retries_used: u32,
+    retries: RetryBudget,
     phase: Phase,
     state: D::State,
     /// The highest sequence the fold has consumed: the next read's
@@ -434,8 +393,7 @@ impl<D: Decision> BoundaryMachine<D> {
         Self {
             decision,
             query,
-            retry_policy,
-            retries_used: 0,
+            retries: RetryBudget::new(retry_policy),
             phase: Phase::Reading,
             state,
             read_position: Sequence::START,
@@ -549,8 +507,7 @@ impl<D: Decision> BoundaryMachine<D> {
         if sequence <= self.condition_position() {
             return self.violation("conflict reported a position at or before the condition's");
         }
-        if self.retries_used < self.retry_policy.max_retries {
-            self.retries_used += 1;
+        if self.retries.try_consume() {
             self.phase = Phase::Reading;
             // Re-read the fold query's delta from where the fold
             // stopped — never from `sequence`: selected events between
@@ -582,50 +539,31 @@ impl<D: Decision> BoundaryMachine<D> {
     }
 
     fn decide_and_emit(&mut self) -> BoundaryAction<D::Event, D::Error> {
-        match self.decision.decide(&self.state).outcome {
-            Ok(routed) if routed.is_empty() => {
-                self.phase = Phase::Done;
-                BoundaryAction::Done(BoundaryOutcome::Noop)
-            }
-            Ok(routed) => {
-                // Group per stream, preserving the decision's order
-                // within each stream.
-                let mut by_stream: alloc::collections::BTreeMap<StreamId, Vec<NewEvent<D::Event>>> =
-                    alloc::collections::BTreeMap::new();
-                for (event, stream) in routed {
-                    by_stream.entry(stream).or_default().push(NewEvent {
-                        event: event.event,
-                        metadata: self.metadata.clone(),
-                    });
-                }
+        let decision = self.decision.decide(&self.state);
+        let outcome = match decision.into_appends(&self.metadata, |_| Some(ExpectedVersion::Any)) {
+            Routed::Append(appends) => {
                 self.phase = Phase::Appending;
-                BoundaryAction::Append {
-                    appends: by_stream
-                        .into_iter()
-                        .map(|(stream_id, events)| StreamAppend {
-                            stream_id,
-                            expected: ExpectedVersion::Any,
-                            events,
-                        })
-                        .collect(),
+                return BoundaryAction::Append {
+                    appends,
                     condition: AppendCondition {
                         query: self.decision.validation(),
                         after: self.condition_position(),
                     },
-                }
+                };
             }
-            Err(error) => {
-                self.phase = Phase::Done;
-                BoundaryAction::Done(BoundaryOutcome::Rejected(error))
+            Routed::Unroutable => {
+                return self.violation("the decision routed an event the machine cannot append");
             }
-        }
+            Routed::Noop => BoundaryOutcome::Noop,
+            Routed::Rejected(error) => BoundaryOutcome::Rejected(error),
+        };
+        self.phase = Phase::Done;
+        BoundaryAction::Done(outcome)
     }
 
     fn violation(&mut self, message: &'static str) -> BoundaryAction<D::Event, D::Error> {
         self.phase = Phase::Done;
-        BoundaryAction::Done(BoundaryOutcome::Failed(StoreError::Other(Arc::new(
-            ProtocolError::new(message),
-        ))))
+        BoundaryAction::Done(BoundaryOutcome::Failed(StoreError::protocol(message)))
     }
 }
 
@@ -828,6 +766,7 @@ pub mod enrollment {
 mod tests {
     use super::enrollment::*;
     use super::*;
+    use crate::vocabulary::StreamId;
     use alloc::vec;
     use proptest::prelude::*;
 
@@ -862,7 +801,7 @@ mod tests {
     fn is_violation<E, Err>(action: &BoundaryAction<E, Err>) -> bool {
         matches!(
             action,
-            BoundaryAction::Done(BoundaryOutcome::Failed(StoreError::Other(_)))
+            BoundaryAction::Done(BoundaryOutcome::Failed(error)) if error.is_protocol_violation()
         )
     }
 

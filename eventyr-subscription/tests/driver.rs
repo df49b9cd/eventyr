@@ -218,7 +218,9 @@ fn ack_failed_redelivers_the_whole_batch() {
                 ),
             },
             SubscriptionInput::Applied,
-            SubscriptionInput::AckFailed,
+            SubscriptionInput::AckFailed {
+                error: StoreError::Unavailable,
+            },
             SubscriptionInput::Slept,
             SubscriptionInput::Fetched {
                 batch: Batch::new(
