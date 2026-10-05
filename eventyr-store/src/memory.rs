@@ -22,7 +22,10 @@ use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 
 use crate::notify::{CommitSignal, LocalCommitListener, LocalCommitSignal};
-use crate::store::{EventStore, QueryAppend, StreamLifecycle, StreamsAll};
+use crate::store::{
+    EventStore, QueryAppend, StreamLifecycle, StreamsAll, TruncatePlan, plan_truncate,
+    read_starts_before_cut, validate_batch,
+};
 
 struct Inner<E> {
     /// Envelopes per stream, in stream order. After a truncation the
@@ -117,7 +120,8 @@ impl<E: Clone> Inner<E> {
     }
 
     /// Check every stream expectation, then write: the body of
-    /// `append_batch`, shared with `append_if`. Caller holds the lock.
+    /// `append_batch`, shared with `append_if`. Caller holds the lock and
+    /// has already refused a batch naming a stream twice.
     fn append_all(
         &mut self,
         appends: Vec<StreamAppend<E>>,
@@ -244,6 +248,9 @@ where
         &self,
         appends: Vec<StreamAppend<E>>,
     ) -> Result<Vec<CommittedStream<E>>, StoreError> {
+        // A repeated stream would pass pass 1 against the old head and
+        // then conflict in pass 2, after the first half was written.
+        validate_batch(&appends)?;
         let wrote = appends.iter().any(|append| !append.events.is_empty());
         let result = self.lock().append_all(appends);
         self.committed(result, wrote)
@@ -255,25 +262,23 @@ where
         from: Version,
     ) -> impl Stream<Item = Result<EventEnvelope<E>, StoreError>> + Send {
         let inner = self.lock();
-        let read: Vec<Result<EventEnvelope<E>, StoreError>> = match inner.cuts.get(stream_id) {
-            // The read would start before the first kept event.
-            Some(&first) if from.as_u64() + 1 < first => vec![Err(StoreError::Truncated {
-                stream_id: stream_id.clone(),
-                first: Version::new(first),
-            })],
-            _ => inner
-                .streams
-                .get(stream_id)
-                .map(|stream| {
-                    stream
-                        .iter()
-                        .filter(|envelope| envelope.version > from)
-                        .cloned()
-                        .map(Ok)
-                        .collect()
-                })
-                .unwrap_or_default(),
-        };
+        let first_kept = inner.cuts.get(stream_id).copied().unwrap_or(1);
+        let read: Vec<Result<EventEnvelope<E>, StoreError>> =
+            match read_starts_before_cut(stream_id, from, first_kept) {
+                Err(truncated) => vec![Err(truncated)],
+                Ok(()) => inner
+                    .streams
+                    .get(stream_id)
+                    .map(|stream| {
+                        stream
+                            .iter()
+                            .filter(|envelope| envelope.version > from)
+                            .cloned()
+                            .map(Ok)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            };
         iter(read)
     }
 }
@@ -313,16 +318,10 @@ where
     ) -> Result<(), StoreError> {
         let mut inner = self.lock();
         let head = inner.current_version(stream_id);
-        let cut = version.as_u64();
-        if cut > head + 1 {
-            return Err(StoreError::other(format!(
-                "cannot truncate {stream_id} before {version}: it ends at {head}"
-            )));
-        }
         let first = inner.cuts.get(stream_id).copied().unwrap_or(1);
-        if cut <= first {
+        let TruncatePlan::Cut(cut) = plan_truncate(stream_id, head, first, version)? else {
             return Ok(());
-        }
+        };
         inner.cuts.insert(stream_id.clone(), cut);
         if let Some(stream) = inner.streams.get_mut(stream_id) {
             stream.retain(|envelope| envelope.version.as_u64() >= cut);
@@ -356,6 +355,7 @@ where
         appends: Vec<StreamAppend<E>>,
         condition: AppendCondition,
     ) -> Result<Vec<CommittedStream<E>>, StoreError> {
+        validate_batch(&appends)?;
         let wrote = appends.iter().any(|append| !append.events.is_empty());
         let result = {
             let mut inner = self.lock();

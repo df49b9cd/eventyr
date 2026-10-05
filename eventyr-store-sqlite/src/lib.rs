@@ -21,6 +21,8 @@
 //! fjall's single-writer database does, and `append_batch`'s one
 //! transaction across streams is atomic for the same reason.
 
+#[cfg(feature = "checkpoints")]
+mod checkpoints;
 #[cfg(feature = "shred")]
 mod keys;
 #[cfg(feature = "parked")]
@@ -31,7 +33,7 @@ mod store;
 #[cfg(feature = "views")]
 pub mod views;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use eventyr_core::error::StoreError;
 
@@ -48,6 +50,35 @@ pub use keys::SqliteKeyStore;
 
 #[cfg(feature = "parked")]
 pub use parked::SqliteParkedStore;
+
+#[cfg(feature = "checkpoints")]
+pub use checkpoints::SqliteCheckpointStore;
+
+/// Lock a connection shared by this crate's stores — the one poisoning
+/// policy for all of them.
+///
+/// A poisoned lock is taken, not reported. No code under it can leave
+/// the database half-written: rusqlite reports failures as `Result`s,
+/// and every multi-statement write runs in a transaction that rolls back
+/// when its guard drops during the panic. So the panic that poisoned the
+/// lock left SQLite consistent, and refusing every later call — on this
+/// store and on every sibling sharing its connection — would turn one
+/// failed call into a dead database handle.
+pub(crate) fn lock_conn(
+    conn: &Mutex<rusqlite::Connection>,
+) -> MutexGuard<'_, rusqlite::Connection> {
+    conn.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A stored position (version or sequence) back as a `u64`: a negative
+/// one is corrupt data, not a number to wrap.
+pub(crate) fn position(value: i64) -> Result<u64, StoreError> {
+    u64::try_from(value).map_err(|_| {
+        StoreError::from(SqliteStoreError::CorruptRow(format!(
+            "negative position: {value}"
+        )))
+    })
+}
 
 /// The crate-level error: store failures are [`StoreError`] once they
 /// leave the store; this is what those `Other` variants wrap.

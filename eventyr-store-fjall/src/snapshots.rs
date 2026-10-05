@@ -2,9 +2,8 @@
 //! fourth keyspace, `"{stream_id}\0{version:016}"` → JSON
 //! [`Snapshot`]-shaped rows, read through a reverse range scan so the
 //! newest version is the first hit — the port's newest-wins semantics
-//! fall straight out of the key layout.
-
-use std::sync::Mutex;
+//! fall out of the key layout, and `save` drops an offer at or below the
+//! newest stored version so an equal-version offer cannot replace it.
 
 use fjall::{Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace};
 use serde::{Deserialize, Serialize};
@@ -26,12 +25,13 @@ struct StoredSnapshot<S> {
 
 /// The fjall [`SnapshotStore`]: newest-per-stream snapshots in their
 /// own keyspace of the same database the event store uses.
+///
+/// Saves are fjall write transactions, serialized with the event
+/// store's by the database's single-writer lock and fsynced on commit
+/// like every write in this crate.
 pub struct FjallSnapshotStore<S> {
     keyspace: SingleWriterTxDatabase,
     snapshots: SingleWriterTxKeyspace,
-    // `save` is a single-writer transaction against one keyspace;
-    // the lock mirrors the event store's.
-    write_lock: Mutex<()>,
     _state: std::marker::PhantomData<fn() -> S>,
 }
 
@@ -45,7 +45,6 @@ impl<S> FjallSnapshotStore<S> {
             snapshots: keyspace
                 .keyspace(PARTITION_SNAPSHOTS, fjall::KeyspaceCreateOptions::default)?,
             keyspace: keyspace.clone(),
-            write_lock: Mutex::new(()),
             _state: std::marker::PhantomData,
         })
     }
@@ -115,32 +114,36 @@ where
         }
     }
 
-    fn save(
-        &self,
-        snapshot: Snapshot<S>,
-    ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
-        let snapshot = snapshot.clone();
-        async move {
-            let _guard = self
-                .write_lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut tx = self.keyspace.write_tx();
-            let key = Self::key(&snapshot.stream_id, snapshot.version.as_u64());
-            let value = serde_json::to_vec(&StoredSnapshot {
-                version: snapshot.version.as_u64(),
-                state: snapshot.state,
-            })
-            .map_err(|error| {
-                StoreError::Other(std::sync::Arc::new(FjallStoreError::CorruptRow(format!(
-                    "{error}"
-                ))))
-            })?;
-            tx.insert(&self.snapshots, key, value);
-            tx.commit().map_err(|error| {
-                StoreError::Other(std::sync::Arc::new(FjallStoreError::Engine(error)))
-            })
+    async fn save(&self, snapshot: Snapshot<S>) -> Result<(), StoreError> {
+        let mut tx = crate::store::durable_write_tx(&self.keyspace);
+        let key = Self::key(&snapshot.stream_id, snapshot.version.as_u64());
+        // Newest wins: an offer at or below a stored version is
+        // dropped, not written — the write driver saves
+        // fire-and-forget, so a late offer must not replace a newer
+        // (or equal) snapshot. The check runs in the write
+        // transaction, so no save can land between it and the insert.
+        let mut upper = snapshot.stream_id.as_str().as_bytes().to_vec();
+        upper.push(0);
+        upper.push(0xff);
+        if tx
+            .range(&self.snapshots, key.clone()..upper)
+            .next()
+            .is_some()
+        {
+            return Ok(());
         }
+        let value = serde_json::to_vec(&StoredSnapshot {
+            version: snapshot.version.as_u64(),
+            state: snapshot.state,
+        })
+        .map_err(|error| {
+            StoreError::Other(std::sync::Arc::new(FjallStoreError::CorruptRow(format!(
+                "{error}"
+            ))))
+        })?;
+        tx.insert(&self.snapshots, key, value);
+        tx.commit()
+            .map_err(|error| StoreError::Other(std::sync::Arc::new(FjallStoreError::Engine(error))))
     }
 }
 
@@ -148,9 +151,8 @@ where
 mod tests {
     use super::*;
 
-    // The in-memory store can stand in while these compile; the real
-    // coverage is the contract test in this crate's tests/.
-    // Keep the key layout exercised without a database.
+    // The port's behaviour is covered by `snapshot_contract` in this
+    // crate's tests/; this pins the key layout it relies on.
     #[test]
     fn key_layout_orders_by_version() {
         let stream = StreamId::from("account-1");

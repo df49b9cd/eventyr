@@ -20,11 +20,21 @@
 //! enum variant's [`EventName`](eventyr_core::event_name::EventName) in a
 //! separate column — so payload-struct renames are free and historical
 //! payloads stay selectable by an upcaster.
+//!
+//! The migrations are compiled into the crate and run by
+//! [`store::migrate`]. Features add the optional parts: `snapshots`
+//! (the `SnapshotStore`), `views` (the `ViewStore` and inline views,
+//! 0.7.3), `checkpoints` (a durable `CheckpointStore` for subscriptions)
+//! and `time` (envelope timestamps). Every migration runs whatever the
+//! features, so turning one on later needs no schema change.
 
+#[cfg(feature = "checkpoints")]
+pub mod checkpoints;
 pub mod notify;
 #[cfg(feature = "snapshots")]
 pub mod snapshots;
 pub mod store;
+#[cfg(feature = "views")]
 pub mod views;
 
 use std::sync::Arc;
@@ -41,6 +51,8 @@ const RAISE_EXCEPTION: &str = "P0001";
 /// (migration 0009); its `hint` is the stream id.
 const STREAM_CLOSED: &str = "EV001";
 
+#[cfg(feature = "checkpoints")]
+pub use checkpoints::PgCheckpointStore;
 pub use notify::PgCommitSignal;
 pub use store::PgStore;
 

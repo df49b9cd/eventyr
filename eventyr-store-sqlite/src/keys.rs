@@ -55,16 +55,12 @@ impl SqliteKeyStore {
     /// A key store beside an event store, on its connection.
     pub fn beside<E>(store: &crate::SqliteStore<E>) -> Result<Self, SqliteStoreError> {
         let conn = store.conn();
-        conn.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .execute_batch(SCHEMA)?;
+        crate::lock_conn(&conn).execute_batch(SCHEMA)?;
         Ok(Self { conn })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
-        self.conn
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::lock_conn(&self.conn)
     }
 }
 

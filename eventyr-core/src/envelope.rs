@@ -61,6 +61,27 @@ impl Metadata {
         }
     }
 
+    /// Metadata as a store reads it back: the two ids and the
+    /// idempotency key, each from its own column. The timestamp, behind
+    /// the `time` feature, stays `None`; a store that records one sets it
+    /// after.
+    pub fn stored(
+        causation_id: Option<String>,
+        correlation_id: Option<String>,
+        idempotency_key: Option<String>,
+    ) -> Self {
+        #[allow(
+            clippy::needless_update,
+            reason = "no-op without the `time` field; required with it"
+        )]
+        Self {
+            causation_id,
+            correlation_id,
+            idempotency_key,
+            ..Self::default()
+        }
+    }
+
     /// Builder-style: the idempotency key of the command these events
     /// come from (0.7.5).
     pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {

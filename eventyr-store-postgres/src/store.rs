@@ -6,7 +6,6 @@
 //! and the wire format.
 
 use std::future::Future;
-use std::path::Path;
 
 use eventyr_core::batch::{CommittedStream, StreamAppend};
 use eventyr_core::boundary::{AppendCondition, Query, Tagged};
@@ -15,18 +14,18 @@ use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 use eventyr_store::store::{
-    EventFilter, EventStore, FilteredRead, QueryAppend, StreamLifecycle, StreamsAll,
+    EventFilter, EventStore, FilteredRead, QueryAppend, StreamLifecycle, StreamsAll, TruncatePlan,
+    plan_truncate, read_starts_before_cut, sql_position, validate_batch,
 };
 use futures::Stream;
 use sqlx::postgres::PgPool;
 
 use crate::PgStoreError;
-use std::collections::BTreeMap;
+#[cfg(feature = "views")]
 use std::sync::Arc;
 
-use eventyr_projection::inline::{
-    InlineView, InlineViews, RowKey, StoredRow, fold_inline, rows_touched,
-};
+#[cfg(feature = "views")]
+use eventyr_projection::inline::{InlineView, InlineViews};
 
 /// An [`EventStore`] over Postgres, via sqlx, for one event enum `E` —
 /// and, for [`Tagged`] events, [`QueryAppend`] (0.7.1).
@@ -36,14 +35,18 @@ use eventyr_projection::inline::{
 pub struct PgStore<E> {
     pool: PgPool,
     /// Views folded inside every append transaction (0.7.3).
+    #[cfg(feature = "views")]
     inline_views: InlineViews<E>,
+    _event: std::marker::PhantomData<fn() -> E>,
 }
 
 impl<E> Clone for PgStore<E> {
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
+            #[cfg(feature = "views")]
             inline_views: Arc::clone(&self.inline_views),
+            _event: std::marker::PhantomData,
         }
     }
 }
@@ -54,7 +57,9 @@ impl<E> PgStore<E> {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
+            #[cfg(feature = "views")]
             inline_views: Arc::from([]),
+            _event: std::marker::PhantomData,
         }
     }
 
@@ -70,9 +75,42 @@ impl<E> PgStore<E> {
     /// commit-order lock, migration 0006), so inline folds never race;
     /// their cost is added to that serialized section. Keep inline views
     /// cheap, and steer heavy or rarely-read ones to the async path.
+    #[cfg(feature = "views")]
     pub fn with_inline_views(mut self, views: Vec<Arc<dyn InlineView<E>>>) -> Self {
         self.inline_views = views.into();
         self
+    }
+
+    /// Whether appends have inline views to fold — always `false`
+    /// without the `views` feature.
+    #[allow(clippy::unused_self, reason = "constant without the `views` feature")]
+    fn has_inline_views(&self) -> bool {
+        #[cfg(feature = "views")]
+        {
+            !self.inline_views.is_empty()
+        }
+        #[cfg(not(feature = "views"))]
+        {
+            false
+        }
+    }
+
+    /// Fold `committed` into the inline views inside the caller's open
+    /// transaction — a no-op without the `views` feature.
+    async fn write_views(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        committed: &[EventEnvelope<E>],
+    ) -> Result<(), StoreError> {
+        #[cfg(feature = "views")]
+        {
+            crate::views::write_inline_views(conn, &self.inline_views, committed).await
+        }
+        #[cfg(not(feature = "views"))]
+        {
+            let _ = (conn, committed);
+            Ok(())
+        }
     }
 
     /// Build a pool and run the migration.
@@ -88,13 +126,13 @@ impl<E> PgStore<E> {
     }
 }
 
+/// The migrations, compiled into the binary: running them needs no
+/// source tree at run time.
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 /// Run the migrations against a pool.
 pub async fn migrate(pool: &PgPool) -> Result<(), PgStoreError> {
-    let migrations = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    sqlx::migrate::Migrator::new(migrations)
-        .await?
-        .run(pool)
-        .await?;
+    MIGRATOR.run(pool).await?;
     Ok(())
 }
 
@@ -103,37 +141,48 @@ pub async fn migrate(pool: &PgPool) -> Result<(), PgStoreError> {
 const EVENT_COLUMNS: &str =
     "global_sequence, stream_id, stream_version, payload, metadata, created_at";
 
-/// One `append_events` call's arguments: the expectation kind, the
-/// exact version, and the per-event arrays fanned out from one source
-/// of truth so the four stay correlated.
-type AppendArgs = (
-    i16,
-    i64,
-    Vec<String>,
-    Vec<serde_json::Value>,
-    Vec<Option<String>>,
-    Vec<Option<String>>,
-    Vec<Option<String>>,
-);
+/// One `append_events` call's arguments: the expectation, and the
+/// per-event columns fanned out into parallel arrays — one entry per
+/// event in each, built together so they stay correlated.
+struct AppendArgs {
+    /// 0 = Any, 1 = Empty, 2 = Exact (see [`expectation_args`]).
+    expected_kind: i16,
+    /// The version an `Exact` expectation names; 0 otherwise.
+    expected_version: i64,
+    event_types: Vec<String>,
+    payloads: Vec<serde_json::Value>,
+    causation_ids: Vec<Option<String>>,
+    correlation_ids: Vec<Option<String>>,
+    idempotency_keys: Vec<Option<String>>,
+}
 
-fn append_args<E: serde::Serialize + EventName>(
-    expected: ExpectedVersion,
-    events: Vec<NewEvent<E>>,
-) -> Result<AppendArgs, PgStoreError> {
-    let (kind, exact) = expectation_args(expected);
-    let mut names = Vec::with_capacity(events.len());
-    let mut payloads = Vec::with_capacity(events.len());
-    let mut causations = Vec::with_capacity(events.len());
-    let mut correlations = Vec::with_capacity(events.len());
-    let mut keys = Vec::with_capacity(events.len());
-    for new_event in events {
-        names.push(new_event.event.event_name().to_string());
-        payloads.push(serde_json::to_value(&new_event.event).map_err(PgStoreError::from)?);
-        causations.push(new_event.metadata.causation_id);
-        correlations.push(new_event.metadata.correlation_id);
-        keys.push(new_event.metadata.idempotency_key);
+impl AppendArgs {
+    fn new<E: serde::Serialize + EventName>(
+        expected: ExpectedVersion,
+        events: Vec<NewEvent<E>>,
+    ) -> Result<Self, PgStoreError> {
+        let (expected_kind, expected_version) = expectation_args(expected);
+        let mut args = Self {
+            expected_kind,
+            expected_version,
+            event_types: Vec::with_capacity(events.len()),
+            payloads: Vec::with_capacity(events.len()),
+            causation_ids: Vec::with_capacity(events.len()),
+            correlation_ids: Vec::with_capacity(events.len()),
+            idempotency_keys: Vec::with_capacity(events.len()),
+        };
+        for new_event in events {
+            args.event_types
+                .push(new_event.event.event_name().to_string());
+            args.payloads
+                .push(serde_json::to_value(&new_event.event).map_err(PgStoreError::from)?);
+            args.causation_ids.push(new_event.metadata.causation_id);
+            args.correlation_ids.push(new_event.metadata.correlation_id);
+            args.idempotency_keys
+                .push(new_event.metadata.idempotency_key);
+        }
+        Ok(args)
     }
-    Ok((kind, exact, names, payloads, causations, correlations, keys))
 }
 
 /// Run one `append_events` call against `conn` within an open
@@ -143,19 +192,18 @@ async fn append_events_tx(
     stream_id: &str,
     args: AppendArgs,
 ) -> Result<Vec<EventRow>, sqlx::Error> {
-    let (kind, exact, names, payloads, causations, correlations, keys) = args;
     let query = sqlx::AssertSqlSafe(format!(
         "SELECT {EVENT_COLUMNS} FROM append_events($1, $2, $3, $4, $5, $6, $7, $8)"
     ));
     sqlx::query_as::<_, EventRow>(query)
-        .bind(kind)
-        .bind(exact)
+        .bind(args.expected_kind)
+        .bind(args.expected_version)
         .bind(stream_id)
-        .bind(&names[..])
-        .bind(&payloads[..])
-        .bind(&causations[..])
-        .bind(&correlations[..])
-        .bind(&keys[..])
+        .bind(&args.event_types[..])
+        .bind(&args.payloads[..])
+        .bind(&args.causation_ids[..])
+        .bind(&args.correlation_ids[..])
+        .bind(&args.idempotency_keys[..])
         .fetch_all(conn)
         .await
 }
@@ -207,17 +255,18 @@ where
         // data, not a number to wrap.
         let invalid =
             |value: i64| PgStoreError::CorruptRow(format!("negative position in the log: {value}"));
-        // The two ids ride the `metadata` column; the timestamp is
-        // `created_at`, set only when this crate's `time` feature is on.
-        let metadata = Metadata {
-            idempotency_key: metadata.idempotency_key,
-            ..Metadata::of_ids(metadata.causation_id, metadata.correlation_id)
-        };
+        // The ids and the key ride the `metadata` column; the timestamp
+        // is `created_at`, set only when this crate's `time` feature is on.
+        #[cfg_attr(not(feature = "time"), allow(unused_mut))]
+        let mut metadata = Metadata::stored(
+            metadata.causation_id,
+            metadata.correlation_id,
+            metadata.idempotency_key,
+        );
         #[cfg(feature = "time")]
-        let metadata = Metadata {
-            timestamp: Some(row.created_at),
-            ..metadata
-        };
+        {
+            metadata.timestamp = Some(row.created_at);
+        }
         Ok(EventEnvelope {
             sequence: Sequence::new(
                 u64::try_from(row.global_sequence).map_err(|_| invalid(row.global_sequence))?,
@@ -240,8 +289,20 @@ fn expectation_args(expected: ExpectedVersion) -> (i16, i64) {
     match expected {
         ExpectedVersion::Any => (0, 0),
         ExpectedVersion::Empty => (1, 0),
-        ExpectedVersion::Exact(v) => (2, v.as_u64().try_into().unwrap_or(i64::MAX)),
+        ExpectedVersion::Exact(v) => (2, sql_position(v.as_u64())),
     }
+}
+
+/// Take one stream's advisory lock until the transaction ends — the
+/// lock `append_events` takes, through the same SQL function
+/// (migration 0010), so the key is defined once.
+async fn lock_stream(conn: &mut sqlx::PgConnection, stream_id: &str) -> Result<(), StoreError> {
+    sqlx::query("SELECT eventyr_lock_stream($1)")
+        .bind(stream_id)
+        .execute(conn)
+        .await
+        .map_err(PgStoreError::into_store)?;
+    Ok(())
 }
 
 /// Take every appended stream's advisory lock, sorted, before writing
@@ -253,13 +314,8 @@ async fn lock_streams<E>(
 ) -> Result<(), StoreError> {
     let mut ids: Vec<&str> = appends.iter().map(|a| a.stream_id.as_str()).collect();
     ids.sort_unstable();
-    ids.dedup();
-    for id in &ids {
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(id)
-            .execute(&mut *conn)
-            .await
-            .map_err(PgStoreError::into_store)?;
+    for id in ids {
+        lock_stream(&mut *conn, id).await?;
     }
     Ok(())
 }
@@ -285,7 +341,7 @@ where
 {
     let mut committed = Vec::with_capacity(appends.len());
     for append in appends {
-        let args = append_args(append.expected, append.events).map_err(StoreError::from)?;
+        let args = AppendArgs::new(append.expected, append.events).map_err(StoreError::from)?;
         let rows = append_events_tx(&mut *conn, append.stream_id.as_str(), args)
             .await
             .map_err(PgStoreError::into_store)?;
@@ -354,82 +410,15 @@ async fn query_page<'c>(
     rows.map_err(PgStoreError::into_store)
 }
 
-/// Fold `committed` into the inline views and write the changed rows,
-/// inside the caller's open transaction.
-///
-/// No lock of its own: every append path holds the commit-order lock
-/// (migration 0006) by the time it gets here, until commit, so view
-/// folds are already serialized — two appends to different streams
-/// folding into one row cannot both read its old value. If that lock is
-/// ever relaxed (per-tag locking, §14), these rows need their own;
-/// `concurrent_folds_into_one_row_lose_nothing` fails without either.
-async fn write_inline_views<E>(
-    conn: &mut sqlx::PgConnection,
-    views: &[Arc<dyn InlineView<E>>],
-    committed: &[EventEnvelope<E>],
-) -> Result<(), StoreError> {
-    if views.is_empty() || committed.is_empty() {
-        return Ok(());
-    }
-    let touched = rows_touched(views, committed);
-    if touched.is_empty() {
-        return Ok(());
-    }
-    let mut loaded: BTreeMap<RowKey, StoredRow> = BTreeMap::new();
-    for (name, id) in &touched {
-        let row: Option<(i64, serde_json::Value)> = sqlx::query_as(
-            "SELECT version, payload FROM views WHERE view_name = $1 AND view_id = $2",
-        )
-        .bind(name)
-        .bind(id)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(PgStoreError::into_store)?;
-        if let Some((version, payload)) = row {
-            let version = u64::try_from(version).map_err(|_| {
-                StoreError::from(PgStoreError::CorruptRow(format!(
-                    "negative view version: {version}"
-                )))
-            })?;
-            loaded.insert(
-                (name.clone(), id.clone()),
-                StoredRow {
-                    version: Sequence::new(version),
-                    payload,
-                },
-            );
-        }
-    }
-    let rows = fold_inline(views, committed, loaded)
-        .map_err(|error| StoreError::Other(Arc::new(error)))?;
-    for ((name, id), row) in rows {
-        let version = i64::try_from(row.version.as_u64()).map_err(|_| {
-            StoreError::from(PgStoreError::CorruptRow("view version beyond i64".into()))
-        })?;
-        sqlx::query(
-            "INSERT INTO views (view_name, view_id, version, payload) VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (view_name, view_id) DO UPDATE \
-             SET version = EXCLUDED.version, payload = EXCLUDED.payload, updated_at = now() \
-             WHERE views.version < EXCLUDED.version",
-        )
-        .bind(&name)
-        .bind(&id)
-        .bind(version)
-        .bind(&row.payload)
-        .execute(&mut *conn)
-        .await
-        .map_err(PgStoreError::into_store)?;
-    }
-    Ok(())
-}
-
 const QUERY_PAGE: i64 = 512;
 
-/// The advisory lock every append holds from drawing its global
-/// sequence until it commits (migration 0006): sequences become visible
-/// in order, so `stream_all` never shows a later one before an earlier
-/// one that will still commit. Must match the key in `append_events`.
-const COMMIT_ORDER_LOCK: i64 = 7_300_160_413_598_463_541;
+/// The events of every append, in commit order, for the inline views.
+fn all_events<E: Clone>(committed: &[CommittedStream<E>]) -> Vec<EventEnvelope<E>> {
+    committed
+        .iter()
+        .flat_map(|stream| stream.events.iter().cloned())
+        .collect()
+}
 
 impl<E> EventStore for PgStore<E>
 where
@@ -437,22 +426,26 @@ where
 {
     type Event = E;
 
+    /// One `append_events` call: the closed check, the expectation
+    /// check and the insert, under the stream's advisory lock. An empty
+    /// append runs it too, so it is refused exactly when a non-empty one
+    /// would be, and writes nothing.
     fn append(
         &self,
         stream_id: &StreamId,
         expected: ExpectedVersion,
         events: Vec<NewEvent<E>>,
     ) -> impl Future<Output = Result<Vec<EventEnvelope<E>>, StoreError>> + Send {
-        let pool = self.pool.clone();
-        let views = Arc::clone(&self.inline_views);
+        let this = self.clone();
         let stream_id = stream_id.clone();
         async move {
-            if events.is_empty() {
-                return Ok(Vec::new());
-            }
-            let args = append_args(expected, events).map_err(StoreError::from)?;
-            let mut conn = pool.acquire().await.map_err(PgStoreError::into_store)?;
-            if views.is_empty() {
+            let args = AppendArgs::new(expected, events).map_err(StoreError::from)?;
+            let mut conn = this
+                .pool
+                .acquire()
+                .await
+                .map_err(PgStoreError::into_store)?;
+            if !this.has_inline_views() {
                 // No inline views: one autocommitted statement.
                 let rows = append_events_tx(&mut conn, stream_id.as_str(), args)
                     .await
@@ -465,7 +458,7 @@ where
                 .await
                 .map_err(PgStoreError::into_store)?;
             let committed = decode_rows(rows)?;
-            write_inline_views(&mut tx, &views, &committed).await?;
+            this.write_views(&mut tx, &committed).await?;
             tx.commit().await.map_err(PgStoreError::into_store)?;
             Ok(committed)
         }
@@ -484,25 +477,32 @@ where
         &self,
         appends: Vec<StreamAppend<E>>,
     ) -> impl Future<Output = Result<Vec<CommittedStream<E>>, StoreError>> + Send {
-        let pool = self.pool.clone();
-        let views = Arc::clone(&self.inline_views);
+        let this = self.clone();
         async move {
+            // `append_events` reads each stream's head inside the
+            // transaction, so a repeated stream would see its own first
+            // write and append after it — a batch other stores refuse.
+            validate_batch(&appends)?;
             use sqlx::Acquire;
-            let mut conn = pool.acquire().await.map_err(PgStoreError::into_store)?;
+            let mut conn = this
+                .pool
+                .acquire()
+                .await
+                .map_err(PgStoreError::into_store)?;
             let mut tx = conn.begin().await.map_err(PgStoreError::into_store)?;
 
             lock_streams(&mut tx, &appends).await?;
             let committed = append_all_tx(&mut tx, appends).await?;
-            let events: Vec<_> = committed
-                .iter()
-                .flat_map(|c| c.events.iter().cloned())
-                .collect();
-            write_inline_views(&mut tx, &views, &events).await?;
+            this.write_views(&mut tx, &all_events(&committed)).await?;
             tx.commit().await.map_err(PgStoreError::into_store)?;
             Ok(committed)
         }
     }
 
+    /// The truncation cut and the rows, read in one `REPEATABLE READ`
+    /// snapshot: a truncation committing between the two reads would
+    /// otherwise pass the cut check and then return the rows left after
+    /// it — a partial history instead of [`StoreError::Truncated`].
     fn stream(
         &self,
         stream_id: &StreamId,
@@ -511,38 +511,7 @@ where
         let pool = self.pool.clone();
         let stream_id = stream_id.clone();
         Box::pin(async_stream::stream! {
-            let first_kept: Result<Option<i64>, StoreError> = sqlx::query_scalar(
-                "SELECT first_kept FROM stream_lifecycle WHERE stream_id = $1",
-            )
-            .bind(stream_id.as_str())
-            .fetch_optional(&pool)
-            .await
-            .map_err(PgStoreError::into_store);
-            match first_kept {
-                Ok(Some(first)) if (from.as_u64() as i64) + 1 < first => {
-                    yield Err(StoreError::Truncated {
-                        stream_id: stream_id.clone(),
-                        first: Version::new(first as u64),
-                    });
-                    return;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    yield Err(error);
-                    return;
-                }
-            }
-            let query = sqlx::AssertSqlSafe(format!(
-                "SELECT {EVENT_COLUMNS} FROM events WHERE stream_id = $1 AND stream_version > $2 \
-                 ORDER BY stream_version"
-            ));
-            let rows = sqlx::query_as::<_, EventRow>(query)
-            .bind(stream_id.as_str())
-            .bind(from.as_u64().try_into().unwrap_or(i64::MAX))
-            .fetch_all(&pool)
-            .await
-            .map_err(PgStoreError::into_store);
-
+            let rows = read_stream(&pool, &stream_id, from).await;
             let rows = match rows {
                 Ok(rows) => rows,
                 Err(error) => {
@@ -557,6 +526,48 @@ where
     }
 }
 
+/// The body of [`EventStore::stream`] for [`PgStore`]: check the cut and
+/// read the rows inside one read-only `REPEATABLE READ` transaction.
+async fn read_stream(
+    pool: &PgPool,
+    stream_id: &StreamId,
+    from: Version,
+) -> Result<Vec<EventRow>, StoreError> {
+    let mut tx = pool
+        .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await
+        .map_err(PgStoreError::into_store)?;
+    let first_kept: Option<i64> =
+        sqlx::query_scalar("SELECT first_kept FROM stream_lifecycle WHERE stream_id = $1")
+            .bind(stream_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PgStoreError::into_store)?;
+    let first_kept = first_kept.map_or(Ok(1), position)?;
+    read_starts_before_cut(stream_id, from, first_kept)?;
+    let query = sqlx::AssertSqlSafe(format!(
+        "SELECT {EVENT_COLUMNS} FROM events WHERE stream_id = $1 AND stream_version > $2 \
+         ORDER BY stream_version"
+    ));
+    let rows = sqlx::query_as::<_, EventRow>(query)
+        .bind(stream_id.as_str())
+        .bind(sql_position(from.as_u64()))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(PgStoreError::into_store)?;
+    tx.commit().await.map_err(PgStoreError::into_store)?;
+    Ok(rows)
+}
+
+/// A stored position back as a `u64`: a negative one is corrupt data.
+fn position(value: i64) -> Result<u64, StoreError> {
+    u64::try_from(value).map_err(|_| {
+        StoreError::from(PgStoreError::CorruptRow(format!(
+            "negative position: {value}"
+        )))
+    })
+}
+
 impl<E> StreamsAll for PgStore<E>
 where
     E: serde::Serialize + serde::de::DeserializeOwned + EventName + Clone + Send + Sync,
@@ -568,7 +579,7 @@ where
         let pool = self.pool.clone();
         Box::pin(async_stream::stream! {
             const PAGE: i64 = 512;
-            let mut cursor = from.as_u64().try_into().unwrap_or(i64::MAX);
+            let mut cursor = sql_position(from.as_u64());
             loop {
                 let query = sqlx::AssertSqlSafe(format!(
                     "SELECT {EVENT_COLUMNS} FROM events WHERE global_sequence > $1 \
@@ -622,7 +633,7 @@ where
         let pool = self.pool.clone();
         let filter = filter.clone();
         async move {
-            let from_i64: i64 = from.as_u64().try_into().unwrap_or(i64::MAX);
+            let from_i64 = sql_position(from.as_u64());
             let scan_limit = i64::try_from(scan_limit.max(1)).unwrap_or(i64::MAX);
             let bound: Option<i64> = sqlx::query_scalar(
                 "SELECT max(global_sequence) FROM ( \
@@ -694,7 +705,7 @@ where
                 return;
             }
             let types = query_types(&query);
-            let mut cursor = after.as_u64().try_into().unwrap_or(i64::MAX);
+            let mut cursor = sql_position(after.as_u64());
             loop {
                 let rows = match query_page(&pool, types.as_deref(), cursor, QUERY_PAGE).await {
                     Ok(rows) => rows,
@@ -735,23 +746,28 @@ where
         appends: Vec<StreamAppend<E>>,
         condition: AppendCondition,
     ) -> impl Future<Output = Result<Vec<CommittedStream<E>>, StoreError>> + Send {
-        let pool = self.pool.clone();
-        let views = Arc::clone(&self.inline_views);
+        let this = self.clone();
         async move {
+            validate_batch(&appends)?;
             use sqlx::Acquire;
-            let mut conn = pool.acquire().await.map_err(PgStoreError::into_store)?;
+            let mut conn = this
+                .pool
+                .acquire()
+                .await
+                .map_err(PgStoreError::into_store)?;
             let mut tx = conn.begin().await.map_err(PgStoreError::into_store)?;
 
             lock_streams(&mut tx, &appends).await?;
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(COMMIT_ORDER_LOCK)
+            // The same lock `append_events` takes, through the same SQL
+            // function (migration 0010): one definition of the key.
+            sqlx::query("SELECT eventyr_commit_order_lock()")
                 .execute(&mut *tx)
                 .await
                 .map_err(PgStoreError::into_store)?;
 
             if !condition.query.items.is_empty() {
                 let types = query_types(&condition.query);
-                let mut cursor: i64 = condition.after.as_u64().try_into().unwrap_or(i64::MAX);
+                let mut cursor = sql_position(condition.after.as_u64());
                 let mut latest = None;
                 loop {
                     let rows = query_page(&mut *tx, types.as_deref(), cursor, QUERY_PAGE).await?;
@@ -775,11 +791,7 @@ where
             }
 
             let committed = append_all_tx(&mut tx, appends).await?;
-            let events: Vec<_> = committed
-                .iter()
-                .flat_map(|c| c.events.iter().cloned())
-                .collect();
-            write_inline_views(&mut tx, &views, &events).await?;
+            this.write_views(&mut tx, &all_events(&committed)).await?;
             tx.commit().await.map_err(PgStoreError::into_store)?;
             Ok(committed)
         }
@@ -800,11 +812,7 @@ where
         let stream_id = stream_id.clone();
         async move {
             let mut tx = pool.begin().await.map_err(PgStoreError::into_store)?;
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-                .bind(stream_id.as_str())
-                .execute(&mut *tx)
-                .await
-                .map_err(PgStoreError::into_store)?;
+            lock_stream(&mut tx, stream_id.as_str()).await?;
             sqlx::query(
                 "INSERT INTO stream_lifecycle (stream_id, closed) VALUES ($1, TRUE) \
                  ON CONFLICT (stream_id) DO UPDATE SET closed = TRUE",
@@ -828,30 +836,22 @@ where
         let stream_id = stream_id.clone();
         async move {
             let mut tx = pool.begin().await.map_err(PgStoreError::into_store)?;
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-                .bind(stream_id.as_str())
-                .execute(&mut *tx)
-                .await
-                .map_err(PgStoreError::into_store)?;
+            lock_stream(&mut tx, stream_id.as_str()).await?;
+            // The head the same way `append_events` reads it (0010).
             let (head, first): (i64, i64) = sqlx::query_as(
-                "SELECT GREATEST( \
-                     COALESCE((SELECT MAX(stream_version) FROM events WHERE stream_id = $1), 0), \
-                     COALESCE((SELECT head FROM stream_lifecycle WHERE stream_id = $1), 0)), \
+                "SELECT eventyr_stream_head($1), \
                      COALESCE((SELECT first_kept FROM stream_lifecycle WHERE stream_id = $1), 1)",
             )
             .bind(stream_id.as_str())
             .fetch_one(&mut *tx)
             .await
             .map_err(PgStoreError::into_store)?;
-            let cut = i64::try_from(version.as_u64()).unwrap_or(i64::MAX);
-            if cut > head + 1 {
-                return Err(StoreError::other(format!(
-                    "cannot truncate {stream_id} before {version}: it ends at {head}"
-                )));
-            }
-            if cut <= first {
+            let TruncatePlan::Cut(cut) =
+                plan_truncate(&stream_id, position(head)?, position(first)?, version)?
+            else {
                 return Ok(());
-            }
+            };
+            let cut = sql_position(cut);
             sqlx::query(
                 "INSERT INTO stream_lifecycle (stream_id, first_kept, head) VALUES ($1, $2, $3) \
                  ON CONFLICT (stream_id) DO UPDATE SET first_kept = $2, head = $3",
