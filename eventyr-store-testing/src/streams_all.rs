@@ -21,6 +21,7 @@ where
     the_global_stream_orders_across_streams_by_append_order::<E, _>(&make_store());
     the_global_bound_is_exclusive::<E, _>(&make_store());
     sequences_are_strictly_increasing::<E, _>(&make_store());
+    a_bound_past_the_end_reads_nothing::<E, _>(&make_store());
 }
 
 fn append_all<E: ContractEvent, S: StreamsAll<Event = E>>(store: &S, batches: &[(&str, &[u64])]) {
@@ -104,6 +105,22 @@ fn sequences_are_strictly_increasing<E: ContractEvent, S: StreamsAll<Event = E>>
     // The whole stream is already proven globally ordered; a store that
     // delivered a later sequence before an earlier one fails that check.
     assert_eq!(all.len(), 4);
+}
+
+fn a_bound_past_the_end_reads_nothing<E: ContractEvent, S: StreamsAll<Event = E>>(store: &S) {
+    append_all(store, &[("past-a", &[1, 2])]);
+    // A bound no database integer holds must still mean "after
+    // everything" — a store that wraps it into a negative number reads
+    // the whole log instead.
+    let past: Vec<_> = block_on(store.stream_all(Sequence::new(u64::MAX)).try_collect())
+        .expect("global stream read");
+    assert!(
+        past.is_empty(),
+        "nothing lies after the largest sequence: {:?}",
+        past.iter()
+            .map(|envelope| envelope.sequence)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[cfg(test)]

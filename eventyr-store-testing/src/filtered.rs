@@ -18,6 +18,7 @@ use crate::event_store::ContractEvent;
 ///
 /// `E::event_name` must return a name that depends on the payload:
 /// even values `"Even"`, odd values `"Odd"` — the suite filters by it.
+/// [`ParityEvent`](crate::ParityEvent) is that type, ready-made.
 pub fn filtered_read_contract<E, S>(make_store: impl Fn() -> S)
 where
     E: ContractEvent + EventName,
@@ -28,6 +29,7 @@ where
     reports_progress_through_unmatched_runs::<E, _>(&make_store());
     an_empty_store_scans_nothing::<E, _>(&make_store());
     prefixes_match_literally::<E, _>(&make_store());
+    a_bound_past_the_end_scans_nothing::<E, _>(&make_store());
 }
 
 fn seed<E: ContractEvent, S: StreamsAll<Event = E>>(store: &S, stream: &str, values: &[u64]) {
@@ -161,6 +163,19 @@ where
     assert_eq!(empty.scanned, Sequence::START);
 }
 
+fn a_bound_past_the_end_scans_nothing<E, S>(store: &S)
+where
+    E: ContractEvent + EventName,
+    S: StreamsAll<Event = E>,
+{
+    seed(store, "account-1", &[1, 2]);
+    // A bound no database integer holds: it must still mean "after
+    // everything", not wrap around to "before everything".
+    let past = read(store, u64::MAX, &EventFilter::all(), 10, 10);
+    assert!(past.events.is_empty(), "{:?}", values(&past));
+    assert_eq!(past.scanned, Sequence::new(u64::MAX));
+}
+
 fn prefixes_match_literally<E, S>(store: &S)
 where
     E: ContractEvent + EventName,
@@ -202,31 +217,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::filtered_read_contract;
-    use eventyr_core::event_name::EventName;
+    use crate::ParityEvent;
     use eventyr_store::memory::InMemoryStore;
-
-    /// A `u64` whose stored name depends on its parity.
-    #[derive(Clone, Copy, PartialEq, Debug)]
-    struct Parity(u64);
-
-    impl From<u64> for Parity {
-        fn from(value: u64) -> Self {
-            Self(value)
-        }
-    }
-
-    impl EventName for Parity {
-        fn event_name(&self) -> &'static str {
-            if self.0.is_multiple_of(2) {
-                "Even"
-            } else {
-                "Odd"
-            }
-        }
-    }
 
     #[test]
     fn the_default_filtered_read_passes() {
-        filtered_read_contract::<Parity, _>(InMemoryStore::new);
+        filtered_read_contract::<ParityEvent, _>(InMemoryStore::new);
     }
 }

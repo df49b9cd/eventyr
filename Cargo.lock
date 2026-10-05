@@ -552,6 +552,7 @@ version = "0.1.0"
 dependencies = [
  "eventyr-core",
  "eventyr-store",
+ "eventyr-store-fjall",
  "eventyr-store-testing",
  "fjall",
  "futures",
@@ -569,6 +570,7 @@ dependencies = [
  "eventyr-core",
  "eventyr-projection",
  "eventyr-store",
+ "eventyr-store-postgres",
  "eventyr-store-testing",
  "eventyr-subscription",
  "futures",
@@ -607,6 +609,7 @@ dependencies = [
  "eventyr-core",
  "eventyr-store",
  "futures",
+ "serde",
  "tokio",
 ]
 

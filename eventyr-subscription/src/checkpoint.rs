@@ -25,7 +25,9 @@ pub trait CheckpointStore: Send + Sync {
     /// [`ORIGIN`](Checkpoint::ORIGIN) if never written.
     fn load(&self, name: &str) -> impl Future<Output = Result<Checkpoint, StoreError>> + Send;
 
-    /// Persist `checkpoint` as `name`'s position.
+    /// Persist `checkpoint` as `name`'s position, replacing whatever was
+    /// there: the last store wins. The runner only ever moves a name
+    /// forward; a lower store is an operator rewinding the projection.
     fn store(
         &self,
         name: &str,
@@ -38,8 +40,11 @@ pub trait CheckpointStore: Send + Sync {
 /// Convenient for tests and examples. On a restart every projection
 /// resumes from [`ORIGIN`](Checkpoint::ORIGIN) and replays the whole
 /// log — correct under the at-least-once idempotent-apply contract, but
-/// usually not what production wants; use a durable store there (a
-/// Postgres one arrives with `eventyr-store-postgres`).
+/// usually not what production wants; use a durable store there:
+/// `SqliteCheckpointStore` (`eventyr-store-sqlite`'s `checkpoints`
+/// feature) or `PgCheckpointStore` (`eventyr-store-postgres`'s
+/// `checkpoints` feature), beside the parked events and the read
+/// models they guard.
 #[derive(Default)]
 pub struct InMemoryCheckpointStore {
     inner: Mutex<HashMap<String, Checkpoint>>,
@@ -73,6 +78,60 @@ impl CheckpointStore for InMemoryCheckpointStore {
     }
 }
 
+/// Run the [`CheckpointStore`] contract against `make_store`'s fresh
+/// stores. Every implementation runs it.
+///
+/// The contract is the trait's: an unwritten name loads
+/// [`ORIGIN`](Checkpoint::ORIGIN), a stored checkpoint loads back,
+/// names are independent, and the last store wins — including one that
+/// moves a name back, which is how an operator rewinds a projection.
+pub fn checkpoint_store_contract<C: CheckpointStore>(make_store: impl Fn() -> C) {
+    use eventyr_core::vocabulary::Sequence;
+    use futures::executor::block_on;
+
+    let at = |sequence: u64| Checkpoint::new(Sequence::new(sequence));
+
+    let store = make_store();
+    assert_eq!(
+        block_on(store.load("projection-a")).expect("load"),
+        Checkpoint::ORIGIN,
+        "an unwritten name loads the origin"
+    );
+
+    block_on(store.store("projection-a", at(7))).expect("store");
+    assert_eq!(block_on(store.load("projection-a")).expect("load"), at(7));
+    assert_eq!(
+        block_on(store.load("projection-b")).expect("load"),
+        Checkpoint::ORIGIN,
+        "names are independent"
+    );
+
+    block_on(store.store("projection-a", at(9))).expect("store again");
+    assert_eq!(
+        block_on(store.load("projection-a")).expect("load"),
+        at(9),
+        "a later store replaces the position"
+    );
+    block_on(store.store("projection-a", at(3))).expect("rewind");
+    assert_eq!(
+        block_on(store.load("projection-a")).expect("load"),
+        at(3),
+        "the last store wins, even a lower one"
+    );
+
+    block_on(store.store("projection-b", at(u64::from(u32::MAX) + 5))).expect("store b");
+    assert_eq!(
+        block_on(store.load("projection-b")).expect("load"),
+        at(u64::from(u32::MAX) + 5),
+        "a position beyond 32 bits round-trips"
+    );
+    assert_eq!(
+        block_on(store.load("projection-a")).expect("load"),
+        at(3),
+        "storing one name leaves the others alone"
+    );
+}
+
 // Blanket impls so references and `Arc` work wherever a store does.
 
 macro_rules! impl_checkpoint_delegation {
@@ -103,6 +162,11 @@ impl_checkpoint_delegation!(std::sync::Arc<C>);
 mod tests {
     use super::*;
     use eventyr_core::vocabulary::Sequence;
+
+    #[test]
+    fn the_in_memory_checkpoint_store_passes_the_contract() {
+        super::checkpoint_store_contract(InMemoryCheckpointStore::new);
+    }
 
     #[tokio::test]
     async fn an_unwritten_name_loads_the_origin() {

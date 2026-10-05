@@ -55,6 +55,7 @@ where
     stream_reads_start_from_the_exclusive_bound::<E, _>(&make_store());
     appends_are_visible_to_reads::<E, _>(&make_store());
     metadata_round_trips::<E, _>(&make_store());
+    an_empty_append_still_checks_its_expectation::<E, _>(&make_store());
 }
 
 fn appends_are_versioned_positioned_and_typed<E: ContractEvent, S: EventStore<Event = E>>(
@@ -230,6 +231,41 @@ fn metadata_round_trips<E: ContractEvent, S: EventStore<Event = E>>(store: &S) {
         "the idempotency key round-trips (0.7.5)"
     );
     assert_eq!(events[1].metadata.idempotency_key, None);
+}
+
+fn an_empty_append_still_checks_its_expectation<E: ContractEvent, S: EventStore<Event = E>>(
+    store: &S,
+) {
+    let stream = StreamId::from("contract-empty");
+    block_on(append(store, &stream, ExpectedVersion::Empty, &[1])).expect("first append commits");
+
+    // Appending nothing writes nothing, but it is still an append: a
+    // caller using it to assert a version must hear about a conflict.
+    let error = block_on(append(store, &stream, ExpectedVersion::Empty, &[]))
+        .expect_err("an empty append with a violated expectation conflicts");
+    assert!(
+        matches!(error, StoreError::Conflict { current, .. } if current == Version::new(1)),
+        "the conflict reports the current version, got {error:?}"
+    );
+    let error = block_on(append(
+        store,
+        &stream,
+        ExpectedVersion::Exact(Version::new(4)),
+        &[],
+    ))
+    .expect_err("a wrong Exact version conflicts even with nothing to write");
+    assert!(matches!(error, StoreError::Conflict { .. }), "{error:?}");
+
+    let committed = block_on(append(
+        store,
+        &stream,
+        ExpectedVersion::Exact(Version::new(1)),
+        &[],
+    ))
+    .expect("an empty append with a matching expectation succeeds");
+    assert!(committed.is_empty());
+    let events = block_on(stream_of(store, &stream, Version::EMPTY)).expect("stream read");
+    assert_eq!(events.len(), 1, "an empty append writes nothing");
 }
 
 // The contract is self-testing: the in-memory store ships it, so the

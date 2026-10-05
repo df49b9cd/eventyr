@@ -25,6 +25,9 @@ serde_json = { version = "1", default-features = false, features = ["alloc"] }
 thiserror = { version = "2", default-features = false }
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 
+# dev-dependency on ourselves so the contract-suite tests can turn on
+# the feature (a crate's own --features don't reach `tests/`).
 [dev-dependencies]
-eventyr-store-testing = { workspace = true }
+eventyr-store-fjall = { path = ".", features = ["snapshots"] }
+eventyr-store-testing = { workspace = true, features = ["serde"] }
 tempfile = { version = "3" }

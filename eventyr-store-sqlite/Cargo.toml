@@ -21,6 +21,8 @@ views = ["dep:eventyr-projection"]
 shred = ["dep:eventyr-shred"]
 # A `ParkedStore` for subscriptions' poison events (0.7.7).
 parked = ["dep:eventyr-subscription"]
+# A durable `CheckpointStore` for subscriptions.
+checkpoints = ["dep:eventyr-subscription"]
 
 [dependencies]
 eventyr-core = { workspace = true, features = ["serde"] }
@@ -37,7 +39,7 @@ futures = { version = "0.3", default-features = false, features = ["alloc"] }
 # dev-dependency on ourselves so the contract-suite tests can toggle
 # the feature (a crate's own --features don't reach `tests/`).
 [dev-dependencies]
-eventyr-store-sqlite = { path = ".", features = ["snapshots", "views", "shred", "parked"] }
+eventyr-store-sqlite = { path = ".", features = ["snapshots", "views", "shred", "parked", "checkpoints"] }
 eventyr-shred-chacha = { workspace = true }
-eventyr-store-testing = { workspace = true }
+eventyr-store-testing = { workspace = true, features = ["serde"] }
 eventyr-subscription = { workspace = true }

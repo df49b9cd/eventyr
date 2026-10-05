@@ -75,24 +75,61 @@ fn total() -> Arc<dyn InlineView<Event>> {
     ))
 }
 
+/// Schemas this file's tests created, dropped by [`drop_schemas`] so a
+/// dev database does not fill with them.
+static SCHEMAS: std::sync::Mutex<Vec<(sqlx::PgPool, sqlx::PgPool, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
 async fn fresh_pool(url: &str, connections: u32) -> sqlx::PgPool {
     let schema = format!("inline_{}", uuid::Uuid::new_v4().simple());
-    let admin = sqlx::PgPool::connect(url).await.expect("connect");
+    // One connection, closed promptly when idle: a test's schemas live
+    // until its cleanup, and the default 100-connection server must
+    // serve every concurrently running test.
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .idle_timeout(std::time::Duration::from_secs(5))
+        .connect(url)
+        .await
+        .expect("connect");
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .execute(&admin)
         .await
         .expect("create schema");
-    admin.close().await;
     let options: sqlx::postgres::PgConnectOptions = url.parse().expect("url");
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(connections)
+        // Bounded waits and prompt idle closes: a failing drop must say
+        // so quickly instead of hanging the suite, and the schemas all
+        // stay open until their test's cleanup — the server's 100
+        // connections serve every concurrently running test.
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .idle_timeout(std::time::Duration::from_secs(5))
         .connect_with(options.options([("search_path", schema.as_str())]))
         .await
         .expect("connect to schema");
     eventyr_store_postgres::store::migrate(&pool)
         .await
         .expect("migrate");
+    SCHEMAS
+        .lock()
+        .expect("registry")
+        .push((pool.clone(), admin, schema));
     pool
+}
+
+/// Drop every schema created so far; call at the end of a test.
+async fn drop_schemas() {
+    let schemas: Vec<_> = std::mem::take(&mut *SCHEMAS.lock().expect("registry"));
+    for (pool, admin, name) in schemas {
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {name} CASCADE"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop schema");
+        admin.close().await;
+    }
 }
 
 fn url() -> String {
@@ -158,6 +195,7 @@ async fn the_row_is_there_when_the_append_returns() {
         Some(100)
     );
     assert_eq!(row(&views, "total", "all").await.map(|r| r.0), Some(116));
+    drop_schemas().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -196,11 +234,16 @@ async fn a_view_that_cannot_fold_fails_the_append() {
     .await
     .expect("read");
     assert!(events.is_empty(), "no event outlives its failed view write");
+    drop_schemas().await;
 }
 
 /// Many appends to *different* streams race to fold into one shared
 /// row. Without the row lock two of them would read the same old total
 /// and one deposit would vanish.
+///
+/// The heaviest pool the file opens: run it alone with the other heavy
+/// test binary's suites out of the way, so a 100-connection server
+/// always has room.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 async fn concurrent_folds_into_one_row_lose_nothing() {
@@ -230,6 +273,7 @@ async fn concurrent_folds_into_one_row_lose_nothing() {
         row(&views, "total", "all").await.map(|r| r.0),
         Some(WRITERS)
     );
+    drop_schemas().await;
 }
 
 /// A plain store (no inline views) still writes no view rows.
@@ -248,4 +292,5 @@ async fn without_inline_views_nothing_is_written() {
         .await
         .expect("append");
     assert!(row(&views, "balance", "account-1").await.is_none());
+    drop_schemas().await;
 }

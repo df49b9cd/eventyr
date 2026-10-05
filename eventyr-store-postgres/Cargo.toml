@@ -18,11 +18,17 @@ time = ["eventyr-core/time", "sqlx/time", "dep:time"]
 # The `SnapshotStore` implementation over the `snapshots` migration.
 # Off by default: stores that only want the event log pay nothing.
 snapshots = []
+# The `ViewStore` port and inline views (0.7.3), over the `views` table.
+views = ["dep:eventyr-projection"]
+# A durable `CheckpointStore` for subscriptions, over the `checkpoints`
+# table (migration 0011).
+checkpoints = ["dep:eventyr-subscription"]
 
 [dependencies]
 eventyr-core = { workspace = true, features = ["serde"] }
 eventyr-store = { workspace = true }
-eventyr-projection = { workspace = true, features = ["inline"] }
+eventyr-projection = { workspace = true, features = ["inline"], optional = true }
+eventyr-subscription = { workspace = true, optional = true }
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
@@ -38,8 +44,12 @@ async-stream = { version = "0.3", default-features = false }
 futures = { version = "0.3", default-features = false, features = ["alloc", "std"] }
 time = { version = "0.3", default-features = false, optional = true }
 
+# dev-dependency on ourselves so the tests can turn on the features
+# they exercise (a crate's own --features don't reach `tests/`).
 [dev-dependencies]
+eventyr-store-postgres = { path = ".", features = ["snapshots", "views", "checkpoints"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+eventyr-projection = { workspace = true, features = ["inline"] }
 eventyr-subscription = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
-eventyr-store-testing = { workspace = true }
+eventyr-store-testing = { workspace = true, features = ["serde"] }

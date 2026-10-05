@@ -9,7 +9,9 @@ use eventyr_core::error::StoreError;
 use eventyr_core::vocabulary::{Sequence, StreamId, Version};
 use eventyr_subscription::parked::{ParkedEvent, ParkedStore};
 
-use crate::SqliteStoreError;
+use eventyr_store::store::sql_position;
+
+use crate::{SqliteStoreError, lock_conn, position};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS parked_events (
@@ -47,9 +49,7 @@ impl<E> SqliteParkedStore<E> {
     /// A parked store beside an event store, on its connection.
     pub fn beside<X>(store: &crate::SqliteStore<X>) -> Result<Self, SqliteStoreError> {
         let conn = store.conn();
-        conn.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .execute_batch(SCHEMA)?;
+        lock_conn(&conn).execute_batch(SCHEMA)?;
         Ok(Self {
             conn,
             _event: std::marker::PhantomData,
@@ -66,18 +66,8 @@ impl<E> SqliteParkedStore<E> {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
-        self.conn
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        lock_conn(&self.conn)
     }
-}
-
-fn position(value: i64) -> Result<u64, StoreError> {
-    u64::try_from(value).map_err(|_| {
-        StoreError::from(SqliteStoreError::CorruptRow(format!(
-            "negative position: {value}"
-        )))
-    })
 }
 
 impl<E> ParkedStore<E> for SqliteParkedStore<E>
@@ -98,9 +88,9 @@ where
                  parked_at = datetime('now')",
                 rusqlite::params![
                     event.subscription,
-                    event.envelope.sequence.as_u64() as i64,
+                    sql_position(event.envelope.sequence.as_u64()),
                     event.envelope.stream_id.as_str(),
-                    event.envelope.version.as_u64() as i64,
+                    sql_position(event.envelope.version.as_u64()),
                     payload,
                     metadata.causation_id,
                     metadata.correlation_id,
@@ -164,10 +154,7 @@ where
                             stream_id: StreamId::from(stream),
                             version: Version::new(position(version)?),
                             event,
-                            metadata: Metadata {
-                                idempotency_key: key,
-                                ..Metadata::of_ids(cause, corr)
-                            },
+                            metadata: Metadata::stored(cause, corr, key),
                         },
                         attempts: u32::try_from(attempts).unwrap_or(u32::MAX),
                         error,
@@ -181,7 +168,7 @@ where
         self.lock()
             .execute(
                 "DELETE FROM parked_events WHERE subscription = ?1 AND global_sequence = ?2",
-                rusqlite::params![subscription, sequence.as_u64() as i64],
+                rusqlite::params![subscription, sql_position(sequence.as_u64())],
             )
             .map_err(SqliteStoreError::into_store)?;
         Ok(())

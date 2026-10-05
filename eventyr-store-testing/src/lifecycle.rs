@@ -1,17 +1,20 @@
 //! The [`StreamLifecycle`] contract checks (0.7.6).
 //!
 //! A store that can close and truncate streams proves it here: a closed
-//! stream refuses every append (single, batch) and keeps its history
+//! stream refuses every append (single, batch, empty, and — through
+//! [`lifecycle_query_append_contract`] — conditional) and keeps its history
 //! readable, closing is idempotent and works on an empty stream, and a
 //! truncated stream refuses reads that would start before the cut while
 //! serving those that start at or after it — in the stream and in the
 //! global log alike.
 
 use eventyr_core::batch::StreamAppend;
+use eventyr_core::boundary::enrollment::EnrollmentEvent;
+use eventyr_core::boundary::{AppendCondition, Query};
 use eventyr_core::envelope::{EventEnvelope, NewEvent};
 use eventyr_core::error::StoreError;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
-use eventyr_store::store::{StreamLifecycle, StreamsAll};
+use eventyr_store::store::{QueryAppend, StreamLifecycle, StreamsAll};
 use futures::TryStreamExt;
 use futures::executor::block_on;
 
@@ -26,6 +29,7 @@ where
 {
     a_closed_stream_refuses_appends_and_keeps_its_history::<E, _>(&make_store());
     a_closed_stream_refuses_batch_appends_atomically::<E, _>(&make_store());
+    a_closed_stream_refuses_an_empty_append::<E, _>(&make_store());
     closing_is_idempotent_and_works_on_an_empty_stream::<E, _>(&make_store());
     a_truncated_stream_refuses_reads_from_before_the_cut::<E, _>(&make_store());
     truncation_reaches_the_global_stream::<E, _>(&make_store());
@@ -129,6 +133,20 @@ where
     assert_eq!(global(store), before, "nothing in the batch was written");
 }
 
+fn a_closed_stream_refuses_an_empty_append<E, S>(store: &S)
+where
+    E: ContractEvent,
+    S: StreamLifecycle<Event = E> + StreamsAll<Event = E>,
+{
+    append(store, "life-a", ExpectedVersion::Empty, &[1]).expect("append");
+    block_on(store.close_stream(&sid("life-a"))).expect("close");
+    // Nothing to write, but the stream is closed: every store answers
+    // the same rather than one of them skipping the check.
+    let error = append(store, "life-a", ExpectedVersion::Any, &[])
+        .expect_err("a closed stream refuses even an empty append");
+    assert!(closed(&error, "life-a"), "{error:?}");
+}
+
 fn closing_is_idempotent_and_works_on_an_empty_stream<E, S>(store: &S)
 where
     E: ContractEvent,
@@ -230,13 +248,84 @@ where
     assert_eq!(read(store, "life-a", 3).expect("read"), vec![E::from(4)]);
 }
 
+/// Run the lifecycle checks of the conditional append path against
+/// `make_store`'s fresh stores: a store that implements both
+/// [`StreamLifecycle`] and [`QueryAppend`] proves that `append_if`
+/// refuses a closed stream like every other append path, atomically.
+///
+/// Separate from [`lifecycle_contract`] because not every store with a
+/// lifecycle serves dynamic consistency boundaries; it speaks the same
+/// enrollment fixture as [`query_append_contract`](crate::query_append_contract).
+pub fn lifecycle_query_append_contract<S>(make_store: impl Fn() -> S)
+where
+    S: StreamLifecycle<Event = EnrollmentEvent> + QueryAppend<Event = EnrollmentEvent>,
+{
+    a_closed_stream_refuses_conditional_appends_atomically(&make_store());
+}
+
+fn a_closed_stream_refuses_conditional_appends_atomically<S>(store: &S)
+where
+    S: StreamLifecycle<Event = EnrollmentEvent> + QueryAppend<Event = EnrollmentEvent>,
+{
+    let defined = |course: &str| EnrollmentEvent::CourseDefined {
+        course: course.into(),
+        seats: 1,
+    };
+    block_on(store.append(
+        &sid("course-c1"),
+        ExpectedVersion::Empty,
+        vec![NewEvent::new(defined("c1"))],
+    ))
+    .expect("append");
+    block_on(store.close_stream(&sid("course-c1"))).expect("close");
+    let before = block_on(store.stream_all(Sequence::START).try_collect::<Vec<_>>())
+        .expect("global read")
+        .len();
+
+    let error = block_on(store.append_if(
+        vec![
+            StreamAppend {
+                stream_id: sid("course-c2"),
+                expected: ExpectedVersion::Any,
+                events: vec![NewEvent::new(defined("c2"))],
+            },
+            StreamAppend {
+                stream_id: sid("course-c1"),
+                expected: ExpectedVersion::Any,
+                events: vec![NewEvent::new(EnrollmentEvent::Enrolled {
+                    course: "c1".into(),
+                    student: "s1".into(),
+                })],
+            },
+        ],
+        AppendCondition {
+            query: Query::none(),
+            after: Sequence::START,
+        },
+    ))
+    .expect_err("a conditional append touching a closed stream fails");
+    assert!(closed(&error, "course-c1"), "{error:?}");
+    let after = block_on(store.stream_all(Sequence::START).try_collect::<Vec<_>>())
+        .expect("global read")
+        .len();
+    assert_eq!(
+        after, before,
+        "nothing in the conditional batch was written"
+    );
+}
+
 #[cfg(test)]
 mod tests {
-    use super::lifecycle_contract;
+    use super::{lifecycle_contract, lifecycle_query_append_contract};
     use eventyr_store::memory::InMemoryStore;
 
     #[test]
     fn the_in_memory_store_passes_the_lifecycle_contract() {
         lifecycle_contract::<u64, _>(InMemoryStore::new);
+    }
+
+    #[test]
+    fn the_in_memory_store_passes_the_conditional_lifecycle_contract() {
+        lifecycle_query_append_contract(InMemoryStore::new);
     }
 }
