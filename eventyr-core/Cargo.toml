@@ -29,8 +29,8 @@ std = []
 
 [dependencies]
 eventyr-macros = { workspace = true, optional = true }
-serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
-time = { version = "0.3", default-features = false, optional = true }
+serde = { workspace = true, features = ["alloc"], optional = true }
+time = { workspace = true, optional = true }
 
 [dev-dependencies]
-proptest = "1"
+proptest.workspace = true

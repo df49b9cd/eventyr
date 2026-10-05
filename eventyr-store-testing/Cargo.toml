@@ -13,8 +13,7 @@ workspace = true
 [dependencies]
 eventyr-core = { workspace = true }
 eventyr-store = { workspace = true }
-futures = { version = "0.3", default-features = false, features = ["alloc", "executor"] }
+futures = { workspace = true, features = ["executor"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
 
