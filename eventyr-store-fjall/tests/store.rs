@@ -214,3 +214,13 @@ fn fjall_store_passes_the_filtered_read_contract() {
         store
     });
 }
+
+#[test]
+fn fjall_store_passes_the_lifecycle_contract() {
+    eventyr_store_testing::lifecycle_contract::<ContractEvent, _>(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FjallStore::<ContractEvent>::open(dir.path()).expect("open");
+        std::mem::forget(dir);
+        store
+    });
+}

@@ -9,7 +9,9 @@ use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 use eventyr_store::notify::{CommitSignal, LocalCommitListener, LocalCommitSignal};
-use eventyr_store::store::{EventFilter, EventStore, FilteredRead, QueryAppend, StreamsAll};
+use eventyr_store::store::{
+    EventFilter, EventStore, FilteredRead, QueryAppend, StreamLifecycle, StreamsAll,
+};
 use futures::Stream;
 use futures::stream::iter;
 
@@ -27,6 +29,15 @@ CREATE TABLE IF NOT EXISTS events (
     idempotency_key TEXT,
     created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE (stream_id, stream_version)
+);
+-- Stream lifecycle (0.7.6): a row only for streams that were closed or
+-- truncated. `head` keeps a truncated stream's version when its rows
+-- are gone; `first_kept` is the first version left.
+CREATE TABLE IF NOT EXISTS stream_lifecycle (
+    stream_id   TEXT    PRIMARY KEY,
+    closed      INTEGER NOT NULL DEFAULT 0,
+    first_kept  INTEGER NOT NULL DEFAULT 1,
+    head        INTEGER NOT NULL DEFAULT 0
 );
 ";
 
@@ -223,6 +234,36 @@ where
     }
 }
 
+/// A stream's lifecycle row, or the defaults for a stream that has none.
+struct Lifecycle {
+    closed: bool,
+    first_kept: i64,
+    head: i64,
+}
+
+fn lifecycle(conn: &rusqlite::Connection, stream_id: &StreamId) -> Result<Lifecycle, StoreError> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row(
+            "SELECT closed, first_kept, head FROM stream_lifecycle WHERE stream_id = ?1",
+            [stream_id.as_str()],
+            |row| {
+                Ok(Lifecycle {
+                    closed: row.get::<_, i64>(0)? != 0,
+                    first_kept: row.get(1)?,
+                    head: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(SqliteStoreError::into_store)?
+        .unwrap_or(Lifecycle {
+            closed: false,
+            first_kept: 1,
+            head: 0,
+        }))
+}
+
 /// The write path, shared by the single-stream and batch appends:
 /// check every head, insert every event, commit. All-or-nothing under
 /// SQLite's transaction; the expectation check runs inside it so a
@@ -236,8 +277,14 @@ where
 {
     let mut committed = Vec::with_capacity(appends.len());
     for (stream_id, expected, events) in appends {
-        // The head, inside the transaction: the current version is the
-        // count of rows the stream holds.
+        let life = lifecycle(tx, stream_id)?;
+        if life.closed {
+            return Err(StoreError::StreamClosed {
+                stream_id: stream_id.clone(),
+            });
+        }
+        // The head, inside the transaction: the newest row's version, or
+        // the recorded head of a stream truncated to nothing.
         let current: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(stream_version), 0) FROM events WHERE stream_id = ?1",
@@ -245,6 +292,7 @@ where
                 |row| row.get(0),
             )
             .map_err(SqliteStoreError::into_store)?;
+        let current = current.max(life.head);
         if !eventyr_store::store::expected_version_matches(*expected, current.max(0) as u64) {
             return Err(StoreError::Conflict {
                 stream_id: Some(stream_id.clone()),
@@ -396,6 +444,16 @@ where
         from: Version,
     ) -> impl Stream<Item = Result<EventEnvelope<E>, StoreError>> + Send {
         let conn = self.lock();
+        match lifecycle(&conn, stream_id) {
+            Ok(life) if (from.as_u64() as i64) + 1 < life.first_kept => {
+                return iter(vec![Err(StoreError::Truncated {
+                    stream_id: stream_id.clone(),
+                    first: Version::new(life.first_kept as u64),
+                })]);
+            }
+            Ok(_) => {}
+            Err(error) => return iter(vec![Err(error)]),
+        }
         let sql = format!(
             "SELECT {EVENT_COLUMNS} FROM events WHERE stream_id = ?1 AND stream_version > ?2 \
              ORDER BY stream_version"
@@ -572,5 +630,66 @@ where
         &self,
     ) -> impl std::future::Future<Output = Result<Self::Listener, StoreError>> + Send {
         self.signal.subscribe()
+    }
+}
+
+impl<E> StreamLifecycle for SqliteStore<E>
+where
+    E: serde::Serialize + serde::de::DeserializeOwned + EventName + Clone + Send + Sync,
+{
+    async fn close_stream(&self, stream_id: &StreamId) -> Result<(), StoreError> {
+        self.lock()
+            .execute(
+                "INSERT INTO stream_lifecycle (stream_id, closed) VALUES (?1, 1) \
+                 ON CONFLICT (stream_id) DO UPDATE SET closed = 1",
+                [stream_id.as_str()],
+            )
+            .map_err(SqliteStoreError::into_store)?;
+        Ok(())
+    }
+
+    /// One `IMMEDIATE` transaction: record the head and the cut, then
+    /// delete the rows below it. The head is recorded so a stream
+    /// truncated to nothing keeps its version.
+    async fn truncate_before(
+        &self,
+        stream_id: &StreamId,
+        version: Version,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(SqliteStoreError::into_store)?;
+        let life = lifecycle(&tx, stream_id)?;
+        let rows_head: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(stream_version), 0) FROM events WHERE stream_id = ?1",
+                [stream_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(SqliteStoreError::into_store)?;
+        let head = rows_head.max(life.head);
+        let cut = version.as_u64() as i64;
+        if cut > head + 1 {
+            return Err(StoreError::other(format!(
+                "cannot truncate {stream_id} before {version}: it ends at {head}"
+            )));
+        }
+        if cut <= life.first_kept {
+            return Ok(());
+        }
+        tx.execute(
+            "INSERT INTO stream_lifecycle (stream_id, first_kept, head) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (stream_id) DO UPDATE SET first_kept = ?2, head = ?3",
+            rusqlite::params![stream_id.as_str(), cut, head],
+        )
+        .map_err(SqliteStoreError::into_store)?;
+        tx.execute(
+            "DELETE FROM events WHERE stream_id = ?1 AND stream_version < ?2",
+            rusqlite::params![stream_id.as_str(), cut],
+        )
+        .map_err(SqliteStoreError::into_store)?;
+        tx.commit().map_err(SqliteStoreError::into_store)?;
+        Ok(())
     }
 }

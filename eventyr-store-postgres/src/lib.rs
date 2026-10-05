@@ -37,6 +37,10 @@ use sqlx::postgres::PgDatabaseError;
 /// signal a version-conflict (its `hint` carries the actual version).
 const RAISE_EXCEPTION: &str = "P0001";
 
+/// The SQLSTATE `append_events` raises for an append to a closed stream
+/// (migration 0009); its `hint` is the stream id.
+const STREAM_CLOSED: &str = "EV001";
+
 pub use notify::PgCommitSignal;
 pub use store::PgStore;
 
@@ -66,6 +70,15 @@ impl PgStoreError {
     /// connection-level failure as [`StoreError::Unavailable`], anything
     /// else as fatal-by-construction.
     pub(crate) fn into_store(error: sqlx::Error) -> StoreError {
+        if let Some(pg) = error
+            .as_database_error()
+            .and_then(|db| db.try_downcast_ref::<PgDatabaseError>())
+            && pg.code() == STREAM_CLOSED
+        {
+            return StoreError::StreamClosed {
+                stream_id: eventyr_core::vocabulary::StreamId::from(pg.hint().unwrap_or_default()),
+            };
+        }
         let conflict = error
             .as_database_error()
             .and_then(|db| db.try_downcast_ref::<PgDatabaseError>())

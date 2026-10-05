@@ -22,13 +22,24 @@ use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 
 use crate::notify::{CommitSignal, LocalCommitListener, LocalCommitSignal};
-use crate::store::{EventStore, QueryAppend, StreamsAll};
+use crate::store::{EventStore, QueryAppend, StreamLifecycle, StreamsAll};
 
 struct Inner<E> {
-    /// Envelopes per stream, in stream order.
+    /// Envelopes per stream, in stream order. After a truncation the
+    /// vec starts at the cut, so a stream's version is its head, not
+    /// the vec's length.
     streams: HashMap<StreamId, Vec<EventEnvelope<E>>>,
     /// Every envelope, in global (append) order.
     global: Vec<EventEnvelope<E>>,
+    /// The highest sequence ever assigned. Not `global.len()`: a
+    /// truncation removes envelopes but never reuses their sequences.
+    next_sequence: u64,
+    /// Each stream's version — its last event's, kept across truncation.
+    heads: HashMap<StreamId, u64>,
+    /// Streams closed to appends (0.7.6).
+    closed: std::collections::HashSet<StreamId>,
+    /// The first kept version of each truncated stream (0.7.6).
+    cuts: HashMap<StreamId, u64>,
 }
 
 // Manual impl: the derive would impose an undesired `E: Default` bound.
@@ -37,15 +48,26 @@ impl<E> Default for Inner<E> {
         Self {
             streams: HashMap::new(),
             global: Vec::new(),
+            next_sequence: 0,
+            heads: HashMap::new(),
+            closed: std::collections::HashSet::new(),
+            cuts: HashMap::new(),
         }
     }
 }
 
 impl<E: Clone> Inner<E> {
     fn current_version(&self, stream_id: &StreamId) -> u64 {
-        self.streams
-            .get(stream_id)
-            .map_or(0, |stream| stream.len() as u64)
+        self.heads.get(stream_id).copied().unwrap_or(0)
+    }
+
+    fn check_open(&self, stream_id: &StreamId) -> Result<(), StoreError> {
+        if self.closed.contains(stream_id) {
+            return Err(StoreError::StreamClosed {
+                stream_id: stream_id.clone(),
+            });
+        }
+        Ok(())
     }
 
     /// Check the expectation against the stream and write the batch,
@@ -57,6 +79,7 @@ impl<E: Clone> Inner<E> {
         expected: ExpectedVersion,
         events: Vec<NewEvent<E>>,
     ) -> Result<Vec<EventEnvelope<E>>, StoreError> {
+        self.check_open(stream_id)?;
         let current = self.current_version(stream_id);
         if !crate::store::expected_version_matches(expected, current) {
             return Err(StoreError::Conflict {
@@ -65,11 +88,18 @@ impl<E: Clone> Inner<E> {
             });
         }
 
-        let base_sequence = self.global.len() as u64;
+        let base_sequence = self.next_sequence;
+        self.next_sequence += events.len() as u64;
+        if !events.is_empty() {
+            self.heads
+                .insert(stream_id.clone(), current + events.len() as u64);
+        }
         let mut committed = Vec::with_capacity(events.len());
         // Split the fields so the stream vec and the global vec can be
         // written in the same loop.
-        let Inner { streams, global } = self;
+        let Inner {
+            streams, global, ..
+        } = self;
         let stream = streams.entry(stream_id.clone()).or_default();
         for (index, new_event) in events.into_iter().enumerate() {
             let envelope = EventEnvelope {
@@ -94,6 +124,7 @@ impl<E: Clone> Inner<E> {
     ) -> Result<Vec<CommittedStream<E>>, StoreError> {
         // Pass 1: every expectation, before anything is written.
         for append in &appends {
+            self.check_open(&append.stream_id)?;
             let current = self.current_version(&append.stream_id);
             if !crate::store::expected_version_matches(append.expected, current) {
                 return Err(StoreError::Conflict {
@@ -224,18 +255,26 @@ where
         from: Version,
     ) -> impl Stream<Item = Result<EventEnvelope<E>, StoreError>> + Send {
         let inner = self.lock();
-        let events: Vec<EventEnvelope<E>> = inner
-            .streams
-            .get(stream_id)
-            .map(|stream| {
-                stream
-                    .iter()
-                    .filter(|envelope| envelope.version > from)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        iter(events.into_iter().map(Ok))
+        let read: Vec<Result<EventEnvelope<E>, StoreError>> = match inner.cuts.get(stream_id) {
+            // The read would start before the first kept event.
+            Some(&first) if from.as_u64() + 1 < first => vec![Err(StoreError::Truncated {
+                stream_id: stream_id.clone(),
+                first: Version::new(first),
+            })],
+            _ => inner
+                .streams
+                .get(stream_id)
+                .map(|stream| {
+                    stream
+                        .iter()
+                        .filter(|envelope| envelope.version > from)
+                        .cloned()
+                        .map(Ok)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        iter(read)
     }
 }
 
@@ -255,6 +294,43 @@ where
             .cloned()
             .collect();
         iter(events.into_iter().map(Ok))
+    }
+}
+
+impl<E> StreamLifecycle for InMemoryStore<E>
+where
+    E: Clone + Send,
+{
+    async fn close_stream(&self, stream_id: &StreamId) -> Result<(), StoreError> {
+        self.lock().closed.insert(stream_id.clone());
+        Ok(())
+    }
+
+    async fn truncate_before(
+        &self,
+        stream_id: &StreamId,
+        version: Version,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        let head = inner.current_version(stream_id);
+        let cut = version.as_u64();
+        if cut > head + 1 {
+            return Err(StoreError::other(format!(
+                "cannot truncate {stream_id} before {version}: it ends at {head}"
+            )));
+        }
+        let first = inner.cuts.get(stream_id).copied().unwrap_or(1);
+        if cut <= first {
+            return Ok(());
+        }
+        inner.cuts.insert(stream_id.clone(), cut);
+        if let Some(stream) = inner.streams.get_mut(stream_id) {
+            stream.retain(|envelope| envelope.version.as_u64() >= cut);
+        }
+        inner.global.retain(|envelope| {
+            &envelope.stream_id != stream_id || envelope.version.as_u64() >= cut
+        });
+        Ok(())
     }
 }
 

@@ -217,6 +217,51 @@ pub struct FilteredRead<E> {
     pub scanned: Sequence,
 }
 
+/// A store that can end a stream's life (0.7.6): close it to further
+/// appends, or drop the oldest part of its history.
+///
+/// Neither operation lets a decision see the wrong state. The write
+/// protocol decides against the stream's whole folded history, so:
+///
+/// - [`close_stream`](Self::close_stream) is a tombstone, not a soft
+///   delete. A deleted stream that later accepted appends would fold an
+///   empty history and then append at version *N + 1*, a decision taken
+///   against state it never saw. A closed stream refuses appends with
+///   [`StoreError::StreamClosed`] instead, and its history stays
+///   readable for projections and audits.
+/// - [`truncate_before`](Self::truncate_before) drops events below a
+///   version, and a read that starts before the cut fails with
+///   [`StoreError::Truncated`] rather than folding a partial history.
+///   Truncate only below a snapshot the readers start from, and only
+///   after every projection that needs the dropped events has passed
+///   them.
+///
+/// Both are permanent. Both reach the global stream as an ordinary
+/// event the caller appends first (a `Closed` or `Archived` variant of
+/// the domain's own enum), so projections see a marker rather than a
+/// silent gap; the port does not invent one, since a store cannot
+/// construct a domain event.
+pub trait StreamLifecycle: EventStore {
+    /// Refuse every later append to `stream_id`. Idempotent. Closing a
+    /// stream that has no events is allowed and reserves the name.
+    fn close_stream(
+        &self,
+        stream_id: &StreamId,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Delete the events of `stream_id` below `version`, keeping
+    /// `version` and everything after it. A later read whose exclusive
+    /// lower bound lies below `version - 1` fails with
+    /// [`StoreError::Truncated`]. Truncating to a version at or below
+    /// the current cut is a no-op; past the stream's end it is an error.
+    /// The global stream loses the same events.
+    fn truncate_before(
+        &self,
+        stream_id: &StreamId,
+        version: Version,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+}
+
 /// A store that can serve dynamic consistency boundaries (0.7.1): read
 /// the events a [`Query`] selects, and append guarded by an
 /// [`AppendCondition`] instead of (only) a stream version.
@@ -361,6 +406,30 @@ macro_rules! impl_port_delegation {
         }
     };
 }
+
+macro_rules! impl_lifecycle_delegation {
+    ($pointer:ty) => {
+        impl<S: StreamLifecycle + ?Sized> StreamLifecycle for $pointer {
+            fn close_stream(
+                &self,
+                stream_id: &StreamId,
+            ) -> impl Future<Output = Result<(), StoreError>> + Send {
+                (**self).close_stream(stream_id)
+            }
+
+            fn truncate_before(
+                &self,
+                stream_id: &StreamId,
+                version: Version,
+            ) -> impl Future<Output = Result<(), StoreError>> + Send {
+                (**self).truncate_before(stream_id, version)
+            }
+        }
+    };
+}
+
+impl_lifecycle_delegation!(&S);
+impl_lifecycle_delegation!(std::sync::Arc<S>);
 
 macro_rules! impl_query_delegation {
     ($pointer:ty) => {

@@ -14,7 +14,9 @@ use eventyr_core::envelope::{EventEnvelope, Metadata, NewEvent};
 use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
-use eventyr_store::store::{EventFilter, EventStore, FilteredRead, QueryAppend, StreamsAll};
+use eventyr_store::store::{
+    EventFilter, EventStore, FilteredRead, QueryAppend, StreamLifecycle, StreamsAll,
+};
 use futures::Stream;
 use sqlx::postgres::PgPool;
 
@@ -509,6 +511,27 @@ where
         let pool = self.pool.clone();
         let stream_id = stream_id.clone();
         Box::pin(async_stream::stream! {
+            let first_kept: Result<Option<i64>, StoreError> = sqlx::query_scalar(
+                "SELECT first_kept FROM stream_lifecycle WHERE stream_id = $1",
+            )
+            .bind(stream_id.as_str())
+            .fetch_optional(&pool)
+            .await
+            .map_err(PgStoreError::into_store);
+            match first_kept {
+                Ok(Some(first)) if (from.as_u64() as i64) + 1 < first => {
+                    yield Err(StoreError::Truncated {
+                        stream_id: stream_id.clone(),
+                        first: Version::new(first as u64),
+                    });
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            }
             let query = sqlx::AssertSqlSafe(format!(
                 "SELECT {EVENT_COLUMNS} FROM events WHERE stream_id = $1 AND stream_version > $2 \
                  ORDER BY stream_version"
@@ -759,6 +782,93 @@ where
             write_inline_views(&mut tx, &views, &events).await?;
             tx.commit().await.map_err(PgStoreError::into_store)?;
             Ok(committed)
+        }
+    }
+}
+
+impl<E> StreamLifecycle for PgStore<E>
+where
+    E: serde::Serialize + serde::de::DeserializeOwned + EventName + Clone + Send + Sync,
+{
+    /// Under the stream's advisory lock, so a close cannot interleave
+    /// with an append that already passed its closed check.
+    fn close_stream(
+        &self,
+        stream_id: &StreamId,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let pool = self.pool.clone();
+        let stream_id = stream_id.clone();
+        async move {
+            let mut tx = pool.begin().await.map_err(PgStoreError::into_store)?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+                .bind(stream_id.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(PgStoreError::into_store)?;
+            sqlx::query(
+                "INSERT INTO stream_lifecycle (stream_id, closed) VALUES ($1, TRUE) \
+                 ON CONFLICT (stream_id) DO UPDATE SET closed = TRUE",
+            )
+            .bind(stream_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(PgStoreError::into_store)?;
+            tx.commit().await.map_err(PgStoreError::into_store)
+        }
+    }
+
+    /// One transaction under the stream's advisory lock: record the head
+    /// and the cut, then delete the rows below it.
+    fn truncate_before(
+        &self,
+        stream_id: &StreamId,
+        version: Version,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let pool = self.pool.clone();
+        let stream_id = stream_id.clone();
+        async move {
+            let mut tx = pool.begin().await.map_err(PgStoreError::into_store)?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+                .bind(stream_id.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(PgStoreError::into_store)?;
+            let (head, first): (i64, i64) = sqlx::query_as(
+                "SELECT GREATEST( \
+                     COALESCE((SELECT MAX(stream_version) FROM events WHERE stream_id = $1), 0), \
+                     COALESCE((SELECT head FROM stream_lifecycle WHERE stream_id = $1), 0)), \
+                     COALESCE((SELECT first_kept FROM stream_lifecycle WHERE stream_id = $1), 1)",
+            )
+            .bind(stream_id.as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(PgStoreError::into_store)?;
+            let cut = i64::try_from(version.as_u64()).unwrap_or(i64::MAX);
+            if cut > head + 1 {
+                return Err(StoreError::other(format!(
+                    "cannot truncate {stream_id} before {version}: it ends at {head}"
+                )));
+            }
+            if cut <= first {
+                return Ok(());
+            }
+            sqlx::query(
+                "INSERT INTO stream_lifecycle (stream_id, first_kept, head) VALUES ($1, $2, $3) \
+                 ON CONFLICT (stream_id) DO UPDATE SET first_kept = $2, head = $3",
+            )
+            .bind(stream_id.as_str())
+            .bind(cut)
+            .bind(head)
+            .execute(&mut *tx)
+            .await
+            .map_err(PgStoreError::into_store)?;
+            sqlx::query("DELETE FROM events WHERE stream_id = $1 AND stream_version < $2")
+                .bind(stream_id.as_str())
+                .bind(cut)
+                .execute(&mut *tx)
+                .await
+                .map_err(PgStoreError::into_store)?;
+            tx.commit().await.map_err(PgStoreError::into_store)
         }
     }
 }

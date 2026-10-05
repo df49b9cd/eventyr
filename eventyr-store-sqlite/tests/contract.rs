@@ -168,3 +168,10 @@ fn tempfile_dir() -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
 }
+
+#[test]
+fn sqlite_store_passes_the_lifecycle_contract() {
+    eventyr_store_testing::lifecycle_contract::<ContractEvent, _>(|| {
+        SqliteStore::<ContractEvent>::open_in_memory().expect("open")
+    });
+}

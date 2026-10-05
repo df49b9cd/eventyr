@@ -14,7 +14,7 @@ use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 use eventyr_store::notify::{CommitSignal, LocalCommitListener, LocalCommitSignal};
-use eventyr_store::store::{EventStore, QueryAppend, StreamsAll};
+use eventyr_store::store::{EventStore, QueryAppend, StreamLifecycle, StreamsAll};
 
 use crate::FjallStoreError;
 
@@ -35,6 +35,10 @@ const PARTITION_STREAMS: &str = "streams";
 const PARTITION_HEADS: &str = "heads";
 const PARTITION_GLOBAL: &str = "global";
 const PARTITION_META: &str = "meta";
+/// `stream_id` → `[closed: u8, first_kept: u64 BE]`, only for streams
+/// that were closed or truncated (0.7.6). `heads` already keeps a
+/// truncated stream's version.
+const PARTITION_LIFECYCLE: &str = "lifecycle";
 const KEY_NEXT_SEQUENCE: &[u8] = b"next";
 
 /// The serialized row in `streams`: everything an
@@ -73,6 +77,7 @@ pub struct FjallStore<E> {
     heads: SingleWriterTxKeyspace,
     global: SingleWriterTxKeyspace,
     meta: SingleWriterTxKeyspace,
+    lifecycle: SingleWriterTxKeyspace,
     /// The write-side serialization point (see the type's docs).
     write_lock: Mutex<()>,
     /// Raised after every commit (0.7.2); shared by clones.
@@ -88,6 +93,7 @@ impl<E> Clone for FjallStore<E> {
             heads: self.heads.clone(),
             global: self.global.clone(),
             meta: self.meta.clone(),
+            lifecycle: self.lifecycle.clone(),
             write_lock: Mutex::new(()),
             signal: self.signal.clone(),
             _event: std::marker::PhantomData,
@@ -117,6 +123,7 @@ impl<E> FjallStore<E> {
             heads: keyspace.keyspace(PARTITION_HEADS, KeyspaceCreateOptions::default)?,
             global: keyspace.keyspace(PARTITION_GLOBAL, KeyspaceCreateOptions::default)?,
             meta: keyspace.keyspace(PARTITION_META, KeyspaceCreateOptions::default)?,
+            lifecycle: keyspace.keyspace(PARTITION_LIFECYCLE, KeyspaceCreateOptions::default)?,
             write_lock: Mutex::new(()),
             signal: LocalCommitSignal::new(),
             keyspace,
@@ -140,6 +147,37 @@ impl<E> FjallStore<E> {
         upper.push(0);
         upper.push(0xff);
         (lower, upper)
+    }
+
+    /// `(closed, first_kept)` for `stream_id`: `(false, 1)` unless the
+    /// stream was closed or truncated.
+    fn life(&self, tx: &impl Readable, stream_id: &StreamId) -> Result<(bool, u64), StoreError> {
+        match tx
+            .get(&self.lifecycle, stream_id.as_str())
+            .map_err(engine)?
+        {
+            None => Ok((false, 1)),
+            Some(value) => {
+                let (closed, first) = value
+                    .split_first()
+                    .ok_or_else(|| corrupt("an empty lifecycle record"))?;
+                let first = first
+                    .first_chunk::<8>()
+                    .ok_or_else(|| corrupt("a lifecycle record without its cut"))?;
+                Ok((*closed != 0, u64::from_be_bytes(*first)))
+            }
+        }
+    }
+
+    fn head(&self, tx: &impl Readable, stream_id: &StreamId) -> Result<u64, StoreError> {
+        match tx.get(&self.heads, stream_id.as_str()).map_err(engine)? {
+            Some(head) => Ok(u64::from_be_bytes(
+                *head
+                    .first_chunk::<8>()
+                    .ok_or_else(|| corrupt("the head is not 8 bytes"))?,
+            )),
+            None => Ok(0),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -210,6 +248,11 @@ impl<E> FjallStore<E> {
         // Pass 1: every head, before anything is written.
         let mut currents = Vec::with_capacity(appends.len());
         for (stream_id, expected, _) in &appends {
+            if self.life(tx, stream_id)?.0 {
+                return Err(StoreError::StreamClosed {
+                    stream_id: stream_id.clone(),
+                });
+            }
             let current = match tx.get(&self.heads, stream_id.as_str()).map_err(engine)? {
                 Some(head) => u64::from_be_bytes(
                     *head
@@ -471,8 +514,18 @@ where
     where
         E: serde::de::DeserializeOwned,
     {
-        let (lower, upper) = Self::stream_range(stream_id, from);
         let tx = self.keyspace.read_tx();
+        match self.life(&tx, stream_id) {
+            Ok((_, first)) if from.as_u64() + 1 < first => {
+                return iter(vec![Err(StoreError::Truncated {
+                    stream_id: stream_id.clone(),
+                    first: Version::new(first),
+                })]);
+            }
+            Ok(_) => {}
+            Err(error) => return iter(vec![Err(error)]),
+        }
+        let (lower, upper) = Self::stream_range(stream_id, from);
         let events: Vec<Result<EventEnvelope<E>, StoreError>> = tx
             .range(&self.streams, lower..upper)
             .map(|guard| self.decode(&guard.value().map_err(engine)?, stream_id))
@@ -556,5 +609,73 @@ where
         &self,
     ) -> impl std::future::Future<Output = Result<Self::Listener, StoreError>> + Send {
         self.signal.subscribe()
+    }
+}
+
+impl<E> StreamLifecycle for FjallStore<E>
+where
+    E: serde::Serialize + serde::de::DeserializeOwned + EventName + Clone + Send + Sync,
+{
+    fn close_stream(
+        &self,
+        stream_id: &StreamId,
+    ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+        let this = self.clone();
+        let stream_id = stream_id.clone();
+        async move {
+            let _guard = this.lock();
+            let mut tx = this.keyspace.write_tx();
+            let (_, first) = this.life(&tx, &stream_id)?;
+            let mut record = vec![1u8];
+            record.extend_from_slice(&first.to_be_bytes());
+            tx.insert(&this.lifecycle, stream_id.as_str(), record);
+            tx.commit().map_err(engine)
+        }
+    }
+
+    /// One write transaction: record the cut, then remove the stream's
+    /// rows below it and their global pointers. The stream's head stays
+    /// in `heads`, so its version survives.
+    fn truncate_before(
+        &self,
+        stream_id: &StreamId,
+        version: Version,
+    ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+        let this = self.clone();
+        let stream_id = stream_id.clone();
+        async move {
+            let _guard = this.lock();
+            let mut tx = this.keyspace.write_tx();
+            let (closed, first) = this.life(&tx, &stream_id)?;
+            let head = this.head(&tx, &stream_id)?;
+            let cut = version.as_u64();
+            if cut > head + 1 {
+                return Err(StoreError::other(format!(
+                    "cannot truncate {stream_id} before {version}: it ends at {head}"
+                )));
+            }
+            if cut <= first {
+                return Ok(());
+            }
+            let (lower, _) = Self::stream_range(&stream_id, Version::new(first - 1));
+            let upper = Self::stream_key(&stream_id, version);
+            let doomed: Vec<(Vec<u8>, u64)> = tx
+                .range(&this.streams, lower..upper)
+                .map(|guard| {
+                    let (key, value) = guard.into_inner().map_err(engine)?;
+                    let row: StoredRow<serde::de::IgnoredAny> =
+                        serde_json::from_slice(&value).map_err(corrupt)?;
+                    Ok((key.to_vec(), row.sequence))
+                })
+                .collect::<Result<_, StoreError>>()?;
+            for (key, sequence) in doomed {
+                tx.remove(&this.streams, key);
+                tx.remove(&this.global, format!("{sequence:016}"));
+            }
+            let mut record = vec![u8::from(closed)];
+            record.extend_from_slice(&cut.to_be_bytes());
+            tx.insert(&this.lifecycle, stream_id.as_str(), record);
+            tx.commit().map_err(engine)
+        }
     }
 }

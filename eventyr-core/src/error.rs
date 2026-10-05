@@ -30,6 +30,24 @@ pub enum StoreError {
         /// The highest matching position the store saw.
         sequence: crate::vocabulary::Sequence,
     },
+    /// The stream is closed (0.7.6): it accepts no more appends. Its
+    /// history stays readable unless it was also truncated.
+    StreamClosed {
+        /// The closed stream.
+        stream_id: StreamId,
+    },
+    /// The read asked for events the store no longer has (0.7.6): the
+    /// stream was truncated, and its first remaining event is at
+    /// `first`. Never folded around — state rebuilt from a partial
+    /// history would be wrong without saying so. A reader that starts
+    /// at or after `first - 1` (a snapshot at or past the cut) is
+    /// unaffected.
+    Truncated {
+        /// The truncated stream.
+        stream_id: StreamId,
+        /// The first version the store still has.
+        first: Version,
+    },
     /// Transient failure (connection lost, timeout). Retrying the whole
     /// interaction is the caller's business; the machine does not retry
     /// I/O.
@@ -53,6 +71,10 @@ impl fmt::Display for StoreError {
                     f,
                     "append condition failed: a matching event exists at {sequence}"
                 )
+            }
+            Self::StreamClosed { stream_id } => write!(f, "stream {stream_id} is closed"),
+            Self::Truncated { stream_id, first } => {
+                write!(f, "stream {stream_id} was truncated: it starts at {first}")
             }
             Self::Unavailable => f.write_str("store unavailable"),
             Self::Other(source) => write!(f, "store failure: {source}"),

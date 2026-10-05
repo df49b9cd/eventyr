@@ -464,3 +464,17 @@ fn pg_store_passes_the_filtered_read_contract() {
     let _guard = runtime.enter();
     eventyr_store_testing::filtered_read_contract::<ParityEvent, _>(|| fresh_store(&runtime, &url));
 }
+
+#[test]
+#[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
+fn pg_store_passes_the_lifecycle_contract() {
+    let url = std::env::var("EVENTYR_TEST_PG_URL")
+        .expect("EVENTYR_TEST_PG_URL must point at a real Postgres");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let _guard = runtime.enter();
+    eventyr_store_testing::lifecycle_contract::<ContractEvent, _>(|| fresh_store(&runtime, &url));
+}
