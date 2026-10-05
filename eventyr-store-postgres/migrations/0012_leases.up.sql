@@ -13,6 +13,5 @@ CREATE TABLE projector_leases (
     ttl_ms       BIGINT      NOT NULL CHECK (ttl_ms > 0),
     grace        INTEGER     NOT NULL CHECK (grace > 0),
     max_grace    INTEGER     NOT NULL CHECK (max_grace > grace),
-    version      BIGINT      NOT NULL,
-    CHECK (version >= 0)
+    version      BIGINT      NOT NULL CHECK (version >= 0)
 );

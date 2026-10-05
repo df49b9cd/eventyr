@@ -90,11 +90,11 @@ fn url() -> String {
 fn pg_lease_store_passes_the_lease_store_contract() {
     let url = url();
     let runtime = runtime();
-    let lease_store = PgLeaseStore::new(&fresh_store::<eventyr_store_testing::PayloadEvent>(
-        &runtime, &url, 1,
-    ));
     {
         let _guard = runtime.enter();
+        let lease_store = PgLeaseStore::new(&fresh_store::<eventyr_store_testing::PayloadEvent>(
+            &runtime, &url, 1,
+        ));
         lease_store_contract(|| lease_store.clone());
     }
     runtime.block_on(cleanup_schemas());
@@ -105,18 +105,17 @@ fn pg_lease_store_passes_the_lease_store_contract() {
 fn two_pools_cannot_hold_one_name() {
     let url = url();
     let runtime = runtime();
-    let one = PgLeaseStore::new(&fresh_store::<eventyr_store_testing::PayloadEvent>(
-        &runtime, &url, 1,
-    ));
-    let two = PgLeaseStore::new(&fresh_store::<eventyr_store_testing::PayloadEvent>(
-        &runtime, &url, 1,
-    ));
+    // Two lease stores over the *same* database: the point of the lease
+    // is that two drivers behind separate pools still share the row.
+    let schema = runtime.block_on(make_schema(&url, 4));
+    let one = PgLeaseStore::from_pool(schema.pool.clone());
+    let two = PgLeaseStore::from_pool(schema.pool.clone());
     let policy = LeasePolicy {
         ttl: Duration::from_secs(30),
         grace: 3,
         max_grace: 12,
     };
-    runtime.block_on(async move {
+    runtime.block_on(async {
         let first = one
             .acquire("balance", policy.ttl, policy.grace, policy.max_grace)
             .await
@@ -128,5 +127,19 @@ fn two_pools_cannot_hold_one_name() {
         ));
         one.release(first).await.expect("release");
     });
-    runtime.block_on(cleanup_schemas());
+    // The stores above hold pool handles into the schema's pool; drop
+    // them before its admin drops the schema.
+    // Close this test's pool itself and tear the schema down; the
+    // shared registry cleanup would wait on these two stores' clones.
+    runtime.block_on(async move {
+        schema.pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {} CASCADE",
+            schema.name
+        )))
+        .execute(&schema.admin)
+        .await
+        .expect("drop schema");
+        schema.admin.close().await;
+    });
 }

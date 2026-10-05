@@ -337,20 +337,32 @@ pub fn lease_store_contract<L: ProjectorLease>(make_store: impl Fn() -> L) {
 
     let policy = LeasePolicy::default();
 
-    // Ttl of 0 makes every lease expiry immediate — the cleanest way to
-    // drive both the "held" and "lost" arms without a clock.
+    // A 1 ms ttl with grace 1 makes every lease expire on the next
+    // microsecond tick — the cleanest way to drive both the "held" and
+    // "lost" arms without a clock, and valid against stores that check
+    // `ttl_ms > 0` (the SQL implementations do).
     let zero = LeasePolicy {
-        ttl: Duration::ZERO,
+        ttl: Duration::from_millis(1),
         grace: 1,
-        max_grace: 1,
+        max_grace: 2, // max_grace > grace
     };
 
     // One name, one holder.
     let store = make_store();
     let lease = block_on(store.acquire("ledger", policy.ttl, policy.grace, policy.max_grace))
         .expect("a fresh name acquires");
+    let contested = LeasePolicy {
+        ttl: Duration::from_millis(1),
+        grace: policy.grace,
+        max_grace: policy.max_grace,
+    };
     assert!(matches!(
-        block_on(store.acquire("ledger", zero.ttl, zero.grace, zero.max_grace)),
+        block_on(store.acquire(
+            "ledger",
+            contested.ttl,
+            contested.grace,
+            contested.max_grace
+        )),
         Err(LeaseError::Taken)
     ));
     block_on(store.release(lease)).expect("release");
@@ -360,11 +372,12 @@ pub fn lease_store_contract<L: ProjectorLease>(make_store: impl Fn() -> L) {
         .expect("released is claimable");
     block_on(store.release(lease)).expect("release");
 
-    // Renewal keeps a lease; a never-renewed lease expires under zero
-    // ttl.
+    // Renewal keeps a lease; a never-renewed lease expires after
+    // ttl * grace — wait the short arm out, then renew is lost.
     let store = make_store();
     let mut lease =
         block_on(store.acquire("ledger", zero.ttl, zero.grace, zero.max_grace)).expect("acquire");
+    std::thread::sleep(Duration::from_millis(10));
     assert!(matches!(
         block_on(store.renew(&mut lease, zero.ttl, zero.grace, zero.max_grace)),
         Err(LeaseError::Lost)

@@ -114,6 +114,8 @@ impl ProjectorLease for PgLeaseStore {
                  max_grace = $5, \
                  version = version + 1 \
              WHERE name = $1 AND holder = $2 AND version = $6 \
+                AND now() < renewed_at + (ttl_ms * grace) * INTERVAL '1 ms' \
+                AND now() < acquired_at + (ttl_ms * max_grace) * INTERVAL '1 ms' \
              RETURNING version",
         )
         .bind(&lease.name)
