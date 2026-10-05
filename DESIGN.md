@@ -599,7 +599,7 @@ Nothing stops two copies of the same projector from running against one checkpoi
 ### Smaller items
 
 - **Projection testing**: a given/when/then `ProjectionScenario` next to `Scenario`, and a `caught_up()` future on the driver, so tests wait on a condition instead of sleeping (Emmett's `whenCaughtUp()` and `PostgreSQLProjectionSpec`).
-- **Focused examples**: `bank.rs` stays the end-to-end proof. A few single-topic examples (a DCB decision, an inline view, a shredded field, a parked event) follow the pieces above as they ship, like `sourcery`'s example set.
+- **Focused examples**: `bank.rs` stays the end-to-end proof — now covering the full shipped surface (snapshots, the saga with its idempotency keys, closure, shredding and erasure, parking and replay, commit-woken projections) with the mirroring suite in `eventyr/tests/bank_story.rs` gating it. The single-topic examples follow the pieces above as they ship, like `sourcery`'s example set: `enrollment.rs` (a DCB decision) and `loan_eligibility.rs` (the narrowed validation query, and the blocking boundary driver) and `inline_view.rs` (inline and async views over SQLite) are shipped. CI runs every example, so their asserts gate merges, not just their compilation.
 
 ### Deferred
 

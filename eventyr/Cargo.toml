@@ -76,3 +76,14 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 futures.workspace = true
 
+# The bank runs the full shipped surface; the focused examples sit
+# behind exactly what they use, so `--all-targets` under default
+# features skips rather than fails them.
+[[example]]
+name = "bank"
+required-features = ["subscription", "projection", "shred_aes_gcm"]
+
+[[example]]
+name = "inline_view"
+required-features = ["sqlite_views"]
+

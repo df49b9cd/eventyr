@@ -55,6 +55,15 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-features
 
+      # The examples are the §0.5.4 worked domain end to end: run them,
+      # so their asserts gate CI, not just their compilation.
+      - name: Examples run
+        run: |
+          cargo run -p eventyr --example bank --all-features
+          cargo run -p eventyr --example enrollment
+          cargo run -p eventyr --example loan_eligibility
+          cargo run -p eventyr --example inline_view --features sqlite_views
+
       # The Postgres-backed suites are `#[ignore]`d for casual `cargo
       # test`; the service above makes the URL real, so run them here.
       # Serial only: the inline-views and contract suites each hold
