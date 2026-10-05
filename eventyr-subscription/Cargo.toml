@@ -22,6 +22,7 @@ testing = []
 eventyr-core.workspace = true
 eventyr-store = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
+uuid.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }

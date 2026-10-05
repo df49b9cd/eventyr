@@ -9,9 +9,10 @@
 //! — lives in `eventyr-core` (DESIGN.md §3: a machine and the types it
 //! transitions on live in core). This crate is the store side: the I/O
 //! ports ([`source::SubscriptionSource`], [`checkpoint::CheckpointStore`],
+//! [`lease::ProjectorLease`] — one driver per checkpoint name, 0.7.9 —
 //! [`runner::Projection`]) and the driver ([`runner::Projector`] /
-//! [`runner::drive_projector`]) it runs against. The `bus` feature
-//! carries the §6 [`bus::Subscription`] shape and the §2
+//! [`runner::drive_projector`], or [`runner::drive_projector_leased`])
+//! it runs against. The `bus` feature carries the §6 [`bus::Subscription`] shape and the §2
 //! [`bus::EventBus`] trait — the 0.3 live-push seam — off by default.
 //! The `testing` feature exports
 //! [`parked::parked_store_contract`] for parked-store implementations
@@ -80,6 +81,7 @@
 #[cfg(feature = "bus")]
 pub mod bus;
 pub mod checkpoint;
+pub mod lease;
 pub mod parked;
 pub mod runner;
 pub mod saga;
@@ -92,10 +94,11 @@ pub mod prelude {
     #[cfg(feature = "bus")]
     pub use crate::bus::{EventBus, Subscription};
     pub use crate::checkpoint::{CheckpointStore, InMemoryCheckpointStore};
+    pub use crate::lease::{InMemoryLeaseStore, LeaseError, LeasePolicy, NoLease, ProjectorLease};
     pub use crate::parked::{InMemoryParkedStore, NoParking, ParkedEvent, ParkedStore};
     pub use crate::runner::{
-        DriverPorts, Fanout, Projection, Projector, SkipRedelivered, drive_projector,
-        drive_projector_blocking,
+        DriverPorts, Fanout, LeasedProjector, Projection, Projector, RunError, SkipRedelivered,
+        drive_projector, drive_projector_blocking, drive_projector_leased,
     };
     pub use crate::saga::{SagaProjection, drive_saga};
     pub use crate::source::{FilteredSubscription, StoreSubscription, SubscriptionSource};
@@ -108,4 +111,9 @@ pub mod prelude {
     };
     pub use eventyr_store::notify::{CommitListener, CommitSignal, LocalCommitSignal, NoSignal};
     pub use eventyr_store::store::EventFilter;
+
+    #[cfg(feature = "testing")]
+    pub use crate::lease::lease_store_contract;
+    #[cfg(feature = "testing")]
+    pub use crate::parked::parked_store_contract;
 }
