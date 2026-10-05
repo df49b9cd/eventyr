@@ -42,6 +42,8 @@ shred_aes_gcm = ["shred", "dep:eventyr-shred-aes-gcm"]
 shred_chacha = ["shred", "dep:eventyr-shred-chacha"]
 # SQLite's subject-key store for crypto-shredding.
 sqlite_shred = ["sqlite", "shred", "eventyr-store-sqlite/shred"]
+# SQLite's parked-event store for poison events (0.7.7).
+sqlite_parked = ["sqlite", "subscription", "eventyr-store-sqlite/parked"]
 # The `Metrics` port's tracing backend (0.5.3): store/projector drivers
 # report through it when this feature is on.
 metrics = ["store", "eventyr-store/tracing"]

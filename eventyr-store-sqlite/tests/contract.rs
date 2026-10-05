@@ -175,3 +175,13 @@ fn sqlite_store_passes_the_lifecycle_contract() {
         SqliteStore::<ContractEvent>::open_in_memory().expect("open")
     });
 }
+
+#[test]
+fn sqlite_parked_store_passes_the_parked_store_contract() {
+    eventyr_subscription::parked::parked_store_contract(|| {
+        eventyr_store_sqlite::SqliteParkedStore::<u64>::from_connection(
+            rusqlite::Connection::open_in_memory().expect("open"),
+        )
+        .expect("schema")
+    });
+}

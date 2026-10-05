@@ -13,7 +13,7 @@
 
 use core::future::Future;
 
-use eventyr_store::metrics::names::{PROJECTED_EVENTS, PROJECTION_FETCH_SPAN};
+use eventyr_store::metrics::names::{PARKED_EVENTS, PROJECTED_EVENTS, PROJECTION_FETCH_SPAN};
 
 use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
@@ -24,6 +24,7 @@ use eventyr_core::subscription::{
 use eventyr_store::notify::{CommitListener, CommitSignal, NoSignal};
 
 use crate::checkpoint::CheckpointStore;
+use crate::parked::{NoParking, ParkedEvent, ParkedStore};
 use crate::source::SubscriptionSource;
 
 /// A read model: folds the global event stream into a queryable shape.
@@ -177,8 +178,8 @@ pub async fn drive_projector_woken<E, S, C, P, F, Fut, W>(
     name: &str,
     source: &S,
     checkpoints: &C,
-    mut projection: P,
-    mut sleep: F,
+    projection: P,
+    sleep: F,
     wake: W,
     metrics: &(dyn eventyr_store::metrics::Metrics + Send + Sync),
 ) -> SubscriptionOutcome
@@ -190,6 +191,49 @@ where
     F: FnMut(core::time::Duration) -> Fut,
     Fut: Future<Output = ()>,
     W: CommitListener,
+    E: Clone + Send,
+{
+    drive_projector_parking(
+        machine,
+        name,
+        source,
+        checkpoints,
+        projection,
+        sleep,
+        wake,
+        &NoParking,
+        metrics,
+    )
+    .await
+}
+
+/// The full driver: [`drive_projector_woken`] that also records the
+/// events its machine parks (0.7.7) in `parked`. A machine whose policy
+/// never parks never calls it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the driver's ports, one argument each — the same shape as the other drivers"
+)]
+pub async fn drive_projector_parking<E, S, C, P, F, Fut, W, K>(
+    machine: &mut SubscriptionMachine<E>,
+    name: &str,
+    source: &S,
+    checkpoints: &C,
+    mut projection: P,
+    mut sleep: F,
+    wake: W,
+    parked: &K,
+    metrics: &(dyn eventyr_store::metrics::Metrics + Send + Sync),
+) -> SubscriptionOutcome
+where
+    S: SubscriptionSource<Event = E>,
+    C: CheckpointStore,
+    P: Projection<Event = E>,
+    P::Error: core::fmt::Display,
+    F: FnMut(core::time::Duration) -> Fut,
+    Fut: Future<Output = ()>,
+    W: CommitListener,
+    K: ParkedStore<E>,
     E: Clone + Send,
 {
     let mut wake = Some(wake);
@@ -237,6 +281,26 @@ where
                             )),
                         })
                     }
+                }
+            }
+            SubscriptionAction::Park {
+                envelope,
+                attempts,
+                error,
+            } => {
+                batch_started = None;
+                let event = ParkedEvent {
+                    subscription: name.to_owned(),
+                    envelope,
+                    attempts,
+                    error: error.to_string(),
+                };
+                match parked.park(event).await {
+                    Ok(()) => {
+                        metrics.counter(PARKED_EVENTS, 1);
+                        machine.handle(SubscriptionInput::Parked)
+                    }
+                    Err(_) => machine.handle(SubscriptionInput::ParkFailed),
                 }
             }
             SubscriptionAction::Ack { checkpoint } => {
@@ -322,13 +386,14 @@ where
 /// Owns a runner per §6 — that is to say, it owns *the machine*, not
 /// the loop: `run` is a future the caller spawns (e.g.
 /// `tokio::spawn(projector.run(..))`).
-pub struct Projector<S, C, P, W = NoSignal> {
+pub struct Projector<S, C, P, W = NoSignal, K = NoParking> {
     source: S,
     checkpoints: C,
     projection: P,
     policy: SubscriptionPolicy,
     name: String,
     wake: W,
+    parked: K,
 }
 
 impl<S, C, P> Projector<S, C, P> {
@@ -342,11 +407,12 @@ impl<S, C, P> Projector<S, C, P> {
             policy: SubscriptionPolicy::default(),
             name: name.into(),
             wake: NoSignal,
+            parked: NoParking,
         }
     }
 }
 
-impl<S, C, P, W> Projector<S, C, P, W> {
+impl<S, C, P, W, K> Projector<S, C, P, W, K> {
     /// Tune the subscription's batch/idle/retry policy.
     pub fn with_policy(mut self, policy: SubscriptionPolicy) -> Self {
         self.policy = policy;
@@ -361,7 +427,7 @@ impl<S, C, P, W> Projector<S, C, P, W> {
     /// Usually the store itself: `.wake_on(store.clone())` for the
     /// in-memory, fjall, and SQLite stores, a
     /// `PgCommitSignal` for Postgres.
-    pub fn wake_on<W2: CommitSignal>(self, signal: W2) -> Projector<S, C, P, W2> {
+    pub fn wake_on<W2: CommitSignal>(self, signal: W2) -> Projector<S, C, P, W2, K> {
         Projector {
             source: self.source,
             checkpoints: self.checkpoints,
@@ -369,6 +435,29 @@ impl<S, C, P, W> Projector<S, C, P, W> {
             policy: self.policy,
             name: self.name,
             wake: signal,
+            parked: self.parked,
+        }
+    }
+
+    /// Park events the projection keeps rejecting (0.7.7): set
+    /// `policy` and record parked events in `store`. With
+    /// [`FailurePolicy::Park`](eventyr_core::subscription::FailurePolicy::Park)
+    /// a poison event no longer stalls the projector; it is recorded,
+    /// skipped, and can be listed and replayed later. Without this the
+    /// projector halts on it, retrying forever.
+    pub fn park_into<K2>(
+        self,
+        store: K2,
+        policy: eventyr_core::subscription::FailurePolicy,
+    ) -> Projector<S, C, P, W, K2> {
+        Projector {
+            source: self.source,
+            checkpoints: self.checkpoints,
+            projection: self.projection,
+            policy: self.policy.on_failure(policy),
+            name: self.name,
+            wake: self.wake,
+            parked: store,
         }
     }
 
@@ -378,7 +467,7 @@ impl<S, C, P, W> Projector<S, C, P, W> {
     }
 }
 
-impl<S, C, P> Projector<S, C, P, NoSignal> {
+impl<S, C, P, K> Projector<S, C, P, NoSignal, K> {
     /// Load the persisted checkpoint, then drive the subscription to
     /// completion, waiting via `sleep` between polls.
     pub async fn run<F, Fut>(self, sleep: F) -> Result<SubscriptionOutcome, StoreError>
@@ -390,12 +479,13 @@ impl<S, C, P> Projector<S, C, P, NoSignal> {
         F: FnMut(core::time::Duration) -> Fut,
         Fut: Future<Output = ()>,
         P::Event: Clone + Send,
+        K: ParkedStore<P::Event>,
     {
         self.drive(sleep, NoSignal).await
     }
 }
 
-impl<S, C, P, W: CommitSignal> Projector<S, C, P, W> {
+impl<S, C, P, W: CommitSignal, K> Projector<S, C, P, W, K> {
     /// Arm the commit listener, load the persisted checkpoint, then
     /// drive the subscription to completion — waiting via `sleep`
     /// between polls, or less when a commit arrives first.
@@ -411,13 +501,14 @@ impl<S, C, P, W: CommitSignal> Projector<S, C, P, W> {
         F: FnMut(core::time::Duration) -> Fut,
         Fut: Future<Output = ()>,
         P::Event: Clone + Send,
+        K: ParkedStore<P::Event>,
     {
         let listener = self.wake.subscribe().await?;
         self.drive(sleep, listener).await
     }
 }
 
-impl<S, C, P, W> Projector<S, C, P, W> {
+impl<S, C, P, W, K> Projector<S, C, P, W, K> {
     async fn drive<F, Fut, L>(
         self,
         sleep: F,
@@ -432,10 +523,11 @@ impl<S, C, P, W> Projector<S, C, P, W> {
         Fut: Future<Output = ()>,
         P::Event: Clone + Send,
         L: CommitListener,
+        K: ParkedStore<P::Event>,
     {
         let resume = self.checkpoints.load(&self.name).await?;
         let mut machine = SubscriptionMachine::new(self.policy, resume);
-        Ok(drive_projector_woken(
+        Ok(drive_projector_parking(
             &mut machine,
             &self.name,
             &self.source,
@@ -443,6 +535,7 @@ impl<S, C, P, W> Projector<S, C, P, W> {
             self.projection,
             sleep,
             listener,
+            &self.parked,
             &eventyr_store::metrics::NoopMetrics,
         )
         .await)

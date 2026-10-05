@@ -23,6 +23,8 @@
 
 #[cfg(feature = "shred")]
 mod keys;
+#[cfg(feature = "parked")]
+mod parked;
 #[cfg(feature = "snapshots")]
 mod snapshots;
 mod store;
@@ -43,6 +45,9 @@ pub use views::SqliteViewStore;
 
 #[cfg(feature = "shred")]
 pub use keys::SqliteKeyStore;
+
+#[cfg(feature = "parked")]
+pub use parked::SqliteParkedStore;
 
 /// The crate-level error: store failures are [`StoreError`] once they
 /// leave the store; this is what those `Other` variants wrap.

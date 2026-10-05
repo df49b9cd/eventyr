@@ -169,6 +169,30 @@ pub struct SubscriptionPolicy {
     /// subscription that stopped merely because it caught up would make
     /// `is_done` mean the wrong thing for the perennial case.
     pub stop_at_catch_up: bool,
+    /// What to do with an event the projection keeps rejecting (0.7.7).
+    /// [`Halt`](FailurePolicy::Halt), the default, retries it forever.
+    pub on_failure: FailurePolicy,
+}
+
+/// What a subscription does with an event its projection keeps
+/// rejecting (0.7.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FailurePolicy {
+    /// Back off and redeliver forever: the projection stalls on the
+    /// event until it applies. The default — skipping an event is a
+    /// correctness decision, never one the library makes for you.
+    #[default]
+    Halt,
+    /// Redeliver up to `retries` more times; then
+    /// [`Park`](SubscriptionAction::Park) the event — record it for
+    /// inspection and replay — and carry on past it as if it had
+    /// applied. Only rejections by the projection count: a failed ack
+    /// or fetch is the infrastructure's fault, not the event's.
+    Park {
+        /// Redeliveries before parking. `0` parks on the first
+        /// rejection.
+        retries: u32,
+    },
 }
 
 impl SubscriptionPolicy {
@@ -180,7 +204,14 @@ impl SubscriptionPolicy {
             idle_sleep,
             retry_sleep,
             stop_at_catch_up: false,
+            on_failure: FailurePolicy::Halt,
         }
+    }
+
+    /// `self`, with `policy` for events the projection keeps rejecting.
+    pub const fn on_failure(mut self, policy: FailurePolicy) -> Self {
+        self.on_failure = policy;
+        self
     }
 
     /// `self`, stopping after the first caught-up poll once caught up.
@@ -217,6 +248,19 @@ pub enum SubscriptionAction<E> {
     Apply {
         /// The event to fold.
         envelope: EventEnvelope<E>,
+    },
+    /// Record `envelope` as parked (0.7.7): the projection rejected it
+    /// `attempts` times and the [`FailurePolicy`] gave up on it. Answer
+    /// [`Parked`](SubscriptionInput::Parked) once it is durably
+    /// recorded — the machine then carries on past it — or
+    /// [`ParkFailed`](SubscriptionInput::ParkFailed).
+    Park {
+        /// The event given up on.
+        envelope: EventEnvelope<E>,
+        /// How many times it was rejected.
+        attempts: u32,
+        /// The last rejection, rendered.
+        error: StoreError,
     },
     /// Persist the checkpoint: every event up to `checkpoint` is applied.
     Ack {
@@ -283,6 +327,11 @@ pub enum SubscriptionInput<E> {
         /// Why the projection rejected the event, rendered for logging.
         error: StoreError,
     },
+    /// The parked event was recorded (0.7.7).
+    Parked,
+    /// Recording the parked event failed. The event is not skipped:
+    /// the machine backs off and redelivers, as for a rejection.
+    ParkFailed,
     /// The checkpoint write persisted.
     Acked,
     /// The checkpoint write failed. Same as an apply failure: sleep and
@@ -329,6 +378,8 @@ enum Phase {
     Fetching,
     /// Waiting for `Applied`/`ApplyFailed` while draining the batch.
     Applying,
+    /// Waiting for `Parked`/`ParkFailed`.
+    Parking,
     /// Waiting for `Acked`/`AckFailed`.
     Acking,
     /// Waiting for `Slept`; trips back to fetch or stop at catch-up.
@@ -370,6 +421,10 @@ pub struct SubscriptionMachine<E> {
     stop_after_ack: bool,
     /// The upper bound of `pending`, captured at `Fetched`.
     upper: Option<Checkpoint>,
+    /// The event the projection last rejected, and how many times in a
+    /// row (0.7.7). Survives redelivery; cleared once the event applies
+    /// or is parked.
+    failing: Option<(crate::vocabulary::Sequence, u32)>,
     _marker: core::marker::PhantomData<E>,
 }
 
@@ -385,6 +440,7 @@ impl<E: Clone> SubscriptionMachine<E> {
             cursor: 0,
             stop_after_ack: false,
             upper: None,
+            failing: None,
             _marker: core::marker::PhantomData,
         }
     }
@@ -407,6 +463,8 @@ impl<E: Clone> SubscriptionMachine<E> {
             SubscriptionInput::Acked => self.on_acked(),
             SubscriptionInput::AckFailed => self.on_ack_failed(),
             SubscriptionInput::Slept => self.on_slept(),
+            SubscriptionInput::Parked => self.on_parked(),
+            SubscriptionInput::ParkFailed => self.on_park_failed(),
             SubscriptionInput::Failed(error) => self.on_failed(error),
             SubscriptionInput::Shutdown => self.on_shutdown(),
         }
@@ -515,6 +573,12 @@ impl<E: Clone> SubscriptionMachine<E> {
         if self.phase != Phase::Applying {
             return self.violation("`Applied` outside the applying phase");
         }
+        // Whatever was failing has now applied (or was parked).
+        if let Some((sequence, _)) = self.failing
+            && self.pending.get(self.cursor).map(|e| e.sequence) == Some(sequence)
+        {
+            self.failing = None;
+        }
         self.cursor = self.cursor.saturating_add(1);
         if let Some(envelope) = self.pending.get(self.cursor) {
             SubscriptionAction::Apply {
@@ -549,13 +613,47 @@ impl<E: Clone> SubscriptionMachine<E> {
         self.fetch()
     }
 
-    fn on_apply_failed(&mut self, _error: StoreError) -> SubscriptionAction<E> {
+    fn on_apply_failed(&mut self, error: StoreError) -> SubscriptionAction<E> {
         if self.phase != Phase::Applying {
             return self.violation("`ApplyFailed` outside the applying phase");
         }
-        // The error is not the machine's to act on — the policy is
-        // always backoff-and-redeliver — but it has been carried this
-        // far so the driver reports the cause before the retry.
+        let Some(envelope) = self.pending.get(self.cursor) else {
+            return self.violation("`ApplyFailed` with no event in flight");
+        };
+        let attempts = match self.failing {
+            Some((sequence, n)) if sequence == envelope.sequence => n.saturating_add(1),
+            _ => 1,
+        };
+        self.failing = Some((envelope.sequence, attempts));
+        match self.policy.on_failure {
+            FailurePolicy::Park { retries } if attempts > retries => {
+                self.phase = Phase::Parking;
+                SubscriptionAction::Park {
+                    envelope: envelope.clone(),
+                    attempts,
+                    error,
+                }
+            }
+            _ => self.drop_pending_and_sleep(),
+        }
+    }
+
+    fn on_parked(&mut self) -> SubscriptionAction<E> {
+        if self.phase != Phase::Parking {
+            return self.violation("`Parked` outside the parking phase");
+        }
+        // The event is recorded: carry on past it exactly as if it had
+        // applied.
+        self.phase = Phase::Applying;
+        self.on_applied()
+    }
+
+    fn on_park_failed(&mut self) -> SubscriptionAction<E> {
+        if self.phase != Phase::Parking {
+            return self.violation("`ParkFailed` outside the parking phase");
+        }
+        // Not recorded, so not skipped. The attempt count stands: the
+        // next rejection tries to park again.
         self.drop_pending_and_sleep()
     }
 
@@ -614,6 +712,19 @@ impl<E: Clone> SubscriptionMachine<E> {
                         envelope: envelope.clone(),
                     },
                     None => self.violation("`Shutdown` while applying a drained batch"),
+                }
+            }
+            Phase::Parking => {
+                self.stop_after_ack = true;
+                // Re-issue the park: the in-flight event was given up on
+                // and the driver is recording it.
+                match (self.pending.get(self.cursor), self.failing) {
+                    (Some(envelope), Some((_, attempts))) => SubscriptionAction::Park {
+                        envelope: envelope.clone(),
+                        attempts,
+                        error: StoreError::other("parked during shutdown"),
+                    },
+                    _ => self.violation("`Shutdown` while parking with nothing in flight"),
                 }
             }
             Phase::Acking => {
@@ -1143,6 +1254,8 @@ mod tests {
             Just(SubscriptionInput::Acked),
             Just(SubscriptionInput::AckFailed),
             Just(SubscriptionInput::Slept),
+            Just(SubscriptionInput::Parked),
+            Just(SubscriptionInput::ParkFailed),
             Just(SubscriptionInput::Failed(StoreError::Unavailable)),
             Just(SubscriptionInput::Shutdown),
         ]
@@ -1269,15 +1382,184 @@ mod tests {
         assert!(is_protocol_violation(&action));
     }
 
+    // -- poison events (0.7.7) ----------------------------------------
+
+    fn parking(retries: u32) -> SubscriptionMachine<AccountEvent> {
+        SubscriptionMachine::new(
+            SubscriptionPolicy::default().on_failure(FailurePolicy::Park { retries }),
+            Checkpoint::ORIGIN,
+        )
+    }
+
+    fn reject() -> SubscriptionInput<AccountEvent> {
+        SubscriptionInput::ApplyFailed {
+            error: StoreError::other("poison"),
+        }
+    }
+
+    /// Fetch `[1, 2, 3]`, apply 1, and reject 2.
+    fn reject_the_second(
+        m: &mut SubscriptionMachine<AccountEvent>,
+    ) -> SubscriptionAction<AccountEvent> {
+        m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(1), envelope(2), envelope(3)]),
+        });
+        m.handle(SubscriptionInput::Applied);
+        m.handle(reject())
+    }
+
+    #[test]
+    fn halt_is_the_default_and_never_parks() {
+        let mut m = machine();
+        m.start();
+        for _ in 0..50 {
+            let action = reject_the_second(&mut m);
+            assert!(matches!(
+                action,
+                SubscriptionAction::Sleep {
+                    reason: SleepReason::Backoff,
+                    ..
+                }
+            ));
+            m.handle(SubscriptionInput::Slept);
+        }
+        assert_eq!(m.checkpoint(), Checkpoint::ORIGIN, "stalled, never skipped");
+    }
+
+    #[test]
+    fn an_event_is_parked_after_its_retry_budget_and_the_rest_applies() {
+        let mut m = parking(2);
+        m.start();
+        // Two retries: the first two rejections back off.
+        for _ in 0..2 {
+            assert!(matches!(
+                reject_the_second(&mut m),
+                SubscriptionAction::Sleep { .. }
+            ));
+            m.handle(SubscriptionInput::Slept);
+        }
+        // The third rejection parks it.
+        let action = reject_the_second(&mut m);
+        let SubscriptionAction::Park {
+            envelope, attempts, ..
+        } = action
+        else {
+            panic!("expected Park, got {action:?}");
+        };
+        assert_eq!(envelope.sequence, Sequence::new(2));
+        assert_eq!(attempts, 3);
+        // Recorded: carry on with event 3, then ack the whole batch.
+        let action = m.handle(SubscriptionInput::Parked);
+        assert!(
+            matches!(action, SubscriptionAction::Apply { envelope } if envelope.sequence == Sequence::new(3))
+        );
+        let action = m.handle(SubscriptionInput::Applied);
+        assert!(
+            matches!(action, SubscriptionAction::Ack { checkpoint } if checkpoint == Checkpoint::new(Sequence::new(3)))
+        );
+        m.handle(SubscriptionInput::Acked);
+        assert_eq!(m.checkpoint(), Checkpoint::new(Sequence::new(3)));
+    }
+
+    #[test]
+    fn zero_retries_parks_on_the_first_rejection() {
+        let mut m = parking(0);
+        m.start();
+        assert!(matches!(
+            reject_the_second(&mut m),
+            SubscriptionAction::Park { attempts: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn a_failed_park_never_skips_the_event() {
+        let mut m = parking(0);
+        m.start();
+        reject_the_second(&mut m);
+        let action = m.handle(SubscriptionInput::ParkFailed);
+        assert!(matches!(
+            action,
+            SubscriptionAction::Sleep {
+                reason: SleepReason::Backoff,
+                ..
+            }
+        ));
+        assert_eq!(m.checkpoint(), Checkpoint::ORIGIN);
+        // Redelivered; the next rejection tries to park again.
+        m.handle(SubscriptionInput::Slept);
+        assert!(matches!(
+            reject_the_second(&mut m),
+            SubscriptionAction::Park { .. }
+        ));
+    }
+
+    #[test]
+    fn an_event_that_recovers_resets_its_count() {
+        let mut m = parking(1);
+        m.start();
+        assert!(matches!(
+            reject_the_second(&mut m),
+            SubscriptionAction::Sleep { .. }
+        ));
+        m.handle(SubscriptionInput::Slept);
+        // This time event 2 applies, and later event 4 is rejected: its
+        // count starts from one, not from event 2's.
+        m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(1), envelope(2), envelope(3)]),
+        });
+        m.handle(SubscriptionInput::Applied);
+        m.handle(SubscriptionInput::Applied);
+        m.handle(SubscriptionInput::Applied);
+        m.handle(SubscriptionInput::Acked);
+        m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(4)]),
+        });
+        assert!(matches!(
+            m.handle(reject()),
+            SubscriptionAction::Sleep { .. }
+        ));
+    }
+
+    #[test]
+    fn failed_acks_do_not_count_against_an_event() {
+        let mut m = parking(0);
+        m.start();
+        m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(1)]),
+        });
+        m.handle(SubscriptionInput::Applied);
+        let action = m.handle(SubscriptionInput::AckFailed);
+        assert!(
+            matches!(action, SubscriptionAction::Sleep { .. }),
+            "an ack failure backs off, never parks"
+        );
+    }
+
+    #[test]
+    fn park_answers_outside_the_parking_phase_are_violations() {
+        let mut m = parking(0);
+        m.start();
+        assert!(is_protocol_violation(&m.handle(SubscriptionInput::Parked)));
+        let mut m = parking(0);
+        m.start();
+        assert!(is_protocol_violation(
+            &m.handle(SubscriptionInput::ParkFailed)
+        ));
+    }
+
     proptest! {
         /// The machine never panics on any input sequence, and once it
         /// is done it stays done: every action after the first `Done` is
         /// a protocol-violation `Done`.
         #[test]
         fn never_panics_and_stays_done(
-            script in prop::collection::vec(arb_subscription_input(), 0..16)
+            script in prop::collection::vec(arb_subscription_input(), 0..16),
+            park in proptest::option::of(0u32..3),
         ) {
-            let mut m = machine();
+            let mut m = match park {
+                None => machine(),
+                Some(retries) => parking(retries),
+            };
             let actions = projector_scripted(&mut m, script);
 
             prop_assert!(!actions.is_empty()); // start always emits
@@ -1292,9 +1574,14 @@ mod tests {
         /// `Ack`/`Acked` is the only path by which `checkpoint()` changes.
         #[test]
         fn checkpoint_never_regresses_and_moves_only_on_ack(
-            script in prop::collection::vec(arb_subscription_input(), 0..16)
+            script in prop::collection::vec(arb_subscription_input(), 0..16),
+            park in proptest::option::of(0u32..3),
         ) {
-            let mut m = machine();
+            // Halting and parking machines alike.
+            let mut m = match park {
+                None => machine(),
+                Some(retries) => parking(retries),
+            };
             let mut last = m.checkpoint();
             let _ = m.start();
             for (i, input) in script.into_iter().enumerate() {

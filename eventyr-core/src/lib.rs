@@ -157,8 +157,8 @@ pub mod prelude {
         HasSnapshotState, OfferSnapshot, Snapshot, SnapshotPolicy, WritePolicy,
     };
     pub use crate::subscription::{
-        Batch, Checkpoint, SleepReason, SubscriptionAction, SubscriptionInput, SubscriptionMachine,
-        SubscriptionOutcome, SubscriptionPolicy,
+        Batch, Checkpoint, FailurePolicy, SleepReason, SubscriptionAction, SubscriptionInput,
+        SubscriptionMachine, SubscriptionOutcome, SubscriptionPolicy,
     };
     pub use crate::testing::{Outcome, Scenario};
     pub use crate::upcast::{RawEvent, Upcaster};

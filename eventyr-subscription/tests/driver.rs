@@ -754,3 +754,131 @@ async fn a_redelivered_saga_event_dispatches_its_command_once() {
             if checkpoint == Checkpoint::new(Sequence::new(head + 1))
     ));
 }
+
+/// 0.7.7 end to end: one event the projection can never apply, among
+/// good ones. With parking the projector records it, catches up past it,
+/// and the event can be listed and — once the projection is fixed —
+/// replayed and removed. Without parking (the default) it stalls.
+#[tokio::test]
+async fn a_poison_event_is_parked_listed_and_replayed() {
+    /// Rejects the value 13 until `fixed` is set. Idempotent, as the
+    /// at-least-once contract requires: a retry redelivers the batch
+    /// from the last ack, so 11 and 12 arrive again with 13.
+    struct Picky {
+        seen: Arc<Mutex<Vec<u64>>>,
+        fixed: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Projection for Picky {
+        type Event = u64;
+        type Error = String;
+        async fn apply(&mut self, event: &EventEnvelope<u64>) -> Result<(), String> {
+            if event.event == 13 && !self.fixed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("thirteen is unlucky".into());
+            }
+            let mut seen = self.seen.lock().expect("poisoned");
+            if !seen.contains(&event.event) {
+                seen.push(event.event);
+            }
+            Ok(())
+        }
+    }
+
+    let store = Arc::new(InMemoryStore::new());
+    populate(&store, &[11, 12, 13, 14, 15]).await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let fixed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let parked = Arc::new(InMemoryParkedStore::new());
+
+    let policy = SubscriptionPolicy::new(64, std::time::Duration::ZERO, std::time::Duration::ZERO)
+        .stop_at_catch_up();
+    let outcome = Projector::new(
+        "picky",
+        StoreSubscription::new(Arc::clone(&store)),
+        InMemoryCheckpointStore::new(),
+        Picky {
+            seen: Arc::clone(&seen),
+            fixed: Arc::clone(&fixed),
+        },
+    )
+    .with_policy(policy)
+    .park_into(Arc::clone(&parked), FailurePolicy::Park { retries: 2 })
+    .run(|_| future::ready(()))
+    .await
+    .expect("run");
+
+    assert!(matches!(
+        outcome,
+        SubscriptionOutcome::CaughtUp { checkpoint } if checkpoint == Checkpoint::new(Sequence::new(5))
+    ));
+    assert_eq!(
+        *seen.lock().expect("poisoned"),
+        vec![11, 12, 14, 15],
+        "13 skipped"
+    );
+
+    let list = parked.list("picky").await.expect("list");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].envelope.event, 13);
+    assert_eq!(list[0].attempts, 3, "the first try and two retries");
+    assert!(list[0].error.contains("unlucky"), "{}", list[0].error);
+
+    // Fix the projection, replay the parked event, remove it.
+    fixed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut projection = Picky {
+        seen: Arc::clone(&seen),
+        fixed: Arc::clone(&fixed),
+    };
+    for entry in list {
+        projection.apply(&entry.envelope).await.expect("replay");
+        parked
+            .remove("picky", entry.envelope.sequence)
+            .await
+            .expect("remove");
+    }
+    assert!(parked.list("picky").await.expect("list").is_empty());
+    assert!(seen.lock().expect("poisoned").contains(&13));
+}
+
+#[tokio::test]
+async fn without_parking_a_poison_event_stalls_the_projector() {
+    struct Never;
+    impl Projection for Never {
+        type Event = u64;
+        type Error = &'static str;
+        async fn apply(&mut self, event: &EventEnvelope<u64>) -> Result<(), &'static str> {
+            if event.event == 13 { Err("no") } else { Ok(()) }
+        }
+    }
+    let store = Arc::new(InMemoryStore::new());
+    populate(&store, &[11, 13, 15]).await;
+    let checkpoints = Arc::new(InMemoryCheckpointStore::new());
+    let run = tokio::spawn(
+        Projector::new(
+            "stalled",
+            StoreSubscription::new(Arc::clone(&store)),
+            Arc::clone(&checkpoints),
+            Never,
+        )
+        .with_policy(
+            SubscriptionPolicy::new(
+                1,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(1),
+            )
+            .stop_at_catch_up(),
+        )
+        .run(tokio::time::sleep),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !run.is_finished(),
+        "halting: the projector never gets past 13"
+    );
+    assert_eq!(
+        CheckpointStore::load(&*checkpoints, "stalled")
+            .await
+            .expect("load"),
+        Checkpoint::new(Sequence::new(1))
+    );
+    run.abort();
+}
