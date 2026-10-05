@@ -698,6 +698,17 @@ async fn main() {
         ExecutionError::Store(StoreError::StreamClosed { .. })
     ));
 
+    // Reading state without a command (0.7.8): the repository folds the
+    // stream into the aggregate's state — carol is `closed`, and the
+    // load answers "what is she now" without re-deciding anything. The
+    // seeded form is the same fold from the snapshot.
+    let carol = repo
+        .load_with_snapshots(AccountId(3))
+        .await
+        .expect("load carol");
+    assert!(carol.state.closed);
+    assert_eq!(carol.version, Version::new(2)); // open + close
+
     // Erasure (0.7.6): bob closes his account and exercises his right
     // to be forgotten. Deleting his key turns every sealed `owner` of
     // his into `Shredded` — history still folds, only the personal data

@@ -296,7 +296,7 @@ where
 }
 ```
 
-This is `katha`'s `make_handler` / `sourcerer`'s `GenericRepository` / `eventcore`'s executor — all converged on the same protocol — but with the protocol *extracted* into a testable machine instead of an async loop.
+This is `katha`'s `make_handler` / `sourcerer`'s `GenericRepository` / `eventcore`'s executor — all converged on the same protocol — but with the protocol *extracted* into a testable machine instead of an async loop. `load(id)` / `load_at(id, version)` and (with `time`) `load_until(id, timestamp)` are the read half (0.7.8): one fold, no machine, snapshot-seeded on a `with_snapshots` repository (`load_with_snapshots` / `load_at_with_snapshots`).
 
 ## 6. Projections & subscriptions (eventyr-subscription, eventyr-projection)
 
@@ -592,6 +592,8 @@ Replay is the caller's: list the parked events, apply each to the fixed projecti
 ### 0.7.8 — Reading state without a command
 
 `AggregateRepository` only executes commands, so there is no `load(id)` for a query handler, a debugging tool, or an integration test. Marten also loads as of a version or timestamp. 0.7.8 adds `load(id)` and `load_at(id, version)` on the repository (snapshot-seeded where configured), plus `load_until(id, timestamp)` when the `time` feature is on. No machine is needed: it is one fold, which §7 keeps out of the machine table.
+
+**Shipped.** All three live on `eventyr-store`'s `AggregateRepository` — one fold, no machine (per §7 a load has nothing multi-step to branch on), each returning `Loaded { state, version }` so "as of" answers carry how far the fold actually read. The plain `load`/`load_at` are on the snapshots-off repository; `load_with_snapshots`/`load_at_with_snapshots` seed from the newest persisted `Snapshot` (never past a `load_at`'s own bound, and a failed seed read fails the load — the write path's rule). `load_until` is never seeded: a snapshot records a version, not an instant, and only stores that write `metadata.timestamp` (the in-memory store via the caller, Postgres via `created_at`) can answer it — an event without one is a `StoreError::Other` naming the stream, not a guess. Stopping at an out-of-order timestamp stops at the *first* later event; `<=` keeps one commit's shared `created_at` together.
 
 ### 0.7.9 — Projector exclusivity and partitioned processing
 

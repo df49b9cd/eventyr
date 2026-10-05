@@ -4,7 +4,11 @@
 //! [`store::StreamsAll`] ports, an in-memory implementation for tests
 //! and examples, the [`driver`]: async (`drive_write`) and blocking (`drive_write_blocking`) faces of one protocol, and the
 //! [`repository::AggregateRepository`] — the ergonomic entry point
-//! that hides the machine behind one method.
+//! that hides the machine behind one method, and the read path
+//! ([`repository::AggregateRepository::load`],
+//! [`load_at`](repository::AggregateRepository::load_at), and with the
+//! `time` feature [`load_until`](repository::AggregateRepository::load_until))
+//! (0.7.8).
 //!
 //! The traits are runtime-agnostic: `append` returns a future, the
 //! streams are async streams, and nothing here names tokio. The
@@ -126,7 +130,7 @@ pub mod prelude {
     pub use crate::notify::{
         CommitListener, CommitSignal, LocalCommitListener, LocalCommitSignal, NoSignal,
     };
-    pub use crate::repository::{AggregateRepository, ExecutionError, ExecutionOutcome};
+    pub use crate::repository::{AggregateRepository, ExecutionError, ExecutionOutcome, Loaded};
     pub use crate::snapshot_store::{InMemorySnapshotStore, SnapshotStore};
     pub use crate::store::{
         EventFilter, EventStore, FilteredRead, QueryAppend, StreamLifecycle, StreamsAll,

@@ -14,7 +14,7 @@ workspace = true
 default = ["time", "macros", "store"]
 # Carries `Metadata::timestamp` through the re-exported core — and
 # through the stores that populate it, when they are enabled.
-time = ["eventyr-core/time", "eventyr-store-postgres?/time"]
+time = ["eventyr-core/time", "eventyr-store/time", "eventyr-store-postgres?/time"]
 # Re-exports the derive macros through the re-exported core.
 macros = ["eventyr-core/macros"]
 # Re-exports the store side: ports, in-memory store, driver, repository.

@@ -9,12 +9,28 @@
 use eventyr_core::aggregate::Aggregate;
 use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
-use eventyr_core::snapshot::{HasSnapshotState, OfferSnapshot, WritePolicy};
+use eventyr_core::snapshot::{HasSnapshotState, OfferSnapshot, Snapshot, WritePolicy};
+use eventyr_core::vocabulary::{StreamId, Version};
 use eventyr_core::write::{RetryPolicy, WriteMachine, WriteOutcome};
 
 use crate::driver::{drive_write, drive_write_with_snapshots};
 use crate::snapshot_store::SnapshotStore;
 use crate::store::EventStore;
+
+/// A state folded from one stream, and the version it reached (0.7.8).
+///
+/// `version` is the last folded event's position — `Version::EMPTY`
+/// on an empty or unknown stream, and below the bound `load_at` asked
+/// for when the stream never reached it. It is what makes "as of a
+/// timestamp" answerable on the write side: `load_until` reports the
+/// version the fold stopped at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Loaded<St> {
+    /// The folded state (`Aggregate::initial` with each event applied).
+    pub state: St,
+    /// The position of the last folded event; `EMPTY` when none applied.
+    pub version: Version,
+}
 
 /// Why a command execution failed: the domain rejected it, or the store
 /// did.
@@ -131,6 +147,37 @@ where
             _aggregate: core::marker::PhantomData,
         }
     }
+
+    /// Load the instance's state by folding its whole stream (0.7.8).
+    ///
+    /// No command, no append, no retry: one fold from
+    /// [`Aggregate::initial`]. Snapshots are not consulted — see
+    /// [`load_with_snapshots`](AggregateRepository::load_with_snapshots)
+    /// on a snapshots-on repository. An unknown stream loads its
+    /// `initial` and reports `Version::EMPTY`.
+    pub async fn load(&self, id: A::Id) -> Result<Loaded<A::State>, StoreError> {
+        self.fold_while(&id, None, |_| Ok(true)).await
+    }
+
+    /// [`load`](Self::load) stopping at version `version` (inclusive).
+    ///
+    /// `Version::EMPTY` returns the initial state with no I/O. A version
+    /// past the stream's head returns the head state and reports the
+    /// head — `Loaded.version` is what was actually folded.
+    pub async fn load_at(
+        &self,
+        id: A::Id,
+        version: Version,
+    ) -> Result<Loaded<A::State>, StoreError> {
+        if version == Version::EMPTY {
+            return Ok(Loaded {
+                state: A::initial(&id),
+                version: Version::EMPTY,
+            });
+        }
+        self.fold_while(&id, None, |envelope| Ok(envelope.version <= version))
+            .await
+    }
 }
 
 /// The half of the API every repository has, snapshots or not: the
@@ -215,6 +262,82 @@ where
             WriteOutcome::Failed(error) => Err(ExecutionError::Store(error)),
         }
     }
+
+    /// The shared read fold behind `load` / `load_at` /
+    /// `load_until` (0.7.8): seeds from `seed` (a snapshot, when one is
+    /// used) or from [`Aggregate::initial`], then folds the stream from
+    /// the seed's version onward, applying each event while `keep` says
+    /// continue. `keep` runs *before* the fold so `load_until` can stop
+    /// at the first event past its bound without folding it.
+    ///
+    /// The two machine invariants are re-checked here — the events are
+    /// for the expected stream, and versions are contiguous from the
+    /// seed — so a misbehaving store fails the fold loudly instead of
+    /// silently producing a wrong state (the same checks `WriteMachine`
+    /// makes on load).
+    async fn fold_while(
+        &self,
+        id: &A::Id,
+        seed: Option<Snapshot<A::State>>,
+        mut keep: impl FnMut(&EventEnvelope<A::Event>) -> Result<bool, StoreError>,
+    ) -> Result<Loaded<A::State>, StoreError> {
+        let stream_id = StreamId::for_aggregate::<A>(id);
+        let (mut state, mut version) = match seed {
+            Some(snapshot) if snapshot.stream_id != stream_id => {
+                return Err(StoreError::protocol(
+                    "the snapshot store answered for another stream",
+                ));
+            }
+            Some(snapshot) => (snapshot.state, snapshot.version),
+            None => (A::initial(id), Version::EMPTY),
+        };
+        let events = self.store.stream(&stream_id, version);
+        futures::pin_mut!(events);
+        while let Some(envelope) = futures::StreamExt::next(&mut events).await {
+            let envelope = envelope?;
+            if envelope.stream_id != stream_id {
+                return Err(StoreError::protocol("the store read another stream"));
+            }
+            if envelope.version.as_u64() != version.as_u64().saturating_add(1) {
+                return Err(StoreError::protocol(
+                    "the store read a non-contiguous sequence",
+                ));
+            }
+            if !keep(&envelope)? {
+                break;
+            }
+            A::apply(&mut state, &envelope.event);
+            version = envelope.version;
+        }
+        Ok(Loaded { state, version })
+    }
+
+    /// Fold every event whose metadata timestamp is at or before
+    /// `timestamp`, load-only (0.7.8, `time` feature).
+    ///
+    /// The fold stops at the *first* event after the instant — a stream
+    /// appends once per version and timestamps can reorder across
+    /// concurrent commits, so skipping and continuing would fold a hole.
+    /// An event carrying no timestamp is a `StoreError` naming the
+    /// stream: only stores that persist one (the in-memory and Postgres
+    /// stores) can answer a load by time. Never snapshot-seeded — a
+    /// snapshot records a version, not an instant.
+    #[cfg(feature = "time")]
+    pub async fn load_until(
+        &self,
+        id: A::Id,
+        timestamp: time::OffsetDateTime,
+    ) -> Result<Loaded<A::State>, StoreError> {
+        let keep = |envelope: &EventEnvelope<A::Event>| match envelope.metadata.timestamp {
+            Some(stamped) => Ok(stamped <= timestamp),
+            None => Err(StoreError::other(format!(
+                "load_until needs a timestamp; {} has none at version {}",
+                envelope.stream_id,
+                envelope.version.as_u64(),
+            ))),
+        };
+        self.fold_while(&id, None, keep).await
+    }
 }
 
 impl<A, S> AggregateRepository<A, S, ()>
@@ -288,6 +411,48 @@ where
         .await
     }
 
+    /// Load the instance's state from the newest persisted snapshot,
+    /// folding only the delta after it (0.7.8).
+    ///
+    /// The snapshot is a seed, never the whole answer: a failed snapshot
+    /// read fails the load (the write path's rule — a seed is not a
+    /// cache to fall back past). Ignoring the cadence, a load does not
+    /// offer a snapshot. [`load`](AggregateRepository::load) on a
+    /// snapshots-on repository is the same fold without the seed (full
+    /// replay); both names exist so no call silently pays the wrong one.
+    pub async fn load_with_snapshots(&self, id: A::Id) -> Result<Loaded<A::State>, StoreError> {
+        let stream_id = StreamId::for_aggregate::<A>(&id);
+        let seed = self.snapshots.load(&stream_id).await?;
+        self.fold_while(&id, seed, |_| Ok(true)).await
+    }
+
+    /// [`load_with_snapshots`](Self::load_with_snapshots) stopping at
+    /// version `version` (inclusive).
+    ///
+    /// A snapshot *past* `version` is not a seed for it (the fold can
+    /// only move forward), so this seeds from one at or below the bound
+    /// and otherwise replays. `Version::EMPTY` returns the initial state
+    /// with no I/O.
+    pub async fn load_at_with_snapshots(
+        &self,
+        id: A::Id,
+        version: Version,
+    ) -> Result<Loaded<A::State>, StoreError> {
+        if version == Version::EMPTY {
+            return Ok(Loaded {
+                state: A::initial(&id),
+                version: Version::EMPTY,
+            });
+        }
+        let stream_id = StreamId::for_aggregate::<A>(&id);
+        let seed = self
+            .snapshots
+            .load(&stream_id)
+            .await?
+            .filter(|snapshot| snapshot.version <= version);
+        self.fold_while(&id, seed, |envelope| Ok(envelope.version <= version))
+            .await
+    }
     /// [`execute_with_snapshots`](Self::execute_with_snapshots) with the
     /// interaction's metadata stamped on every emitted event (0.5.2).
     pub async fn execute_with_snapshots_and_metadata(

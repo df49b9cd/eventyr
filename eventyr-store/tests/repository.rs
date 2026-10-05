@@ -566,3 +566,112 @@ async fn a_command_against_a_truncated_stream_fails_rather_than_folding_a_partia
         "{error:?}"
     );
 }
+
+// -- load / load_at (0.7.8) -------------------------------------------------
+
+/// A whole-stream load folds every event from `initial`.
+#[tokio::test]
+async fn a_load_folds_the_whole_stream() {
+    let repo = repository();
+    let id = AccountId(1);
+    repo.execute(id.clone(), AccountCommand::Open { owner: "a".into() })
+        .await
+        .expect("open");
+    repo.execute(id.clone(), AccountCommand::Deposit { amount: 100 })
+        .await
+        .expect("deposit");
+    repo.execute(id.clone(), AccountCommand::Deposit { amount: 50 })
+        .await
+        .expect("deposit");
+    repo.execute(id.clone(), AccountCommand::Withdraw { amount: 30 })
+        .await
+        .expect("withdraw");
+
+    let loaded = repo.load(id.clone()).await.expect("load");
+    assert_eq!(loaded.version, Version::new(4));
+    assert!(loaded.state.open);
+    assert_eq!(loaded.state.balance, 120);
+
+    // And the domain still decides against it: one more unit is rejected.
+    assert!(matches!(
+        repo.execute(id, AccountCommand::Withdraw { amount: 121 })
+            .await,
+        Err(ExecutionError::Domain(AccountError::InsufficientFunds))
+    ));
+}
+
+/// An unknown stream loads `initial` and reports `EMPTY`; a closed empty
+/// stream reads the same.
+#[tokio::test]
+async fn a_load_of_an_empty_or_closed_stream_is_the_initial_state() {
+    let repo = repository();
+    let unknown = repo.load(AccountId(99)).await.expect("unknown");
+    assert_eq!(unknown.version, Version::EMPTY);
+    assert!(!unknown.state.open);
+
+    repo.store()
+        .close_stream(&StreamId::for_aggregate::<Account>(&AccountId(7)))
+        .await
+        .expect("close");
+    let closed = repo.load(AccountId(7)).await.expect("closed");
+    assert_eq!(closed.version, Version::EMPTY);
+    assert!(!closed.state.open);
+}
+
+/// `load_at` stops at its version, inclusive; `EMPTY` needs no I/O.
+#[tokio::test]
+async fn a_load_at_stops_at_its_version() {
+    let repo = repository();
+    let id = AccountId(1);
+    repo.execute(id.clone(), AccountCommand::Open { owner: "a".into() })
+        .await
+        .expect("open");
+    repo.execute(id.clone(), AccountCommand::Deposit { amount: 100 })
+        .await
+        .expect("deposit");
+    repo.execute(id.clone(), AccountCommand::Deposit { amount: 50 })
+        .await
+        .expect("deposit");
+    repo.execute(id.clone(), AccountCommand::Withdraw { amount: 30 })
+        .await
+        .expect("withdraw");
+
+    let at_two = repo
+        .load_at(id.clone(), Version::new(2))
+        .await
+        .expect("at 2");
+    assert_eq!(at_two.version, Version::new(2));
+    assert_eq!(at_two.state.balance, 100);
+
+    let at_head = repo
+        .load_at(id.clone(), Version::new(4))
+        .await
+        .expect("at 4");
+    let full = repo.load(id.clone()).await.expect("full");
+    assert_eq!(at_head.version, full.version);
+    assert_eq!(at_head.state.balance, full.state.balance);
+
+    // Past the head, the fold returns what it reached — the version
+    // answers "how far did this actually read".
+    let past = repo
+        .load_at(id.clone(), Version::new(10))
+        .await
+        .expect("past");
+    assert_eq!(past.version, Version::new(4));
+
+    // EMPTY is the initial state with no store round-trip at all.
+    let empty = repo.load_at(id, Version::EMPTY).await.expect("empty");
+    assert_eq!(empty.version, Version::EMPTY);
+    assert!(!empty.state.open);
+}
+
+/// A store that fails a read fails the load.
+#[tokio::test]
+async fn a_failed_load_is_the_store_error() {
+    let repo = AggregateRepository::<Account, LoadFails>::new(LoadFails, RetryPolicy::default());
+    let error = repo
+        .load(AccountId(1))
+        .await
+        .expect_err("the failing store fails the load");
+    assert!(matches!(error, StoreError::Unavailable));
+}
