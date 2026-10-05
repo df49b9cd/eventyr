@@ -29,7 +29,7 @@ eventyr-core = { workspace = true, features = ["serde"] }
 eventyr-store = { workspace = true }
 eventyr-projection = { workspace = true, features = ["inline"], optional = true }
 eventyr-subscription = { workspace = true, optional = true }
-sqlx = { version = "0.9", default-features = false, features = [
+sqlx = { workspace = true, features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
@@ -37,19 +37,19 @@ sqlx = { version = "0.9", default-features = false, features = [
     "migrate",
     "macros",
 ] }
-serde = { version = "1", default-features = false, features = ["derive"] }
-serde_json = { version = "1", default-features = false, features = ["alloc"] }
-thiserror = { version = "2", default-features = false }
-async-stream = { version = "0.3", default-features = false }
-futures = { version = "0.3", default-features = false, features = ["alloc", "std"] }
-time = { version = "0.3", default-features = false, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-stream.workspace = true
+futures = { workspace = true, features = ["std"] }
+time = { workspace = true, optional = true }
 
 # dev-dependency on ourselves so the tests can turn on the features
 # they exercise (a crate's own --features don't reach `tests/`).
 [dev-dependencies]
 eventyr-store-postgres = { path = ".", features = ["snapshots", "views", "checkpoints"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
 eventyr-projection = { workspace = true, features = ["inline"] }
 eventyr-subscription = { workspace = true }
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }
 eventyr-store-testing = { workspace = true, features = ["serde"] }

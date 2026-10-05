@@ -68,15 +68,10 @@ jobs:
           cargo build -p eventyr-core --no-default-features --target thumbv7em-none-eabihf
           cargo build -p eventyr-core --no-default-features --features serde,time --target thumbv7em-none-eabihf
 
-      # Feature powersets: every crate's no-default-features build, plus
-      # each single feature of the crates whose features are meant to
-      # combine or stay off (cargo-hack's checks, approximated without
-      # the extra runner install).
       # Feature powersets via cargo-hack: `--each-feature --no-dev-deps`
       # for every crate, so one feature never depends on another being
-      # on by accident. (Locally the same thing, since cargo-hack may
-      # not be installed: check `--no-default-features` per crate and
-      # each single feature.)
+      # on by accident. (Locally the same thing without the install:
+      # check `--no-default-features` per crate and each single feature.)
       - name: cargo-hack (feature powersets)
         uses: taiki-e/install-action@cargo-hack
       - name: Feature checks

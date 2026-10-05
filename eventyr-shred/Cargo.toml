@@ -27,13 +27,13 @@ parked = ["dep:eventyr-subscription"]
 testing = []
 
 [dependencies]
-eventyr-core = { workspace = true, features = ["std"] }
+eventyr-core.workspace = true
 eventyr-store = { workspace = true }
 eventyr-subscription = { workspace = true, optional = true }
-futures = { version = "0.3", default-features = false, features = ["alloc", "executor"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-base64 = "0.22"
+futures = { workspace = true, features = ["executor"] }
+serde = { workspace = true, features = ["alloc"] }
+serde_json = { workspace = true }
+base64.workspace = true
 aead = { version = "0.6", default-features = false, features = ["alloc", "getrandom"], optional = true }
 zeroize = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
 

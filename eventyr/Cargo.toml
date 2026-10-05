@@ -71,8 +71,8 @@ eventyr-shred-chacha = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Examples: the bank demo drives the async drivers and reads raw events.
-tokio = { version = "1", features = ["rt", "macros", "time"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
-futures = { version = "0.3", default-features = false }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
+futures.workspace = true
 

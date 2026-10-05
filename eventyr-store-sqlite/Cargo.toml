@@ -30,16 +30,17 @@ eventyr-store = { workspace = true }
 eventyr-projection = { workspace = true, features = ["inline"], optional = true }
 eventyr-shred = { workspace = true, optional = true }
 eventyr-subscription = { workspace = true, optional = true }
-rusqlite = { version = "0.34", features = ["bundled"] }
-serde = { version = "1", default-features = false, features = ["derive"] }
-serde_json = { version = "1", default-features = false, features = ["alloc"] }
-thiserror = { version = "2", default-features = false }
-futures = { version = "0.3", default-features = false, features = ["alloc"] }
+rusqlite = { workspace = true, features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+futures.workspace = true
 
 # dev-dependency on ourselves so the contract-suite tests can toggle
 # the feature (a crate's own --features don't reach `tests/`).
 [dev-dependencies]
 eventyr-store-sqlite = { path = ".", features = ["snapshots", "views", "shred", "parked", "checkpoints"] }
+eventyr-shred = { workspace = true, features = ["testing"] }
 eventyr-shred-chacha = { workspace = true }
 eventyr-store-testing = { workspace = true, features = ["serde"] }
-eventyr-subscription = { workspace = true }
+eventyr-subscription = { workspace = true, features = ["testing"] }

@@ -12,4 +12,4 @@ workspace = true
 
 [dependencies]
 eventyr-shred = { workspace = true, features = ["aead", "testing"] }
-aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "getrandom"] }
+aes-gcm = { workspace = true, features = ["aes", "alloc", "getrandom"] }

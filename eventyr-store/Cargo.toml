@@ -15,7 +15,7 @@ default = []
 # The reference backend for the `Metrics` port: a `tracing` event per
 # instrument call. The port itself lives in `eventyr-core`; the feature
 # enables the dep, no re-gating.
-tracing = ["dep:tracing", "eventyr-core/std"]
+tracing = ["dep:tracing"]
 
 [dependencies]
 eventyr-core = { workspace = true }

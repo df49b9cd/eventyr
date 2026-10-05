@@ -64,7 +64,6 @@ sqlx = { version = "0.9", default-features = false }
 syn = { version = "3" }
 quote = { version = "1" }
 proc-macro2 = { version = "1" }
-tracing-subscriber = { version = "0.3" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
