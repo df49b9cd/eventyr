@@ -57,8 +57,10 @@ jobs:
 
       # The Postgres-backed suites are `#[ignore]`d for casual `cargo
       # test`; the service above makes the URL real, so run them here.
+      # Serial only: the inline-views and contract suites each hold
+      # transactions, which deadlocks exhaust a 100-connection container.
       - name: Postgres integration tests
-        run: cargo test -p eventyr-store-postgres --features snapshots,time -- --ignored
+        run: cargo test -p eventyr-store-postgres --features snapshots,time -- --ignored --test-threads=1
 
       # The no_std core builds for a bare-metal target: this is where
       # "no_std" is proven, not asserted.
