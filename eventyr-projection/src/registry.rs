@@ -85,6 +85,15 @@ pub enum RegistryError {
         /// The lowest registered version — should be [`EventSchemaVersion::V1`].
         found: EventSchemaVersion,
     },
+    /// A payload's event type has no rung at all — a stored fact the
+    /// code has never heard of. Loud, never dropped, and never taken
+    /// for a payload already at the current version.
+    UnknownType {
+        /// The event type.
+        event_type: String,
+        /// The stored payload's version.
+        found: EventSchemaVersion,
+    },
     /// A payload's version exceeds any rung's reach — a stored shape
     /// newer than the code knows. Loud, never dropped.
     UnknownVersion {
@@ -113,6 +122,10 @@ impl core::fmt::Display for RegistryError {
                 f,
                 "the upcaster ladder for `{event_type}` has no V1 rung (lowest is {found})"
             ),
+            Self::UnknownType { event_type, found } => write!(
+                f,
+                "`{event_type}` stored at version {found} has no registered upcaster"
+            ),
             Self::UnknownVersion {
                 event_type,
                 found,
@@ -131,8 +144,9 @@ impl core::error::Error for RegistryError {}
 ///
 /// Build with [`new`](UpcasterRegistry::new) and register one rung per
 /// `with_*` call, then [`build`](UpcasterRegistry::build) before serving
-/// reads: a loud [`RegistryError`] on a dangling version, a cycle, or a
-/// name collision — never a silently malformed chain at read.
+/// reads: a loud [`RegistryError`] on a missing base, a dangling
+/// version, or a rung registered twice — never a silently malformed
+/// chain at read.
 ///
 /// The registry is a plain value, not a machine: one lookup per event
 /// is one step (see §7). Running it — [`upcast`](UpcasterRegistry::upcast)
@@ -143,6 +157,10 @@ impl core::error::Error for RegistryError {}
 pub struct UpcasterRegistry {
     /// Per event type, the rungs keyed by the version they upgrade from.
     by_type: BTreeMap<String, BTreeMap<EventSchemaVersion, Box<dyn VersionUpcaster>>>,
+    /// Every `(event_type, from)` registered more than once, in order:
+    /// the map keeps only the last rung, so [`build`](Self::build) learns
+    /// of the overwrite from here.
+    duplicates: Vec<(String, EventSchemaVersion)>,
 }
 
 impl UpcasterRegistry {
@@ -154,9 +172,11 @@ impl UpcasterRegistry {
     /// Register `upcaster` as the rung lifting `event_type` from
     /// `from` to `from + 1`.
     ///
-    /// Returns the previous registration on a duplicate — overwriting a
-    /// registered rung is a configuration error, surfaced here and
-    /// again at [`build`](UpcasterRegistry::build).
+    /// Returns the previous registration on a duplicate. Overwriting a
+    /// registered rung is a configuration error: the new rung replaces
+    /// the old one so the registry stays usable, and
+    /// [`build`](UpcasterRegistry::build) reports it as
+    /// [`DuplicateRung`](RegistryError::DuplicateRung).
     pub fn with<U>(
         mut self,
         event_type: &str,
@@ -168,6 +188,9 @@ impl UpcasterRegistry {
     {
         let rungs = self.by_type.entry(event_type.to_owned()).or_default();
         let previous = rungs.insert(from, Box::new(upcaster));
+        if previous.is_some() {
+            self.duplicates.push((event_type.to_owned(), from));
+        }
         (self, previous)
     }
 
@@ -178,11 +201,18 @@ impl UpcasterRegistry {
     ///
     /// # Errors
     ///
-    /// The first broken link found, as a [`RegistryError`]. A type with
-    /// no `V1→V2` rung but registered rungs above it is
+    /// The first broken link found, as a [`RegistryError`]. A rung
+    /// registered twice is [`DuplicateRung`](RegistryError::DuplicateRung);
+    /// a type with no `V1→V2` rung but registered rungs above it is
     /// [`MissingBase`](RegistryError::MissingBase); a gap above V1 is
     /// [`DanglingVersion`](RegistryError::DanglingVersion).
     pub fn build(&self) -> Result<(), RegistryError> {
+        if let Some((event_type, from)) = self.duplicates.first() {
+            return Err(RegistryError::DuplicateRung {
+                event_type: event_type.clone(),
+                from: *from,
+            });
+        }
         for (event_type, rungs) in &self.by_type {
             let versions: Vec<EventSchemaVersion> = rungs.keys().copied().collect();
             let Some(&first) = versions.first() else {
@@ -194,9 +224,9 @@ impl UpcasterRegistry {
                     found: first,
                 });
             }
-            // A well-formed ladder's rungs are V1, V2, …, one per step,
-            // with no repetition (the map keeps the keys distinct, so
-            // this check is the gap, not the duplicate).
+            // A well-formed ladder's rungs are V1, V2, …, one per step.
+            // The map keeps the keys distinct (duplicates were reported
+            // above), so this check finds the gap.
             for (expected, &version) in versions.iter().enumerate().skip(1) {
                 if version != EventSchemaVersion::new(expected as u32 + 1) {
                     return Err(RegistryError::DanglingVersion {
@@ -216,29 +246,26 @@ impl UpcasterRegistry {
     /// A payload already at (or one past) the highest rung passes
     /// through unchanged. A version above every registered rung is an
     /// [`UpcastError`] (a stored shape newer than the code knows). A
-    /// type with no registered rung is an `UpcastError` too — a stored
-    /// fact the code has never heard of is not conflated with one at
-    /// the current version.
+    /// type with no registered rung is an `UpcastError` too
+    /// ([`UnknownType`](RegistryError::UnknownType)) — a stored fact the
+    /// code has never heard of is not conflated with one at the current
+    /// version.
     pub fn upcast(&self, raw: VersionedRaw) -> Result<Vec<u8>, UpcastError> {
-        let rungs = self
-            .by_type
-            .get(&raw.event_type)
-            .ok_or_else(|| UpcastError {
+        // A type with an empty ladder cannot arise through `with`, but
+        // it reads the same as no ladder at all.
+        let Some((rungs, latest)) = self.by_type.get(&raw.event_type).and_then(|rungs| {
+            let latest = *rungs.keys().next_back()?;
+            Some((rungs, latest))
+        }) else {
+            return Err(UpcastError {
                 event_type: raw.event_type.clone(),
-                message: RegistryError::DanglingVersion {
-                    event_type: raw.event_type.clone(),
-                    from: raw.version,
+                message: RegistryError::UnknownType {
+                    event_type: raw.event_type,
+                    found: raw.version,
                 }
                 .to_string(),
-            })?;
-        let latest = *rungs.keys().next_back().ok_or_else(|| UpcastError {
-            event_type: raw.event_type.clone(),
-            message: RegistryError::DanglingVersion {
-                event_type: raw.event_type.clone(),
-                from: raw.version,
-            }
-            .to_string(),
-        })?;
+            });
+        };
         // One past the latest rung is the current version: it passes
         // through unchanged. Anything higher is a stored shape newer
         // than the code knows.
@@ -391,9 +418,34 @@ mod tests {
         let (registry, previous) =
             registry.with("Amount", EventSchemaVersion::new(1), VersionRung::new(bump));
         assert!(previous.is_none());
-        let (_registry, previous) =
+        let (registry, previous) =
             registry.with("Amount", EventSchemaVersion::new(1), VersionRung::new(bump));
         assert!(previous.is_some(), "overwriting a rung is reported");
+        // The ladder left behind is well-formed; build still refuses it.
+        assert_eq!(
+            registry.build(),
+            Err(RegistryError::DuplicateRung {
+                event_type: "Amount".into(),
+                from: EventSchemaVersion::V1,
+            })
+        );
+    }
+
+    #[test]
+    fn an_unknown_event_type_is_reported_as_one() {
+        let registry = registry_with("Amount", &[(1, bump)]);
+        let error = registry
+            .upcast(raw("Renamed", 1, "0"))
+            .expect_err("a type with no rung");
+        assert_eq!(error.event_type, "Renamed");
+        assert_eq!(
+            error.message,
+            RegistryError::UnknownType {
+                event_type: "Renamed".into(),
+                found: EventSchemaVersion::V1,
+            }
+            .to_string()
+        );
     }
 
     #[test]

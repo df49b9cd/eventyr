@@ -23,9 +23,11 @@ const TAG: &str = "$sensitive";
 /// Sealing or opening failed.
 #[derive(Debug)]
 pub enum ShredError {
-    /// The event did not serialize to JSON, or the result did not
-    /// deserialize back into the event type.
-    Json(serde_json::Error),
+    /// The serde leaf of an error: the category and the position, never
+    /// the message — serde echoes the offending input in it, and the
+    /// input here is being decrypted: leaving it in the error would put
+    /// the personal data into logs and `StoreError::Other`.
+    Json(JsonKind),
     /// The cipher failed. On open this is a sealed field that failed
     /// authentication under a key that *does* exist — tampering or
     /// corruption, never erasure.
@@ -46,10 +48,35 @@ pub enum ShredError {
     Keys(StoreError),
 }
 
+/// The serde leaf of a [`ShredError`]: what failed and where, without
+/// the field's content.
+#[derive(Debug)]
+pub struct JsonKind {
+    category: serde_json::error::Category,
+    line: usize,
+    column: usize,
+}
+
+/// `result` or a redacted [`JsonKind`]: serde's messages can quote the
+/// input, and the input is personal data on its way through the pipe.
+fn redacted<T>(result: Result<T, serde_json::Error>) -> Result<T, ShredError> {
+    result.map_err(|error| {
+        ShredError::Json(JsonKind {
+            category: error.classify(),
+            line: error.line(),
+            column: error.column(),
+        })
+    })
+}
+
 impl core::fmt::Display for ShredError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Json(e) => write!(f, "shredding: {e}"),
+            Self::Json(kind) => write!(
+                f,
+                "shredding: a value failed to serialize at line {} column {} ({:?})",
+                kind.line, kind.column, kind.category
+            ),
             Self::Cipher(e) => write!(f, "shredding: {e}"),
             Self::WrongAlgorithm {
                 sealed_with,
@@ -106,7 +133,7 @@ impl<C: Cipher, K: KeyStore> Shredder<C, K> {
     where
         E: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let mut value = serde_json::to_value(event).map_err(ShredError::Json)?;
+        let mut value = redacted(serde_json::to_value(event))?;
         let mut fields = Vec::new();
         collect(&mut value, &mut fields);
         let mut keys: HashMap<String, SubjectKey> = HashMap::new();
@@ -121,7 +148,7 @@ impl<C: Cipher, K: KeyStore> Shredder<C, K> {
             let plain = field
                 .get("value")
                 .ok_or_else(|| ShredError::Malformed("a plain field without a value".into()))?;
-            let plaintext = serde_json::to_vec(plain).map_err(ShredError::Json)?;
+            let plaintext = redacted(serde_json::to_vec(plain))?;
             let key = match keys.get(&subject) {
                 Some(key) => key.clone(),
                 None => {
@@ -136,7 +163,7 @@ impl<C: Cipher, K: KeyStore> Shredder<C, K> {
                 .map_err(ShredError::Cipher)?;
             *field = sealed(self.cipher.algorithm(), &subject, &ciphertext);
         }
-        serde_json::from_value(value).map_err(ShredError::Json)
+        redacted(serde_json::from_value(value))
     }
 
     /// Decrypt every `Sealed` field of `event`. A field whose subject's
@@ -146,7 +173,7 @@ impl<C: Cipher, K: KeyStore> Shredder<C, K> {
     where
         E: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let mut value = serde_json::to_value(&event).map_err(ShredError::Json)?;
+        let mut value = redacted(serde_json::to_value(&event))?;
         let mut fields = Vec::new();
         collect(&mut value, &mut fields);
         if fields.is_empty() {
@@ -186,13 +213,12 @@ impl<C: Cipher, K: KeyStore> Shredder<C, K> {
                         .cipher
                         .decrypt(&key, &ciphertext, subject.as_bytes())
                         .map_err(ShredError::Cipher)?;
-                    let value: Value =
-                        serde_json::from_slice(&plaintext).map_err(ShredError::Json)?;
+                    let value: Value = redacted(serde_json::from_slice(&plaintext))?;
                     plain(&subject, value)
                 }
             };
         }
-        serde_json::from_value(value).map_err(ShredError::Json)
+        redacted(serde_json::from_value(value))
     }
 
     async fn key_for_sealing(&self, subject: &str) -> Result<SubjectKey, ShredError> {

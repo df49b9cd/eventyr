@@ -27,7 +27,9 @@
 //! Everything runs without an async runtime: a store whose futures
 //! block on real I/O must do that parking inside its own methods (this
 //! suite drives them to `Poll::Ready` one at a time per check), so the
-//! checks run on CI with no database and under miri.
+//! checks run on CI with no database — anywhere miri runs, too,
+//! though CI's miri job covers `eventyr-core` (see
+//! `.github/workflows/ci.yml`).
 //!
 //! The checks exercise the machine-visible protocol only — versions,
 //! sequences, expectations, ordering — because that is the contract: a

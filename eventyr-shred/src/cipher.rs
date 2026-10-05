@@ -5,8 +5,12 @@ use core::fmt;
 /// A subject's secret key, as the cipher made it. Opaque bytes: the
 /// cipher decides their length and meaning, the key store keeps them.
 ///
-/// Its `Debug` output never shows the bytes.
-#[derive(Clone, PartialEq, Eq)]
+/// Its `Debug` output never shows the bytes, and under the `zeroize`
+/// feature the bytes are wiped from memory when the key is dropped
+/// (recipients of [`as_bytes`](Self::as_bytes) — a key store writing to
+/// disk, say — hold their own copy regardless).
+#[derive(Clone)]
+#[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct SubjectKey(Vec<u8>);
 
 impl SubjectKey {
@@ -18,6 +22,14 @@ impl SubjectKey {
     /// The key bytes, for a key store to persist.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    /// Raw key content comparison, for the contracts' "two generated
+    /// keys differ" check. Deliberately not `PartialEq`: if a key must
+    /// be constant-time compared, this is not the seam that does it.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn same_bytes(&self, other: &Self) -> bool {
+        self.0 == other.0
     }
 }
 

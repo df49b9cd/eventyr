@@ -49,6 +49,10 @@ use proc_macro::TokenStream;
 /// - `crate = "..."` — the crate the generated code targets
 ///   (`eventyr-core` by default; `"eventyr"` when the derives come
 ///   through the umbrella crate)
+/// - `event_derive(Serialize, ...)` — extra `#[derive(...)]` paths for
+///   the generated event enum, and `event_attr("#[serde(...)]")` for
+///   any other attribute on it (0.7.6+: a stored or shredded event
+///   enum is a serde value)
 ///
 /// # The event enum
 ///

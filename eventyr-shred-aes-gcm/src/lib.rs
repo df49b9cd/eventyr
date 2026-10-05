@@ -1,13 +1,19 @@
 //! # eventyr-shred-aes-gcm
 //!
 //! AES-256-GCM for [`eventyr_shred`]: 256-bit subject keys, a random
-//! 96-bit nonce per field, and the subject bound as associated data.
+//! 96-bit nonce per field, and the subject bound as associated data —
+//! [`AeadCipher`] pinned to this
+//! algorithm.
 //!
 //! A sealed field stores `nonce ‖ ciphertext ‖ tag`. Random 96-bit
 //! nonces are safe for up to 2³² encryptions under one key (NIST SP
 //! 800-38D) — one key per data subject keeps every key far below that.
 //! For volumes where that bound could matter, use
 //! `eventyr-shred-chacha`, whose 192-bit nonces have no practical limit.
+//!
+//! There is no algorithm-generic API here on purpose: `eventyr-shred`'s
+//! `aead` feature owns the shared code, and this crate is the auditable
+//! pin.
 //!
 //! ```
 //! use eventyr_shred::Cipher;
@@ -20,35 +26,25 @@
 //! # Ok::<(), eventyr_shred::CipherError>(())
 //! ```
 
-use aes_gcm::aead::{Aead, Generate, Key, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::Aes256Gcm;
+use eventyr_shred::aead::AeadCipher;
 use eventyr_shred::{Cipher, CipherError, SubjectKey};
 
 /// The AES-256-GCM [`Cipher`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Aes256GcmCipher;
 
-/// Nonce length in bytes.
-const NONCE: usize = 12;
-
-fn engine(key: &SubjectKey) -> Result<Aes256Gcm, CipherError> {
-    Aes256Gcm::new_from_slice(key.as_bytes()).map_err(|_| {
-        CipherError(format!(
-            "an AES-256 key is 32 bytes, not {}",
-            key.as_bytes().len()
-        ))
-    })
-}
+/// The shared implementation: both algorithm adapters are this const,
+/// over their algorithm.
+const AES_256_GCM: AeadCipher<Aes256Gcm> = AeadCipher::new("aes-256-gcm", "AES-256");
 
 impl Cipher for Aes256GcmCipher {
     fn algorithm(&self) -> &'static str {
-        "aes-256-gcm"
+        AES_256_GCM.algorithm()
     }
 
     fn generate_key(&self) -> Result<SubjectKey, CipherError> {
-        let key = Key::<Aes256Gcm>::try_generate()
-            .map_err(|e| CipherError(format!("random source: {e}")))?;
-        Ok(SubjectKey::from_bytes(key.to_vec()))
+        AES_256_GCM.generate_key()
     }
 
     fn encrypt(
@@ -57,22 +53,7 @@ impl Cipher for Aes256GcmCipher {
         plaintext: &[u8],
         aad: &[u8],
     ) -> Result<Vec<u8>, CipherError> {
-        let engine = engine(key)?;
-        let nonce =
-            Nonce::try_generate().map_err(|e| CipherError(format!("random source: {e}")))?;
-        let sealed = engine
-            .encrypt(
-                &nonce,
-                Payload {
-                    msg: plaintext,
-                    aad,
-                },
-            )
-            .map_err(|_| CipherError("encryption failed".into()))?;
-        let mut out = Vec::with_capacity(NONCE + sealed.len());
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&sealed);
-        Ok(out)
+        AES_256_GCM.encrypt(key, plaintext, aad)
     }
 
     fn decrypt(
@@ -81,15 +62,7 @@ impl Cipher for Aes256GcmCipher {
         ciphertext: &[u8],
         aad: &[u8],
     ) -> Result<Vec<u8>, CipherError> {
-        let engine = engine(key)?;
-        if ciphertext.len() < NONCE {
-            return Err(CipherError("ciphertext shorter than its nonce".into()));
-        }
-        let (nonce, sealed) = ciphertext.split_at(NONCE);
-        let nonce = Nonce::try_from(nonce).map_err(|_| CipherError("bad nonce".into()))?;
-        engine
-            .decrypt(&nonce, Payload { msg: sealed, aad })
-            .map_err(|_| CipherError("authentication failed".into()))
+        AES_256_GCM.decrypt(key, ciphertext, aad)
     }
 }
 

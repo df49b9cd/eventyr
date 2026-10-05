@@ -32,6 +32,12 @@ pub struct ParkedEvent<E> {
 /// subscription acks past the event right after, so a park that is lost
 /// is an event that is silently skipped.
 pub trait ParkedStore<E>: Send + Sync {
+    /// Whether [`park`](Self::park) can ever succeed. Only [`NoParking`]
+    /// says no; a [`Projector`](crate::runner::Projector) whose policy
+    /// parks refuses to run over a store that says no, rather than
+    /// retry the event forever.
+    const RECORDS: bool = true;
+
     /// Record `event`. Parking the same `(subscription, sequence)` again
     /// — a redelivery after a crash between park and ack — replaces the
     /// record, never duplicates it.
@@ -106,6 +112,8 @@ impl<E: Clone + Send> ParkedStore<E> for InMemoryParkedStore<E> {
 }
 
 impl<E, P: ParkedStore<E> + ?Sized> ParkedStore<E> for std::sync::Arc<P> {
+    const RECORDS: bool = P::RECORDS;
+
     fn park(&self, event: ParkedEvent<E>) -> impl Future<Output = Result<(), StoreError>> + Send {
         (**self).park(event)
     }
@@ -129,10 +137,18 @@ impl<E, P: ParkedStore<E> + ?Sized> ParkedStore<E> for std::sync::Arc<P> {
 /// A parked store for subscriptions that never park ([`FailurePolicy::Halt`](eventyr_core::subscription::FailurePolicy::Halt)):
 /// a `Park` reaching it is refused, so the event is redelivered rather
 /// than skipped.
+///
+/// A [`Projector`](crate::runner::Projector) with a
+/// [`FailurePolicy::Park`](eventyr_core::subscription::FailurePolicy::Park)
+/// policy over `NoParking` refuses to run. Driven directly, every
+/// refusal counts on
+/// [`PARK_FAILURES`](eventyr_store::metrics::names::PARK_FAILURES).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoParking;
 
 impl<E: Send> ParkedStore<E> for NoParking {
+    const RECORDS: bool = false;
+
     async fn park(&self, _: ParkedEvent<E>) -> Result<(), StoreError> {
         Err(StoreError::other(
             "this subscription has no parked store; give the projector one to park events",
@@ -149,7 +165,8 @@ impl<E: Send> ParkedStore<E> for NoParking {
 }
 
 /// Run the [`ParkedStore`] contract against `make_store`'s fresh stores.
-/// Every implementation runs it.
+/// Every implementation runs it, behind this crate's `testing` feature.
+#[cfg(any(test, feature = "testing"))]
 pub fn parked_store_contract<P: ParkedStore<u64>>(make_store: impl Fn() -> P) {
     use eventyr_core::envelope::{EventEnvelope, Metadata};
     use eventyr_core::vocabulary::{StreamId, Version};

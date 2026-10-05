@@ -1,4 +1,4 @@
-error: unknown eventyr attribute; expected one of name, id, state, event, event_enum, command, error, initial, apply, decide, crate, events
+error: unknown eventyr attribute; expected one of name, id, state, event, event_enum, command, error, initial, apply, decide, crate, events, event_derive, event_attr
  --> tests/ui/unknown_attribute.rs:7:11
   |
 7 | #[eventyr(nme = "typo")]
