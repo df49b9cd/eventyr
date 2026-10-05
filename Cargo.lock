@@ -627,6 +627,7 @@ dependencies = [
  "eventyr-store",
  "futures",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1738,6 +1739,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
+ "uuid",
  "webpki-roots",
 ]
 
@@ -1805,6 +1807,7 @@ dependencies = [
  "thiserror",
  "time",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1840,6 +1843,7 @@ dependencies = [
  "thiserror",
  "time",
  "tracing",
+ "uuid",
  "whoami",
 ]
 
@@ -1866,6 +1870,7 @@ dependencies = [
  "time",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]

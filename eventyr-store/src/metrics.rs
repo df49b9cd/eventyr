@@ -30,6 +30,20 @@ pub mod names {
     /// backoff. Occasional ones are harmless (at-least-once); a steady
     /// rate means the projection is not making durable progress.
     pub const ACK_FAILURES: &str = "eventyr_ack_failures_total";
+
+    /// Lease renewals a projector driver attempted (0.7.9): the rhythm
+    /// at which a held lease stays held. A drop while the projector is
+    /// running is a sign the driver has stalled between renewals.
+    pub const LEASE_RENEWALS: &str = "eventyr_lease_renewals_total";
+    /// Renewals the lease store failed: one is a flaky store, a run of
+    /// them means the projector is about to report
+    /// [`LeaseLost`](eventyr_core::subscription::SubscriptionOutcome)-side
+    /// loss and stop.
+    pub const LEASE_RENEW_FAILURES: &str = "eventyr_lease_renew_failures_total";
+    /// Leases lost mid-run: another holder owns the name, or the holder
+    /// can no longer renew. Each one ends a driver run; a repeating one
+    /// means two projectors are configured on one name.
+    pub const LEASE_LOST: &str = "eventyr_lease_lost_total";
 }
 
 /// The tracing backend: each instrument call becomes a `tracing` event.

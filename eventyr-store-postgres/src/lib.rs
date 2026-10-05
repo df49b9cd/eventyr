@@ -30,6 +30,8 @@
 
 #[cfg(feature = "checkpoints")]
 pub mod checkpoints;
+#[cfg(feature = "leases")]
+pub mod leases;
 pub mod notify;
 #[cfg(feature = "snapshots")]
 pub mod snapshots;
@@ -53,6 +55,8 @@ const STREAM_CLOSED: &str = "EV001";
 
 #[cfg(feature = "checkpoints")]
 pub use checkpoints::PgCheckpointStore;
+#[cfg(feature = "leases")]
+pub use leases::PgLeaseStore;
 pub use notify::PgCommitSignal;
 pub use store::PgStore;
 
