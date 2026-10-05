@@ -134,6 +134,29 @@ impl<E, P: ParkedStore<E> + ?Sized> ParkedStore<E> for std::sync::Arc<P> {
     }
 }
 
+impl<E, P: ParkedStore<E> + ?Sized> ParkedStore<E> for &P {
+    const RECORDS: bool = P::RECORDS;
+
+    fn park(&self, event: ParkedEvent<E>) -> impl Future<Output = Result<(), StoreError>> + Send {
+        (**self).park(event)
+    }
+
+    fn list(
+        &self,
+        subscription: &str,
+    ) -> impl Future<Output = Result<Vec<ParkedEvent<E>>, StoreError>> + Send {
+        (**self).list(subscription)
+    }
+
+    fn remove(
+        &self,
+        subscription: &str,
+        sequence: Sequence,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        (**self).remove(subscription, sequence)
+    }
+}
+
 /// A parked store for subscriptions that never park ([`FailurePolicy::Halt`](eventyr_core::subscription::FailurePolicy::Halt)):
 /// a `Park` reaching it is refused, so the event is redelivered rather
 /// than skipped.

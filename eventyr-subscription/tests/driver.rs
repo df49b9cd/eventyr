@@ -714,6 +714,69 @@ async fn a_poison_event_is_parked_listed_and_replayed() {
     assert!(seen.lock().expect("poisoned").contains(&13));
 }
 
+/// The combinator's point: without it the projection itself must
+/// remember what it folded, or the redelivered batch counts the events
+/// before the poison one twice. `SkipRedelivered` dedupes by
+/// (stream, version), so only 13's retries reach the inner projection.
+#[tokio::test(start_paused = true)]
+async fn skip_redelivered_keeps_a_poison_event_from_recounting_its_batch() {
+    use std::collections::BTreeMap;
+
+    use eventyr_subscription::runner::SkipRedelivered;
+
+    /// Counts every envelope it is handed — deliberately naive about
+    /// redelivery, the mistake the combinator exists to forgive.
+    struct Counting {
+        folds: Arc<Mutex<BTreeMap<u64, usize>>>,
+    }
+    impl Projection for Counting {
+        type Event = u64;
+        type Error = String;
+        async fn apply(&mut self, event: &EventEnvelope<u64>) -> Result<(), String> {
+            if event.event == 13 {
+                return Err("thirteen is unlucky".into());
+            }
+            *self
+                .folds
+                .lock()
+                .expect("poisoned")
+                .entry(event.event)
+                .or_default() += 1;
+            Ok(())
+        }
+    }
+
+    let store = Arc::new(InMemoryStore::new());
+    populate(&store, &[11, 12, 13, 14, 15]).await;
+    let folds = Arc::new(Mutex::new(BTreeMap::<u64, usize>::new()));
+    let parked = Arc::new(InMemoryParkedStore::new());
+
+    let outcome = Projector::new(
+        "counting",
+        StoreSubscription::new(Arc::clone(&store)),
+        InMemoryCheckpointStore::new(),
+        SkipRedelivered::new(Counting {
+            folds: Arc::clone(&folds),
+        }),
+    )
+    .with_policy(
+        SubscriptionPolicy::new(64, std::time::Duration::ZERO, std::time::Duration::ZERO)
+            .stop_at_catch_up(),
+    )
+    .park_into(Arc::clone(&parked), FailurePolicy::Park { retries: 2 })
+    .run(|_| future::ready(()))
+    .await
+    .expect("run");
+
+    assert!(matches!(outcome, SubscriptionOutcome::CaughtUp { .. }));
+    let folds = folds.lock().expect("poisoned");
+    assert_eq!(
+        *folds,
+        BTreeMap::from([(11, 1), (12, 1), (14, 1), (15, 1)]),
+        "the redeliveries before 13 folded once, and 13 never"
+    );
+}
+
 /// The default halts: the projector rejects 13 again and again and
 /// its checkpoint never passes the event before it.
 #[tokio::test(start_paused = true)]

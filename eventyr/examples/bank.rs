@@ -38,7 +38,7 @@ use eventyr::shred_aes_gcm::Aes256GcmCipher;
 use eventyr::store::prelude::*;
 use eventyr::subscription::prelude::{
     EventFilter, FilteredSubscription, InMemoryCheckpointStore, InMemoryParkedStore, ParkedStore,
-    Projection, Projector, SagaProjection, StoreSubscription, SubscriptionOutcome,
+    Projection, Projector, SagaProjection, SkipRedelivered, StoreSubscription, SubscriptionOutcome,
 };
 
 // -- the domain -----------------------------------------------------
@@ -230,11 +230,21 @@ impl Tagged for AccountEvent {
 
 // -- the multi-stream transfer (0.4) --------------------------------
 
-/// A transfer between two accounts — the batch-machine decision.
+/// A transfer between two accounts — the batch-machine decision. The
+/// decider *is* the command (`Command = Self`), so one `Clone` serves
+/// both slots; the boundary (the two accounts' streams) is named once,
+/// by `AggregateBoundary`.
+#[derive(Clone)]
 struct Transfer {
     from: u64,
     to: u64,
     amount: u64,
+}
+
+impl AggregateBoundary<Account> for Transfer {
+    fn boundary(&self) -> Vec<AccountId> {
+        vec![AccountId(self.from), AccountId(self.to)]
+    }
 }
 
 impl Transfer {
@@ -242,34 +252,12 @@ impl Transfer {
         StreamId::for_aggregate::<Account>(&AccountId(id))
     }
 
-    /// The boundary names its streams twice (once for the loads, once
-    /// for the folds), so one constructor keeps the call honest.
+    /// `for_aggregates` (0.4+) derives the streams and the per-stream
+    /// folds from the boundary the decider itself names — the two-place
+    /// hand-wiring of `BatchMachine::new` (streams *and* a fold map, the
+    /// decider *and* its own command) was exactly that shape by hand.
     fn machine(&self, metadata: Metadata) -> BatchMachine<AccountEvent, AccountError, Transfer> {
-        BatchMachine::new(
-            vec![self.stream_of(self.from), self.stream_of(self.to)],
-            [self.from, self.to]
-                .iter()
-                .map(|&id| {
-                    (
-                        self.stream_of(id),
-                        Box::new(AggregateFold::<Account>(AccountId(id)))
-                            as Box<dyn Fold<AccountEvent>>,
-                    )
-                })
-                .collect(),
-            Transfer {
-                from: self.from,
-                to: self.to,
-                amount: self.amount,
-            },
-            Transfer {
-                from: self.from,
-                to: self.to,
-                amount: self.amount,
-            },
-            RetryPolicy::default(),
-        )
-        .with_metadata(metadata)
+        BatchMachine::for_aggregates(self, RetryPolicy::default()).with_metadata(metadata)
     }
 }
 
@@ -377,16 +365,8 @@ impl Projection for Ledger {
 /// A ledger that refuses any withdrawal over 1_000 — the poison event
 /// for the parking story (0.7.7). Its `Error` is a plain `String`:
 /// projections reject with whatever they can display.
-///
-/// At-least-once is literal: when one event keeps failing, the batch is
-/// redelivered from the last ack, and the events *before* the poison
-/// one arrive again each time. So a projection that can see redelivery
-/// dedupes — here by stream version (each event's `version` is its
-/// position in one stream, so anything at or below the last applied
-/// version is a duplicate fold).
 struct PickyLedger {
     balances: Arc<Mutex<BTreeMap<u64, u64>>>,
-    applied: Arc<Mutex<BTreeMap<u64, u64>>>,
     /// The approval list: the fixed projection lets these through.
     approved: Vec<u64>,
 }
@@ -394,25 +374,12 @@ impl Projection for PickyLedger {
     type Event = AccountEvent;
     type Error = String;
     async fn apply(&mut self, envelope: &EventEnvelope<AccountEvent>) -> Result<(), Self::Error> {
-        let Some(id) = account_of(&envelope.stream_id) else {
-            return Ok(());
-        };
-        {
-            let applied = self.applied.lock().expect("the lock");
-            if envelope.version.as_u64() <= *applied.get(&id).unwrap_or(&0) {
-                return Ok(()); // a redelivery: already folded
-            }
-        }
         if let AccountEvent::Withdrawn(Withdrawn { amount, .. }) = &envelope.event
             && *amount > 1_000
             && !self.approved.contains(amount)
         {
             return Err(format!("withdrawal {amount} needs approval"));
         }
-        self.applied
-            .lock()
-            .expect("the lock")
-            .insert(id, envelope.version.as_u64());
         Ledger {
             balances: self.balances.clone(),
         }
@@ -598,7 +565,10 @@ async fn main() {
     // refuses. `Park { retries: 2 }` lets it reject three times, records
     // the event in the parked store, and carries on past it — one bad
     // event never stalls the projection (Halt stays the default;
-    // skipping is a decision the caller makes).
+    // skipping is a decision the caller makes). `SkipRedelivered` is the
+    // at-least-once help §6 asks every projection to be: the redelivered
+    // batch re-presents the events before the poison one, and the
+    // wrapper skips them by stream version so nothing counts twice.
     repo.execute(AccountId(1), AccountCommand::Deposit { amount: 10_000 })
         .await
         .expect("fund for the big withdrawal");
@@ -606,13 +576,11 @@ async fn main() {
         .await
         .expect("the big withdrawal commits as an event");
     let picky_balances = Arc::new(Mutex::new(BTreeMap::new()));
-    let picky_applied = Arc::new(Mutex::new(BTreeMap::new()));
     let parked = Arc::new(InMemoryParkedStore::new());
-    let sensitive = PickyLedger {
+    let sensitive = SkipRedelivered::new(PickyLedger {
         balances: picky_balances.clone(),
-        applied: picky_applied.clone(),
         approved: Vec::new(),
-    };
+    });
     let outcome = Projector::new(
         "picky",
         StoreSubscription::new(store.clone()),
@@ -637,9 +605,6 @@ async fn main() {
     // projection applies each parked event, and its record is removed.
     let mut fixed = PickyLedger {
         balances: picky_balances.clone(),
-        // A fresh ledger with its own dedupe map: the parked envelope is
-        // replayed from scratch, not redelivered by the subscription.
-        applied: Arc::new(Mutex::new(BTreeMap::new())),
         approved: vec![5_000],
     };
     for entry in poisoned {
@@ -732,6 +697,17 @@ async fn main() {
         refused,
         ExecutionError::Store(StoreError::StreamClosed { .. })
     ));
+
+    // Reading state without a command (0.7.8): the repository folds the
+    // stream into the aggregate's state — carol is `closed`, and the
+    // load answers "what is she now" without re-deciding anything. The
+    // seeded form is the same fold from the snapshot.
+    let carol = repo
+        .load_with_snapshots(AccountId(3))
+        .await
+        .expect("load carol");
+    assert!(carol.state.closed);
+    assert_eq!(carol.version, Version::new(2)); // open + close
 
     // Erasure (0.7.6): bob closes his account and exercises his right
     // to be forgotten. Deleting his key turns every sealed `owner` of

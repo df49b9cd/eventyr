@@ -78,6 +78,7 @@ Design notes:
 - **`decide` is `&self`-free and pure.** No `&self` receiver means the aggregate *type* is just a namespace for behavior — no actor, no dependencies smuggled in. Dependencies (clocks, catalogs) belong in the `Command` or a `Context` parameter added by the repository layer, not in the trait. This keeps domain logic unit-testable with zero mocking.
 - **`Optional` adapter** (`eventyr::Optional`): for aggregates whose initial state is "doesn't exist", `State = Option<T>` is so common that we ship a blanket adapter, like `eventually`'s `Optional`/`AsAggregate`.
 - **`initial`, not `Default`.** The trait constructs its own starting state — given the id, for aggregates that embed it — so states without a meaningful `Default` don't fight the trait. The repository folds from `A::initial`.
+- **An id a payload needs lives in the state.** `decide(state, command)` never sees the id, deliberately — no dependencies smuggled in — so an event payload that must carry it (a payload-derived `Tagged` event is the common case, 0.7.1) gets it from state: give the state an `id` field and start it with the derive's `initial = MyState::new(id)`. The bank example's `Deposited { account, .. }` works exactly this way.
 
 ### 4.2 Identity, versions & store errors
 
@@ -295,7 +296,7 @@ where
 }
 ```
 
-This is `katha`'s `make_handler` / `sourcerer`'s `GenericRepository` / `eventcore`'s executor — all converged on the same protocol — but with the protocol *extracted* into a testable machine instead of an async loop.
+This is `katha`'s `make_handler` / `sourcerer`'s `GenericRepository` / `eventcore`'s executor — all converged on the same protocol — but with the protocol *extracted* into a testable machine instead of an async loop. `load(id)` / `load_at(id, version)` and (with `time`) `load_until(id, timestamp)` are the read half (0.7.8): one fold, no machine, snapshot-seeded on a `with_snapshots` repository (`load_with_snapshots` / `load_at_with_snapshots`).
 
 ## 6. Projections & subscriptions (eventyr-subscription, eventyr-projection)
 
@@ -318,7 +319,7 @@ pub trait Subscription {
 }
 ```
 
-- **At-least-once delivery, idempotent apply** — the only honest contract (thalo's guarantee, EventStoreDB's model).
+- **At-least-once delivery, idempotent apply** — the only honest contract (thalo's guarantee, EventStoreDB's model). The help for *being* idempotent is `SkipRedelivered` (0.7.7's companion): a `Projection` wrapper that records the newest folded position per stream and skips anything redelivered at or below it, so the batch retry in 0.7.7 cannot re-count the events before a poison one. The wrapper dedupes within a run; the checkpoint dedupes between runs; a rebuild from the start needs neither.
 - **Checkpointed catch-up subscriptions** over any `StreamsAll` store (eventually's `Subscription::checkpoint/resume`): the projector runner persists the last-acked global sequence, so restarts resume without reprocessing.
 - **The projector is also a machine** — `ProjectorMachine`, per the canonical table in §7; the runner is just its driver. This is where sans-IO pays off most: at-least-once semantics, redelivery after failure, and resume-from-checkpoint are exactly the kind of multi-step, failure-prone protocol that should never be an untestable async loop. The implemented machine (`SubscriptionMachine` in `eventyr-core`, named for its §6-facing role) adds the table's *implied* steps as explicit actions: `Fetch` is the poll §6's `Subscription::poll` implies (`Batch` must be requested), and `Slept` is the driver's answer to `Sleep` — no clock in the machine. That delta between the table's four names and the implemented protocol is intentional.
 - **No built-in consumer loop** — the runner is a plain `tokio` task users spawn; Eventyr ships a `Projector` helper but doesn't own the event loop (mnesis's "the loop is the consumer's" — right for a library).
@@ -517,7 +518,7 @@ The machine is `eventyr_core::boundary::BoundaryMachine`, run with `drive_bounda
 **Shipped**, with three departures from the plan above:
 
 - **A `CommitSignal` port, not an `EventBus` implementation.** `EventBus::publish` pushes envelopes *out*, so implementing it would mean the store calls a publisher after each commit. That is the wrong direction for Postgres, where the commit itself raises `NOTIFY`, and it carries more than a hint needs. The new port in `eventyr_store::notify` is narrower. `CommitSignal::subscribe` arms a `CommitListener`, and its `committed()` resolves once a commit has happened since arming or since the last call. It carries no events. Arming comes *before* the subscriber's first poll, so a commit between a poll and the wait that follows is remembered, never missed. `EventBus` stays what §2 made it, the seam for a user's own transport.
-- **The machine learns why it sleeps.** `SubscriptionAction::Sleep` gained a `SleepReason`. `Idle` (the last poll was empty) may end early on a commit; `Backoff` (a failed apply or ack) runs its course, so a failing projection is not hammered on every write. `drive_projector_woken` races idle sleeps against the listener. `Projector::wake_on(signal).run_woken(sleep)` is the bundled form. A listener that errors is dropped for the rest of the run, and the driver falls back to its timer.
+- **The machine learns why it sleeps.** `SubscriptionAction::Sleep` gained a `SleepReason`. `Idle` (the last poll was empty) may end early on a commit; `Backoff` (a failed apply or ack) runs its course, so a failing projection is not hammered on every write. `drive_projector` with `DriverPorts::wake_on(listener)` races idle sleeps against the listener. `Projector::wake_on(signal).run_woken(sleep)` is the bundled form. A listener that errors is dropped for the rest of the run, and the driver falls back to its timer.
 - **Every store signals, not only in-memory and Postgres.** The in-memory, fjall, and SQLite stores share `LocalCommitSignal`, a generation counter and an `event-listener` `Event` that is raised after each commit that wrote events. It covers commits made through the store's own handles; another process writing the same SQLite file is seen at the next timed poll. Postgres raises `NOTIFY eventyr_commits` inside `append_events` (migration 0007), which Postgres delivers on commit and never on rollback. `PgCommitSignal` gives each subscriber its own listening connection outside the store's pool, and it wakes on commits from any process. The channel is database-wide, so a commit in another schema costs one empty poll. A lost connection resolves as a wake-up and reconnects on the next wait. Nothing is behind a feature flag. The signal is opt-in per projector (`wake_on`), and a projector that doesn't use it behaves exactly as before.
 
 `commit_signal_contract` in `eventyr-store-testing` gates the three embedded stores. Postgres has timed tests against a real database, including an end-to-end one where a projector with a one-hour idle sleep applies a new event within seconds. That test fails when the `NOTIFY` is removed.
@@ -591,6 +592,8 @@ Replay is the caller's: list the parked events, apply each to the fixed projecti
 ### 0.7.8 — Reading state without a command
 
 `AggregateRepository` only executes commands, so there is no `load(id)` for a query handler, a debugging tool, or an integration test. Marten also loads as of a version or timestamp. 0.7.8 adds `load(id)` and `load_at(id, version)` on the repository (snapshot-seeded where configured), plus `load_until(id, timestamp)` when the `time` feature is on. No machine is needed: it is one fold, which §7 keeps out of the machine table.
+
+**Shipped.** All three live on `eventyr-store`'s `AggregateRepository` — one fold, no machine (per §7 a load has nothing multi-step to branch on), each returning `Loaded { state, version }` so "as of" answers carry how far the fold actually read. The plain `load`/`load_at` are on the snapshots-off repository; `load_with_snapshots`/`load_at_with_snapshots` seed from the newest persisted `Snapshot` (never past a `load_at`'s own bound, and a failed seed read fails the load — the write path's rule). `load_until` is never seeded: a snapshot records a version, not an instant, and only stores that write `metadata.timestamp` (the in-memory store via the caller, Postgres via `created_at`) can answer it — an event without one is a `StoreError::Other` naming the stream, not a guess. Stopping at an out-of-order timestamp stops at the *first* later event; `<=` keeps one commit's shared `created_at` together.
 
 ### 0.7.9 — Projector exclusivity and partitioned processing
 

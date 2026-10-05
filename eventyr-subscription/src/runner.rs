@@ -84,6 +84,70 @@ where
     }
 }
 
+/// A projection made idempotent: wraps another `Projection` and skips
+/// any envelope its stream position says was already folded.
+///
+/// At-least-once is literal: the ack moves only after a batch applies,
+/// so a redelivered batch re-applies the events before the one that
+/// failed. A projection that counts or mutates must not fold twice, and
+/// §6 asks every projection to be idempotent without helping. This
+/// wrapper is that help — a first-class duplicate check, not a
+/// work-around in each projection.
+///
+/// Because a stream appends from `Version(1)` upward with no gaps, the
+/// newest position *this projection instance* has folded per stream
+/// exactly partitions "already folded" from "new". An envelope at or
+/// below it is a redelivery and is skipped; the fold runs only for
+/// events past it. The map is in-memory, so a *new run* folding from a
+/// checkpoint behind an envelope that was applied before a crash still
+/// sees it — the wrapper dedupes within a run, the checkpoint dedupes
+/// between runs. A projection that survives restarts by folding from
+/// the start (a rebuild, an inline view moving to async) needs no
+/// dedupe state at all: it is total on re-read.
+///
+/// The inner projection's own failure still fails the envelope (the
+/// position is recorded only after a successful fold), so a poison
+/// event under `FailurePolicy::Park` retries as usual — and its batch
+/// will not re-count the events before it.
+pub struct SkipRedelivered<P> {
+    inner: P,
+    applied: std::collections::BTreeMap<eventyr_core::vocabulary::StreamId, u64>,
+}
+
+impl<P> SkipRedelivered<P> {
+    /// `inner`, with redelivered envelopes skipped.
+    pub fn new(inner: P) -> Self {
+        Self {
+            inner,
+            applied: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The wrapped projection.
+    pub fn into_inner(self) -> P {
+        self.inner
+    }
+}
+
+impl<P> Projection for SkipRedelivered<P>
+where
+    P: Projection,
+    P::Event: Sync,
+{
+    type Event = P::Event;
+    type Error = P::Error;
+
+    async fn apply(&mut self, event: &EventEnvelope<Self::Event>) -> Result<(), Self::Error> {
+        if event.version.as_u64() <= *self.applied.get(&event.stream_id).unwrap_or(&0) {
+            return Ok(()); // a redelivery: already folded
+        }
+        self.inner.apply(event).await?;
+        self.applied
+            .insert(event.stream_id.clone(), event.version.as_u64());
+        Ok(())
+    }
+}
+
 /// The driver's optional ports: what [`drive_projector`] wakes on,
 /// parks into, and reports to. Each defaults to doing nothing.
 ///

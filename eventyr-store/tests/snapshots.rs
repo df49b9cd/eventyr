@@ -251,3 +251,159 @@ async fn snapshots_on_conflict_retry_still_converges() {
         Err(other) => panic!("unexpected store failure: {other:?}"),
     }
 }
+
+// -- seeded loads (0.7.8) ----------------------------------------------------
+
+/// A snapshots-on repository loads from the newest seed and folds only
+/// the delta — a deliberately wrong planted snapshot proves the seed is
+/// used (and a plain load over the same store ignores it).
+#[tokio::test]
+async fn a_seeded_load_starts_from_the_newest_snapshot() {
+    let store = Arc::new(InMemoryStore::new());
+    let snapshots = Arc::new(InMemorySnapshotStore::new());
+    let repo: AggregateRepository<Account, _, _> =
+        AggregateRepository::new(Arc::clone(&store), RetryPolicy::default())
+            .with_snapshots(Arc::clone(&snapshots), policy(100));
+    let id = AccountId(7);
+    let stream = StreamId::for_aggregate::<Account>(&id);
+
+    repo.execute(id.clone(), AccountCommand::Open { owner: "a".into() })
+        .await
+        .expect("open");
+    repo.execute(id.clone(), AccountCommand::Deposit { amount: 100 })
+        .await
+        .expect("deposit");
+
+    // Plant a snapshot whose state the real fold never reached. A
+    // seeded load must return the seed + delta, not recompute.
+    snapshots
+        .save(Snapshot {
+            stream_id: stream.clone(),
+            version: Version::new(2),
+            state: AccountState {
+                open: true,
+                balance: 1_000,
+            },
+        })
+        .await
+        .expect("save");
+
+    let seeded = repo.load_with_snapshots(id.clone()).await.expect("seeded");
+    assert_eq!(seeded.version, Version::new(2));
+    assert_eq!(seeded.state.balance, 1_000);
+
+    // The plain load over the same store replays from the start.
+    let plain: AggregateRepository<Account, _> =
+        AggregateRepository::new(Arc::clone(&store), RetryPolicy::default());
+    let full = plain.load(id.clone()).await.expect("plain");
+    assert_eq!(full.state.balance, 100);
+}
+
+/// A real cadence snapshot is the same seed: the seeded load and the
+/// full load agree.
+#[tokio::test]
+async fn a_stored_snapshot_and_the_full_fold_agree() {
+    let store = Arc::new(InMemoryStore::new());
+    let snapshots = Arc::new(InMemorySnapshotStore::new());
+    let repo: AggregateRepository<Account, _, _> =
+        AggregateRepository::new(Arc::clone(&store), RetryPolicy::default())
+            .with_snapshots(Arc::clone(&snapshots), policy(2));
+    let id = AccountId(7);
+
+    repo.execute(id.clone(), AccountCommand::Open { owner: "a".into() })
+        .await
+        .expect("open");
+    for amount in [100, 50] {
+        repo.execute_with_snapshots(id.clone(), AccountCommand::Deposit { amount })
+            .await
+            .expect("deposit");
+    }
+
+    let seeded = repo.load_with_snapshots(id.clone()).await.expect("seeded");
+    let plain: AggregateRepository<Account, _> =
+        AggregateRepository::new(Arc::clone(&store), RetryPolicy::default());
+    let full = plain.load(id.clone()).await.expect("plain");
+    assert_eq!(seeded.version, full.version);
+    assert_eq!(seeded.state.balance, full.state.balance);
+}
+
+/// `load_at_with_snapshots` never seeds from past its own bound: a
+/// snapshot past the asked version is ignored.
+#[tokio::test]
+async fn a_seeded_load_at_ignores_a_snapshot_past_its_bound() {
+    let store = Arc::new(InMemoryStore::new());
+    let snapshots = Arc::new(InMemorySnapshotStore::new());
+    let repo: AggregateRepository<Account, _, _> =
+        AggregateRepository::new(Arc::clone(&store), RetryPolicy::default())
+            .with_snapshots(Arc::clone(&snapshots), policy(100));
+    let id = AccountId(7);
+    let stream = StreamId::for_aggregate::<Account>(&id);
+
+    repo.execute(id.clone(), AccountCommand::Open { owner: "a".into() })
+        .await
+        .expect("open");
+    repo.execute(id.clone(), AccountCommand::Deposit { amount: 100 })
+        .await
+        .expect("deposit");
+    repo.execute(id.clone(), AccountCommand::Deposit { amount: 50 })
+        .await
+        .expect("deposit");
+
+    snapshots
+        .save(Snapshot {
+            stream_id: stream.clone(),
+            version: Version::new(3),
+            state: AccountState {
+                open: true,
+                balance: 1_000,
+            },
+        })
+        .await
+        .expect("save");
+
+    // The bound is below the snapshot: the fold replays from the start,
+    // stopping at version 2.
+    let at_two = repo
+        .load_at_with_snapshots(id.clone(), Version::new(2))
+        .await
+        .expect("at 2");
+    assert_eq!(at_two.version, Version::new(2));
+    assert_eq!(at_two.state.balance, 100);
+}
+
+/// Truncation below the seed is fine — the seeded load starts past it —
+/// while the plain load must fail with `Truncated` (0.7.6's rule: cut
+/// only below what the snapshot readers start from, now for loads too).
+#[tokio::test]
+async fn a_truncated_stream_loads_from_a_snapshot_but_not_a_full_fold() {
+    let store = Arc::new(InMemoryStore::new());
+    let snapshots = Arc::new(InMemorySnapshotStore::new());
+    let repo: AggregateRepository<Account, _, _> =
+        AggregateRepository::new(Arc::clone(&store), RetryPolicy::default())
+            .with_snapshots(Arc::clone(&snapshots), policy(2));
+    let id = AccountId(7);
+    let stream = StreamId::for_aggregate::<Account>(&id);
+
+    repo.execute_with_snapshots(id.clone(), AccountCommand::Open { owner: "a".into() })
+        .await
+        .expect("open");
+    repo.execute_with_snapshots(id.clone(), AccountCommand::Deposit { amount: 100 })
+        .await
+        .expect("deposit"); // snapshot at 2
+    repo.execute_with_snapshots(id.clone(), AccountCommand::Deposit { amount: 50 })
+        .await
+        .expect("deposit");
+    store
+        .truncate_before(&stream, Version::new(3))
+        .await
+        .expect("truncate");
+
+    let seeded = repo.load_with_snapshots(id.clone()).await.expect("seeded");
+    assert_eq!(seeded.version, Version::new(3));
+    assert_eq!(seeded.state.balance, 150);
+
+    let plain: AggregateRepository<Account, _> =
+        AggregateRepository::new(Arc::clone(&store), RetryPolicy::default());
+    let error = plain.load(id).await.expect_err("truncated");
+    assert!(matches!(error, StoreError::Truncated { .. }));
+}

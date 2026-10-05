@@ -64,6 +64,58 @@ use proc_macro::TokenStream;
 /// `{Ident}Event`); the `Event` type follows the enum. The reverse
 /// conversion is a `match` — the point of a concrete enum.
 ///
+/// # When `decide` needs the id
+///
+/// `decide(state, command)` never sees the aggregate's id — the trait
+/// keeps the decision to state and command so no dependency is smuggled
+/// in. An event payload that must carry the id (a `Tagged` event, whose
+/// tags are payload-derived, is the common reason) gets it from the
+/// *state*: give the state an `id` field and start it from `initial`.
+/// The derive's default `initial` is `Default::default()`, so this
+/// always takes one explicit line:
+///
+/// ```
+/// # use eventyr_macros::Aggregate;
+/// # #[derive(Clone, PartialEq, Eq, Hash, Debug, Default)] struct WalletId(u64);
+/// # impl std::fmt::Display for WalletId {
+/// #     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+/// # }
+/// # #[derive(Clone, Debug, Default, PartialEq)] struct Credited { amount: u64 }
+/// # struct Credit;
+/// # #[derive(Debug)] enum Declined { }
+/// # impl std::fmt::Display for Declined {
+/// #     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("declined") }
+/// # }
+/// #[derive(Clone, Debug, Default)]
+/// struct WalletState {
+///     id: WalletId,
+///     balance: u64,
+/// }
+/// impl WalletState {
+///     fn new(id: &WalletId) -> Self {
+///         Self { id: id.clone(), ..Self::default() }
+///     }
+/// }
+/// # fn apply(state: &mut WalletState, event: &WalletEvent) {}
+/// # fn decide(state: &WalletState, command: &Credit) -> Result<Vec<WalletEvent>, Declined> { todo!() }
+/// #[derive(Aggregate)]
+/// #[eventyr(
+///     id = WalletId,
+///     state = WalletState,
+///     command = Credit,
+///     error = Declined,
+///     initial = WalletState::new(id), // the id is in scope as `id`
+///     apply = apply,
+///     decide = decide,
+///     events(Credited),
+/// )]
+/// struct Wallet;
+/// ```
+///
+/// A thread-local or a command field is a workaround, not the pattern:
+/// the state is the one thing every load, fold, and snapshot already
+/// carries.
+///
 /// # Example
 ///
 /// ```
