@@ -19,9 +19,8 @@ serde = ["dep:serde"]
 [dependencies]
 eventyr-core = { workspace = true }
 eventyr-store = { workspace = true }
-futures = { version = "0.3", default-features = false, features = ["alloc", "executor"] }
-serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+futures = { workspace = true, features = ["executor"] }
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
 
