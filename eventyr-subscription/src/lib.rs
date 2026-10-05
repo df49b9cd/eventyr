@@ -93,7 +93,9 @@ pub mod prelude {
     pub use crate::bus::{EventBus, Subscription};
     pub use crate::checkpoint::{CheckpointStore, InMemoryCheckpointStore};
     pub use crate::parked::{InMemoryParkedStore, NoParking, ParkedEvent, ParkedStore};
-    pub use crate::runner::{DriverPorts, Projection, Projector, drive_projector};
+    pub use crate::runner::{
+        DriverPorts, Fanout, Projection, Projector, drive_projector, drive_projector_blocking,
+    };
     pub use crate::saga::{SagaProjection, drive_saga};
     pub use crate::source::{FilteredSubscription, StoreSubscription, SubscriptionSource};
     pub use eventyr_core::saga::{
