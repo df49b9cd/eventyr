@@ -300,7 +300,7 @@ where
                         metrics.counter(PARKED_EVENTS, 1);
                         machine.handle(SubscriptionInput::Parked)
                     }
-                    Err(_) => machine.handle(SubscriptionInput::ParkFailed),
+                    Err(error) => machine.handle(SubscriptionInput::ParkFailed { error }),
                 }
             }
             SubscriptionAction::Ack { checkpoint } => {
@@ -314,9 +314,9 @@ where
                         }
                         machine.handle(SubscriptionInput::Acked)
                     }
-                    Err(_) => {
+                    Err(error) => {
                         batch_started = None;
-                        machine.handle(SubscriptionInput::AckFailed)
+                        machine.handle(SubscriptionInput::AckFailed { error })
                     }
                 }
             }

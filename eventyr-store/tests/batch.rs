@@ -65,17 +65,20 @@ impl Decide<AccountEvent, AccountError> for Transfer {
         ) {
             return BatchDecision::reject(error);
         }
-        BatchDecision::of(
-            vec![
+        BatchDecision::of([
+            (
+                stream_of(command.from),
                 AccountEvent::Withdrawn {
                     amount: command.amount,
                 },
+            ),
+            (
+                stream_of(command.to),
                 AccountEvent::Deposited {
                     amount: command.amount,
                 },
-            ],
-            vec![stream_of(command.from), stream_of(command.to)],
-        )
+            ),
+        ])
     }
 }
 

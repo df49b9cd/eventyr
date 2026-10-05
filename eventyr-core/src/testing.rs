@@ -9,19 +9,108 @@ use alloc::vec::Vec;
 
 use crate::aggregate::Aggregate;
 use crate::batch::{BatchAction, BatchInput, BatchMachine, Decide};
+use crate::boundary::{BoundaryAction, BoundaryInput, BoundaryMachine, Decision};
 use crate::subscription::{SubscriptionAction, SubscriptionInput, SubscriptionMachine};
 use crate::write::{WriteAction, WriteInput, WriteMachine};
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// A driver-facing machine: a first action from [`start`](Machine::start),
+/// then one action per [`handle`](Machine::handle)d input — the shape
+/// [`scripted`] drives.
+///
+/// Implemented by [`WriteMachine`] (snapshots on or off),
+/// [`BatchMachine`], [`BoundaryMachine`], and [`SubscriptionMachine`];
+/// sealed, since the scripted driver's guarantees are about these
+/// machines' protocols. (The [`SagaMachine`](crate::saga::SagaMachine)
+/// starts from an event, not from nothing, so it drives itself.)
+pub trait Machine: sealed::Sealed {
+    /// What the driver reports back.
+    type Input;
+    /// What the machine asks the driver to do.
+    type Action;
+
+    /// The first action.
+    fn start(&mut self) -> Self::Action;
+
+    /// Consume a driver result and emit the next action.
+    fn handle(&mut self, input: Self::Input) -> Self::Action;
+}
+
+impl<A: Aggregate, S> sealed::Sealed for WriteMachine<A, S> {}
+
+impl<A: Aggregate, S> Machine for WriteMachine<A, S> {
+    type Input = WriteInput<A::Event, S>;
+    type Action = WriteAction<A::Event, A::Error, S>;
+
+    fn start(&mut self) -> Self::Action {
+        WriteMachine::start(self)
+    }
+
+    fn handle(&mut self, input: Self::Input) -> Self::Action {
+        WriteMachine::handle(self, input)
+    }
+}
+
+impl<E, Err, D: Decide<E, Err>> sealed::Sealed for BatchMachine<E, Err, D> {}
+
+impl<E, Err, D: Decide<E, Err>> Machine for BatchMachine<E, Err, D> {
+    type Input = BatchInput<E>;
+    type Action = BatchAction<E, Err>;
+
+    fn start(&mut self) -> Self::Action {
+        BatchMachine::start(self)
+    }
+
+    fn handle(&mut self, input: Self::Input) -> Self::Action {
+        BatchMachine::handle(self, input)
+    }
+}
+
+impl<D: Decision> sealed::Sealed for BoundaryMachine<D> {}
+
+impl<D: Decision> Machine for BoundaryMachine<D> {
+    type Input = BoundaryInput<D::Event>;
+    type Action = BoundaryAction<D::Event, D::Error>;
+
+    fn start(&mut self) -> Self::Action {
+        BoundaryMachine::start(self)
+    }
+
+    fn handle(&mut self, input: Self::Input) -> Self::Action {
+        BoundaryMachine::handle(self, input)
+    }
+}
+
+impl<E: Clone> sealed::Sealed for SubscriptionMachine<E> {}
+
+impl<E: Clone> Machine for SubscriptionMachine<E> {
+    type Input = SubscriptionInput<E>;
+    type Action = SubscriptionAction<E>;
+
+    fn start(&mut self) -> Self::Action {
+        SubscriptionMachine::start(self)
+    }
+
+    fn handle(&mut self, input: Self::Input) -> Self::Action {
+        SubscriptionMachine::handle(self, input)
+    }
+}
 
 /// Drives `machine` through `start()` and every input in `script`,
 /// recording each action in order.
 ///
 /// The script is fed verbatim: inputs after the machine finished are
 /// answered with protocol-violation outcomes, exactly as they would be
-/// at runtime — which is itself worth asserting on.
-pub fn drive_scripted<A: Aggregate>(
-    machine: &mut WriteMachine<A>,
-    script: impl IntoIterator<Item = WriteInput<A::Event>>,
-) -> Vec<WriteAction<A::Event, A::Error>> {
+/// at runtime — which is itself worth asserting on. A subscription's
+/// [`Slept`](SubscriptionInput::Slept) is fed instantly — the machine
+/// decides durations as data, so the scripted driver needs no clock.
+pub fn scripted<M: Machine>(
+    machine: &mut M,
+    script: impl IntoIterator<Item = M::Input>,
+) -> Vec<M::Action> {
     let mut actions = Vec::new();
     actions.push(machine.start());
     for input in script {
@@ -30,37 +119,38 @@ pub fn drive_scripted<A: Aggregate>(
     actions
 }
 
-/// The [`SubscriptionMachine`] sibling of [`drive_scripted`]: feeds
-/// `script` verbatim, recording every action in order.
-///
-/// [`Slept`](SubscriptionInput::Slept) is fed instantly — the machine
-/// decides durations as data, so the scripted driver needs no clock,
-/// and a perennial machine stops only at a scripted `Done`-reaching
-/// input (`Failed`, `Shutdown`, or a catch-up policy).
+/// [`scripted`] for a [`WriteMachine`], snapshots on or off.
+pub fn drive_scripted<A: Aggregate, S>(
+    machine: &mut WriteMachine<A, S>,
+    script: impl IntoIterator<Item = WriteInput<A::Event, S>>,
+) -> Vec<WriteAction<A::Event, A::Error, S>> {
+    scripted(machine, script)
+}
+
+/// [`scripted`] for a [`SubscriptionMachine`]. A perennial machine
+/// stops only at a scripted `Done`-reaching input (`Failed`,
+/// `Shutdown`, or a catch-up policy).
 pub fn projector_scripted<E: Clone>(
     machine: &mut SubscriptionMachine<E>,
     script: impl IntoIterator<Item = SubscriptionInput<E>>,
 ) -> Vec<SubscriptionAction<E>> {
-    let mut actions = Vec::new();
-    actions.push(machine.start());
-    for input in script {
-        actions.push(machine.handle(input));
-    }
-    actions
+    scripted(machine, script)
 }
 
-/// The [`BatchMachine`] sibling of [`drive_scripted`]: feeds `script`
-/// verbatim, recording every action in order.
+/// [`scripted`] for a [`BatchMachine`].
 pub fn batch_scripted<E, Err, D: Decide<E, Err>>(
     machine: &mut BatchMachine<E, Err, D>,
     script: impl IntoIterator<Item = BatchInput<E>>,
 ) -> Vec<BatchAction<E, Err>> {
-    let mut actions = Vec::new();
-    actions.push(machine.start());
-    for input in script {
-        actions.push(machine.handle(input));
-    }
-    actions
+    scripted(machine, script)
+}
+
+/// [`scripted`] for a [`BoundaryMachine`].
+pub fn boundary_scripted<D: Decision>(
+    machine: &mut BoundaryMachine<D>,
+    script: impl IntoIterator<Item = BoundaryInput<D::Event>>,
+) -> Vec<BoundaryAction<D::Event, D::Error>> {
+    scripted(machine, script)
 }
 
 /// A domain test: `given` a history, `when` a command, `then` an

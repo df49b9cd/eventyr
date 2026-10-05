@@ -18,7 +18,7 @@
 //! [`Fold`] — there is no shared state, so cross-stream invariants live
 //! in the [`Decide`] implementation, which reads *every* folded state —
 //! and decides (validation) while routing each event to a stream
-//! ([`BatchDecision::of`]). The result is one atomic
+//! ([`RoutedDecision::of`]). The result is one atomic
 //! [`AppendBatch`](BatchAction::AppendBatch): every stream or none, each
 //! guarded by its own expectation. On a conflict the machine re-reads
 //! only the delta of the stream that moved and re-decides — a conflict
@@ -35,15 +35,13 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::collections::btree_map::Entry;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 
-use crate::envelope::{EventEnvelope, NewEvent};
-use crate::error::{ProtocolError, StoreError};
+use crate::envelope::{EventEnvelope, Metadata, NewEvent};
+use crate::error::StoreError;
 use crate::vocabulary::{ExpectedVersion, StreamId, Version};
-use crate::write::RetryPolicy;
+use crate::write::{RetryBudget, RetryPolicy};
 
 /// The per-stream fold: the batch analogue of computing an
 /// [`Aggregate::State`](crate::aggregate::Aggregate::State).
@@ -118,9 +116,9 @@ pub trait Decide<E, Err>: Send {
     type Command: Send;
 
     /// Decide the batch: the events and their target streams
-    /// ([`BatchDecision::of`]), a rejection
-    /// ([`BatchDecision::reject`]), or no change
-    /// ([`BatchDecision::noop`]).
+    /// ([`RoutedDecision::of`]), a rejection
+    /// ([`RoutedDecision::reject`]), or no change
+    /// ([`RoutedDecision::noop`]).
     fn decide(
         &self,
         folded: &BTreeMap<StreamId, Box<dyn Any + Send>>,
@@ -128,45 +126,49 @@ pub trait Decide<E, Err>: Send {
     ) -> BatchDecision<E, Err>;
 }
 
-/// The decision [`Decide::decide`] returns: accept with events routed
-/// to streams, reject, or no change.
+/// A decision that routes each accepted event to a stream: what
+/// [`Decide::decide`] and
+/// [`Decision::decide`](crate::boundary::Decision::decide) return —
+/// accept with events routed to streams, reject, or no change.
 ///
-/// Construct with [`of`](BatchDecision::of), [`reject`](BatchDecision::reject),
-/// or [`noop`](BatchDecision::noop); the machine destructures it.
-pub struct BatchDecision<E, Err> {
-    outcome: Result<Vec<(NewEvent<E>, StreamId)>, Err>,
+/// Construct with [`of`](RoutedDecision::of), [`to`](RoutedDecision::to),
+/// [`reject`](RoutedDecision::reject), or [`noop`](RoutedDecision::noop);
+/// the machine destructures it. Every event is paired with its stream
+/// at construction, so an event without a target cannot be expressed.
+/// The machine stamps the interaction's
+/// [`Metadata`] on every event at emit time (0.5.2): the domain decides
+/// which events, the boundary decides why.
+///
+/// [`BatchDecision`] and
+/// [`BoundaryDecision`](crate::boundary::BoundaryDecision) name this
+/// type for the machine that consumes it.
+pub struct RoutedDecision<E, Err> {
+    outcome: Result<Vec<(StreamId, E)>, Err>,
 }
 
-impl<E, Err> BatchDecision<E, Err> {
-    /// Accept: append `events`, each routed to the stream at the same
-    /// index of `targets` (the two vecs are the same length — every
-    /// event needs a target). A target outside the machine's boundary
-    /// is a protocol violation at emit time.
+/// The [`RoutedDecision`] a [`BatchMachine`]'s [`Decide`] returns.
+///
+/// Every routed stream must lie inside the machine's boundary: a target
+/// outside it is a protocol violation at emit time. Each stream is
+/// appended guarded by the version its fold reached.
+pub type BatchDecision<E, Err> = RoutedDecision<E, Err>;
+
+impl<E, Err> RoutedDecision<E, Err> {
+    /// Accept: append each event to the stream it is paired with — the
+    /// `(stream, event)` shape [`Saga::react`](crate::saga::Saga::react)
+    /// returns. Events keep their order within each stream.
     ///
-    /// An empty `events` is a noop that still round-trips the store;
-    /// prefer [`noop`](BatchDecision::noop).
-    pub fn of(events: Vec<E>, targets: Vec<StreamId>) -> Self {
-        assert_eq!(
-            events.len(),
-            targets.len(),
-            "every event needs a target stream",
-        );
+    /// An empty `routed` decides no change, like
+    /// [`noop`](RoutedDecision::noop).
+    pub fn of(routed: impl IntoIterator<Item = (StreamId, E)>) -> Self {
         Self {
-            outcome: Ok(events.into_iter().map(NewEvent::new).zip(targets).collect()),
+            outcome: Ok(routed.into_iter().collect()),
         }
     }
 
-    /// Like [`of`](BatchDecision::of), but each event keeps the
-    /// [`Metadata`](crate::envelope::Metadata) the caller set on it.
-    pub fn of_new_events(events: Vec<NewEvent<E>>, targets: Vec<StreamId>) -> Self {
-        assert_eq!(
-            events.len(),
-            targets.len(),
-            "every event needs a target stream",
-        );
-        Self {
-            outcome: Ok(events.into_iter().zip(targets).collect()),
-        }
+    /// Accept: append every event to one stream, in order.
+    pub fn to(stream: StreamId, events: impl IntoIterator<Item = E>) -> Self {
+        Self::of(events.into_iter().map(|event| (stream.clone(), event)))
     }
 
     /// Reject the command: a domain outcome (e.g. "insufficient
@@ -184,6 +186,53 @@ impl<E, Err> BatchDecision<E, Err> {
             outcome: Ok(Vec::new()),
         }
     }
+
+    /// Group the routed events per stream (sorted by stream, decision
+    /// order within each), stamp `metadata` on every event, and guard
+    /// each stream with what `expected` returns for it — `None` marks a
+    /// stream the machine cannot append to.
+    pub(crate) fn into_appends(
+        self,
+        metadata: &Metadata,
+        mut expected: impl FnMut(&StreamId) -> Option<ExpectedVersion>,
+    ) -> Routed<E, Err> {
+        let routed = match self.outcome {
+            Err(error) => return Routed::Rejected(error),
+            Ok(routed) if routed.is_empty() => return Routed::Noop,
+            Ok(routed) => routed,
+        };
+        let mut by_stream: BTreeMap<StreamId, Vec<NewEvent<E>>> = BTreeMap::new();
+        for (stream, event) in routed {
+            by_stream.entry(stream).or_default().push(NewEvent {
+                event,
+                metadata: metadata.clone(),
+            });
+        }
+        let mut appends = Vec::with_capacity(by_stream.len());
+        for (stream_id, events) in by_stream {
+            let Some(expected) = expected(&stream_id) else {
+                return Routed::Unroutable;
+            };
+            appends.push(StreamAppend {
+                stream_id,
+                expected,
+                events,
+            });
+        }
+        Routed::Append(appends)
+    }
+}
+
+/// A [`RoutedDecision`], resolved against the machine that emits it.
+pub(crate) enum Routed<E, Err> {
+    /// No events: nothing to append.
+    Noop,
+    /// The domain rejected the command.
+    Rejected(Err),
+    /// The per-stream appends, sorted by stream.
+    Append(Vec<StreamAppend<E>>),
+    /// An event was routed to a stream the machine cannot append to.
+    Unroutable,
 }
 
 /// One stream's events inside an atomic batch append.
@@ -254,14 +303,35 @@ pub enum BatchInput<E> {
     },
     /// The append conflicted: `stream` is at `current`, not at the
     /// expected version.
+    ///
+    /// A store should name the stream. One that does not (`None`) is
+    /// attributed to the boundary's first stream: a wrong guess never
+    /// folds one stream's events into another's state — the retry
+    /// re-reads the guessed stream from its own folded version, and a
+    /// `current` at or before that version is a protocol violation.
     Conflict {
-        /// The stream whose expectation failed.
-        stream: StreamId,
+        /// The stream whose expectation failed, when the store named it.
+        stream: Option<StreamId>,
         /// That stream's actual version at append time.
         current: Version,
     },
     /// A store operation failed — a stream read or the append.
     Failed(StoreError),
+}
+
+impl<E> From<StoreError> for BatchInput<E> {
+    /// A [`Conflict`](StoreError::Conflict) is the batch protocol's
+    /// retry path — its stream travels as is, named or not; every other
+    /// store failure is [`Failed`](BatchInput::Failed).
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::Conflict { stream_id, current } => BatchInput::Conflict {
+                stream: stream_id,
+                current,
+            },
+            other => BatchInput::Failed(other),
+        }
+    }
 }
 
 /// The terminal outcome of a driven batch machine.
@@ -287,7 +357,7 @@ pub enum BatchOutcome<E, Err> {
     Rejected(Err),
     /// The store failed — a conflict that exhausted the retry budget, a
     /// transient error, or a fatal one. Protocol violations by the
-    /// driver land here too (see [`ProtocolError`]).
+    /// driver land here too (see [`ProtocolError`](crate::error::ProtocolError)).
     Failed(StoreError),
 }
 
@@ -322,8 +392,7 @@ pub struct BatchMachine<E, Err, D: Decide<E, Err>> {
     command: D::Command,
     streams: Vec<StreamId>,
     folds: BTreeMap<StreamId, Box<dyn Fold<E>>>,
-    retry_policy: RetryPolicy,
-    retries_used: u32,
+    retries: RetryBudget,
     phase: Phase,
     /// Folded state per boundary stream.
     folded: BTreeMap<StreamId, Box<dyn Any + Send>>,
@@ -334,7 +403,7 @@ pub struct BatchMachine<E, Err, D: Decide<E, Err>> {
     /// The metadata stamped onto every event this interaction emits
     /// (0.5.2): set by [`with_metadata`](Self::with_metadata), applied
     /// to each `StreamAppend`'s events at emit time.
-    metadata: crate::envelope::Metadata,
+    metadata: Metadata,
     /// Loaded events carrying the interaction's idempotency key, per
     /// stream: the earlier commit, when the batch has run before. A
     /// batch commits atomically, so finding its key in any boundary
@@ -376,13 +445,12 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
             command,
             streams,
             folds,
-            retry_policy,
-            retries_used: 0,
+            retries: RetryBudget::new(retry_policy),
             phase: Phase::Loading,
             folded,
             versions,
             pending,
-            metadata: crate::envelope::Metadata::default(),
+            metadata: Metadata::default(),
             earlier: BTreeMap::new(),
         }
     }
@@ -391,7 +459,7 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
     /// emits (0.5.2), applied to each `StreamAppend` at emit time. Set
     /// before [`start`](Self::start); causation/correlation are boundary
     /// concerns, never the domain's.
-    pub fn with_metadata(mut self, metadata: crate::envelope::Metadata) -> Self {
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
         self.metadata = metadata;
         self
     }
@@ -517,10 +585,13 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
         BatchAction::Done(BatchOutcome::Committed { committed })
     }
 
-    fn on_conflict(&mut self, stream: StreamId, current: Version) -> BatchAction<E, Err> {
+    fn on_conflict(&mut self, stream: Option<StreamId>, current: Version) -> BatchAction<E, Err> {
         if self.phase != Phase::Appending {
             return self.violation("`Conflict` outside the appending phase");
         }
+        let Some(stream) = stream.or_else(|| self.streams.first().cloned()) else {
+            return self.violation("`Conflict` named no stream on an empty boundary");
+        };
         let folded_version = match self.versions.get(&stream) {
             Some(&version) => version,
             // A conflict names the stream whose expectation failed; one
@@ -530,8 +601,7 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
         if current <= folded_version {
             return self.violation("conflict reported a version at or before the folded one");
         }
-        if self.retries_used < self.retry_policy.max_retries {
-            self.retries_used += 1;
+        if self.retries.try_consume() {
             self.phase = Phase::Loading;
             // Reload only the conflicting stream's delta: the conflict
             // names the one stream that moved; the batch was atomic, so
@@ -558,68 +628,31 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
     }
 
     fn decide_and_emit(&mut self) -> BatchAction<E, Err> {
-        match self.decide.decide(&self.folded, &self.command).outcome {
-            Ok(routed) if routed.is_empty() => {
-                self.phase = Phase::Done;
-                BatchAction::Done(BatchOutcome::Noop)
-            }
-            Ok(routed) => {
-                // Group the routed events per stream, preserving the
-                // decision's order within each stream.
-                let mut by_stream: BTreeMap<StreamId, Vec<NewEvent<E>>> = BTreeMap::new();
-                for (event, stream) in routed {
-                    if !self.streams.contains(&stream) {
-                        return self.violation("the decision routed an event outside the boundary");
-                    }
-                    match by_stream.entry(stream) {
-                        Entry::Occupied(mut entry) => entry.get_mut().push(event),
-                        Entry::Vacant(entry) => {
-                            entry.insert(alloc::vec![event]);
-                        }
-                    }
-                }
+        let decision = self.decide.decide(&self.folded, &self.command);
+        // Only boundary streams have a folded version, so a stream
+        // without one is a target outside the boundary.
+        let versions = &self.versions;
+        let routed = decision.into_appends(&self.metadata, |stream| {
+            versions.get(stream).copied().map(ExpectedVersion::after)
+        });
+        let outcome = match routed {
+            Routed::Append(appends) => {
                 self.phase = Phase::Appending;
-                // Stamp the interaction's metadata on every event the
-                // decision routed (0.5.2): the boundary decides the
-                // causation/correlation, not the domain.
-                let metadata = self.metadata.clone();
-                BatchAction::AppendBatch {
-                    appends: by_stream
-                        .into_iter()
-                        .map(|(stream_id, events)| StreamAppend {
-                            expected: match self
-                                .versions
-                                .get(&stream_id)
-                                .copied()
-                                .unwrap_or_default()
-                            {
-                                Version::EMPTY => ExpectedVersion::Empty,
-                                version => ExpectedVersion::Exact(version),
-                            },
-                            events: events
-                                .into_iter()
-                                .map(|event| NewEvent {
-                                    event: event.event,
-                                    metadata: metadata.clone(),
-                                })
-                                .collect(),
-                            stream_id,
-                        })
-                        .collect(),
-                }
+                return BatchAction::AppendBatch { appends };
             }
-            Err(error) => {
-                self.phase = Phase::Done;
-                BatchAction::Done(BatchOutcome::Rejected(error))
+            Routed::Unroutable => {
+                return self.violation("the decision routed an event outside the boundary");
             }
-        }
+            Routed::Noop => BatchOutcome::Noop,
+            Routed::Rejected(error) => BatchOutcome::Rejected(error),
+        };
+        self.phase = Phase::Done;
+        BatchAction::Done(outcome)
     }
 
     fn violation(&mut self, message: &'static str) -> BatchAction<E, Err> {
         self.phase = Phase::Done;
-        BatchAction::Done(BatchOutcome::Failed(StoreError::Other(Arc::new(
-            ProtocolError::new(message),
-        ))))
+        BatchAction::Done(BatchOutcome::Failed(StoreError::protocol(message)))
     }
 }
 
@@ -630,7 +663,6 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
 #[cfg(test)]
 pub(crate) mod transfer {
     use alloc::boxed::Box;
-    use alloc::vec::Vec;
 
     use super::{AggregateFold, BatchDecision, Decide, Fold};
     use crate::aggregate::Aggregate;
@@ -700,17 +732,20 @@ pub(crate) mod transfer {
             ) {
                 return BatchDecision::reject(error);
             }
-            BatchDecision::of(
-                Vec::from([
+            BatchDecision::of([
+                (
+                    stream_of(command.from),
                     AccountEvent::Withdrawn {
                         amount: command.amount,
                     },
+                ),
+                (
+                    stream_of(command.to),
                     AccountEvent::Deposited {
                         amount: command.amount,
                     },
-                ]),
-                Vec::from([stream_of(command.from), stream_of(command.to)]),
-            )
+                ),
+            ])
         }
     }
 }
@@ -757,10 +792,7 @@ mod tests {
     }
 
     fn is_protocol_violation<E, Err>(action: &BatchAction<E, Err>) -> bool {
-        let BatchAction::Done(BatchOutcome::Failed(StoreError::Other(source))) = action else {
-            return false;
-        };
-        source.downcast_ref::<ProtocolError>().is_some()
+        matches!(action, BatchAction::Done(BatchOutcome::Failed(error)) if error.is_protocol_violation())
     }
 
     /// Assert `action` is the protocol-violation outcome, naming the
@@ -1056,7 +1088,7 @@ mod tests {
         });
         // Another writer appended v3 on stream 1 while we decided.
         let action = m.handle(BatchInput::Conflict {
-            stream: stream_of(1),
+            stream: Some(stream_of(1)),
             current: Version::new(3),
         });
         // Retry: re-read only stream 1, from its folded version 2.
@@ -1095,7 +1127,7 @@ mod tests {
         );
         load_funded(&mut m);
         let action = m.handle(BatchInput::Conflict {
-            stream: stream_of(1),
+            stream: Some(stream_of(1)),
             current: Version::new(3),
         });
         assert!(matches!(
@@ -1103,6 +1135,65 @@ mod tests {
             BatchAction::Done(BatchOutcome::Failed(StoreError::Conflict { current, .. }))
                 if current == Version::new(3)
         ));
+    }
+
+    #[test]
+    fn an_unnamed_conflict_is_attributed_to_the_first_stream() {
+        let mut m = transfer_machine(1, 2, 5, &[1, 2]);
+        load_funded(&mut m);
+        let action = m.handle(BatchInput::from(StoreError::Conflict {
+            stream_id: None,
+            current: Version::new(3),
+        }));
+        let BatchAction::LoadStreams { streams, from } = action else {
+            panic!("expected a reload, got {action:?}")
+        };
+        assert_eq!(streams, vec![stream_of(1)]);
+        assert_eq!(from.get(&stream_of(1)), Some(&Version::new(2)));
+    }
+
+    #[test]
+    fn an_unnamed_conflict_at_the_first_streams_version_is_a_protocol_violation() {
+        // Stream 2 moved, but the store didn't say so: the guess (stream
+        // 1, folded at 2) cannot be at 2 — a violation, never a fold.
+        let mut m = transfer_machine(1, 2, 5, &[1, 2]);
+        load_funded(&mut m);
+        let action = m.handle(BatchInput::Conflict {
+            stream: None,
+            current: Version::new(2),
+        });
+        assert_protocol_violation!(action);
+    }
+
+    #[test]
+    fn store_errors_map_to_inputs() {
+        assert!(matches!(
+            BatchInput::<AccountEvent>::from(StoreError::Conflict {
+                stream_id: Some(stream_of(2)),
+                current: Version::new(4),
+            }),
+            BatchInput::Conflict { stream: Some(ref stream), current }
+                if *stream == stream_of(2) && current == Version::new(4)
+        ));
+        assert!(matches!(
+            BatchInput::<AccountEvent>::from(StoreError::Unavailable),
+            BatchInput::Failed(StoreError::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn a_decision_stamps_the_interaction_metadata_on_every_event() {
+        let metadata = Metadata::default().with_idempotency_key("xfer-9");
+        let mut m = transfer_machine(1, 2, 5, &[1, 2]).with_metadata(metadata.clone());
+        let BatchAction::AppendBatch { appends } = load_funded(&mut m) else {
+            panic!("expected an append")
+        };
+        assert!(
+            appends
+                .iter()
+                .flat_map(|append| &append.events)
+                .all(|event| event.metadata == metadata)
+        );
     }
 
     // -- protocol violations --------------------------------------------
@@ -1170,7 +1261,7 @@ mod tests {
         // Folded stream 1 to version 1; a conflict reporting current == 1
         // is a contradiction.
         let action = m.handle(BatchInput::Conflict {
-            stream: stream_of(1),
+            stream: Some(stream_of(1)),
             current: Version::new(1),
         });
         assert!(is_protocol_violation(&action));
@@ -1216,10 +1307,7 @@ mod tests {
             _: &BTreeMap<StreamId, Box<dyn Any + Send>>,
             _: &Self,
         ) -> BatchDecision<AccountEvent, TransferError> {
-            BatchDecision::of(
-                vec![AccountEvent::Deposited { amount: 1 }],
-                vec![stream_of(99)],
-            )
+            BatchDecision::to(stream_of(99), [AccountEvent::Deposited { amount: 1 }])
         }
     }
 
@@ -1245,9 +1333,11 @@ mod tests {
                     committed: vec![CommittedStream { stream_id, events }],
                 }
             }),
-            (1u64..3, 0u64..10).prop_map(|(stream, current)| BatchInput::Conflict {
-                stream: stream_of(stream),
-                current: Version::new(current),
+            (proptest::option::of(1u64..3), 0u64..10).prop_map(|(stream, current)| {
+                BatchInput::Conflict {
+                    stream: stream.map(stream_of),
+                    current: Version::new(current),
+                }
             }),
             Just(BatchInput::Failed(StoreError::Unavailable)),
         ]

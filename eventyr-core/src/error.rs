@@ -5,7 +5,6 @@ use alloc::sync::Arc;
 use core::fmt;
 
 use crate::vocabulary::{StreamId, Version};
-use crate::write::WriteInput;
 
 /// A store operation failed — a stream read, an append, or a
 /// snapshot read. (A snapshot read failing fails the interaction: the
@@ -19,7 +18,7 @@ pub enum StoreError {
     /// `None` — the caller already knows its stream.
     Conflict {
         /// The conflicting stream, when the store knows it.
-        stream_id: Option<crate::vocabulary::StreamId>,
+        stream_id: Option<StreamId>,
         /// The conflicting stream's actual version at append time.
         current: Version,
     },
@@ -127,29 +126,19 @@ impl StoreError {
     pub fn other(message: impl Into<String>) -> Self {
         Self::from(message.into())
     }
-}
 
-/// The [`StreamId`] for a [`Conflict`](StoreError::Conflict) that doesn't
-/// name one, and the driver can pin down — a single-stream interaction's
-/// own stream. The error leaves the field empty because its producer (a
-/// plain `append`) knows the caller has the id; centralizing the fill
-/// keeps the one decision out of every driver.
-pub fn named_conflict_stream(stream_id: Option<StreamId>, fallback: &StreamId) -> StreamId {
-    stream_id.unwrap_or_else(|| fallback.clone())
-}
+    /// A driver protocol violation: a [`ProtocolError`] carrying
+    /// `message`, wrapped as [`Other`](StoreError::Other). The one way
+    /// every machine reports a driver that broke its protocol.
+    pub fn protocol(message: &'static str) -> Self {
+        Self::from(ProtocolError::new(message))
+    }
 
-impl<E, S> From<StoreError> for WriteInput<E, S> {
-    /// Every store failure travels through the machine as
-    /// [`Failed`](WriteInput::Failed) — except a [`Conflict`](StoreError::Conflict), which the
-    /// write protocol owns a retry path for
-    /// ([`WriteInput::Conflict`]). This is the one place that mapping
-    /// exists; a `StoreError` variant that is not retry-shaped lands in
-    /// `Failed` without a driver edit.
-    fn from(error: StoreError) -> Self {
-        match error {
-            StoreError::Conflict { current, .. } => WriteInput::Conflict { current },
-            other => WriteInput::Failed(other),
-        }
+    /// Whether this is a driver protocol violation — an
+    /// [`Other`](StoreError::Other) carrying a [`ProtocolError`], as
+    /// [`protocol`](StoreError::protocol) builds it.
+    pub fn is_protocol_violation(&self) -> bool {
+        matches!(self, Self::Other(source) if source.downcast_ref::<ProtocolError>().is_some())
     }
 }
 
