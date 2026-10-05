@@ -33,6 +33,8 @@ fjall = ["store", "dep:eventyr-store-fjall"]
 # The embedded store over SQLite — the contract suite's reference port.
 sqlite = ["store", "dep:eventyr-store-sqlite"]
 sqlite_snapshots = ["sqlite", "eventyr-store-sqlite/snapshots"]
+# SQLite's view store and inline views (0.7.3).
+sqlite_views = ["sqlite", "projection", "eventyr-store-sqlite/views"]
 # The `Metrics` port's tracing backend (0.5.3): store/projector drivers
 # report through it when this feature is on.
 metrics = ["store", "eventyr-store/tracing"]

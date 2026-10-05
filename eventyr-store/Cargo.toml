@@ -25,5 +25,5 @@ event-listener = "5"
 tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }

@@ -47,6 +47,9 @@ struct StoredRow<E> {
     payload: E,
     causation_id: Option<String>,
     correlation_id: Option<String>,
+    /// 0.7.5; rows written before it decode with none.
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 /// An embedded [`EventStore`] and [`StreamsAll`] over fjall — and, for
@@ -256,6 +259,7 @@ impl<E> FjallStore<E> {
                     payload: event.event,
                     causation_id: event.metadata.causation_id.clone(),
                     correlation_id: event.metadata.correlation_id.clone(),
+                    idempotency_key: event.metadata.idempotency_key.clone(),
                 };
                 let bytes = serde_json::to_vec(&row).map_err(corrupt)?;
                 let key = Self::stream_key(&stream_id, version);
@@ -270,7 +274,11 @@ impl<E> FjallStore<E> {
                     stream_id: stream_id.clone(),
                     version,
                     event: row.payload,
-                    metadata: Metadata::of_ids(row.causation_id, row.correlation_id),
+                    metadata: row_metadata(
+                        row.causation_id,
+                        row.correlation_id,
+                        row.idempotency_key,
+                    ),
                 });
             }
             tx.insert(
@@ -308,7 +316,7 @@ impl<E> FjallStore<E> {
             stream_id: stream_id.clone(),
             version: Version::new(row.version),
             event: row.payload,
-            metadata: Metadata::of_ids(row.causation_id, row.correlation_id),
+            metadata: row_metadata(row.causation_id, row.correlation_id, row.idempotency_key),
         })
     }
 }
@@ -374,6 +382,17 @@ where
                 Err(_) => true,
             })
             .collect()
+    }
+}
+
+fn row_metadata(
+    causation_id: Option<String>,
+    correlation_id: Option<String>,
+    idempotency_key: Option<String>,
+) -> Metadata {
+    Metadata {
+        idempotency_key,
+        ..Metadata::of_ids(causation_id, correlation_id)
     }
 }
 

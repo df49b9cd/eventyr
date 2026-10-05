@@ -488,11 +488,7 @@ mod tests {
     async fn metadata_travels_from_new_event_to_envelope() {
         let store = InMemoryStore::new();
         let mut event = NewEvent::new(1);
-        event.metadata = Metadata {
-            causation_id: Some("cmd-42".into()),
-            correlation_id: Some("corr-7".into()),
-            ..Default::default()
-        };
+        event.metadata = Metadata::of_ids(Some("cmd-42".into()), Some("corr-7".into()));
 
         store
             .append(&sid(), ExpectedVersion::Empty, vec![event])

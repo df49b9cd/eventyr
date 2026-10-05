@@ -70,6 +70,13 @@ pub enum ExecutionOutcome<E, S = ()> {
         /// The snapshot the machine offered at commit, if any.
         snapshot: Option<OfferSnapshot<S>>,
     },
+    /// The command carried an idempotency key (0.7.5) whose earlier
+    /// commit is already in the stream; nothing was decided or appended.
+    /// `committed` is that earlier commit, as stored.
+    AlreadyCommitted {
+        /// The events the earlier commit with this key appended.
+        committed: Vec<EventEnvelope<E>>,
+    },
     /// The command decided no events; nothing was appended.
     Noop,
 }
@@ -175,6 +182,13 @@ where
     /// [`execute`](Self::execute) with the interaction's metadata stamped
     /// on every emitted event (0.5.2).
     ///
+    /// A metadata [`idempotency_key`](eventyr_core::envelope::Metadata::idempotency_key)
+    /// makes the call idempotent (0.7.5): if the stream already holds
+    /// events stamped with the key, the command is not decided again
+    /// and the outcome is [`AlreadyCommitted`](ExecutionOutcome::AlreadyCommitted).
+    /// The check reads the stream the command targets, so it holds
+    /// across processes and restarts with nothing but the event log.
+    ///
     /// The repository drivers stamp `metadata` onto the machine's
     /// `Append` events, so a caller can trace one request's events
     /// (and their causes) without threading ids through the domain.
@@ -193,6 +207,9 @@ where
                 committed,
                 snapshot: None,
             }),
+            WriteOutcome::AlreadyCommitted { committed } => {
+                Ok(ExecutionOutcome::AlreadyCommitted { committed })
+            }
             WriteOutcome::Noop => Ok(ExecutionOutcome::Noop),
             WriteOutcome::Rejected(error) => Err(ExecutionError::Domain(error)),
             WriteOutcome::Failed(error) => Err(ExecutionError::Store(error)),
@@ -294,6 +311,9 @@ where
                 committed,
                 snapshot,
             }),
+            WriteOutcome::AlreadyCommitted { committed } => {
+                Ok(ExecutionOutcome::AlreadyCommitted { committed })
+            }
             WriteOutcome::Noop => Ok(ExecutionOutcome::Noop),
             WriteOutcome::Rejected(error) => Err(ExecutionError::Domain(error)),
             WriteOutcome::Failed(error) => Err(ExecutionError::Store(error)),

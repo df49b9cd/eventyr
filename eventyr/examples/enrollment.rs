@@ -23,7 +23,7 @@ fn enroll(
 ) -> Result<(), EnrollmentError> {
     let mut machine = BoundaryMachine::new(Enroll::new(course, student), RetryPolicy::default());
     match drive_boundary_blocking(&mut machine, store) {
-        BoundaryOutcome::Committed { .. } => Ok(()),
+        BoundaryOutcome::Committed { .. } | BoundaryOutcome::AlreadyCommitted { .. } => Ok(()),
         BoundaryOutcome::Rejected(error) => Err(error),
         BoundaryOutcome::Noop => unreachable!("an enrollment always decides an event"),
         BoundaryOutcome::Failed(error) => panic!("the in-memory store does not fail: {error}"),

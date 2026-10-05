@@ -209,18 +209,27 @@ fn appends_are_visible_to_reads<E: ContractEvent, S: EventStore<Event = E>>(stor
 fn metadata_round_trips<E: ContractEvent, S: EventStore<Event = E>>(store: &S) {
     let stream = StreamId::from("contract-metadata");
     let mut event = NewEvent::new(E::from(1));
-    event.metadata = Metadata {
-        causation_id: Some("cmd-1".into()),
-        correlation_id: Some("corr-1".into()),
-        ..Default::default()
-    };
+    event.metadata =
+        Metadata::of_ids(Some("cmd-1".into()), Some("corr-1".into())).with_idempotency_key("key-1");
+    let plain = NewEvent::new(E::from(2));
 
-    block_on(store.append(&stream, ExpectedVersion::Empty, vec![event]))
+    let committed = block_on(store.append(&stream, ExpectedVersion::Empty, vec![event, plain]))
         .expect("append with metadata");
+    assert_eq!(
+        committed[0].metadata.idempotency_key.as_deref(),
+        Some("key-1"),
+        "the committed envelopes carry the key"
+    );
 
     let events = block_on(stream_of(store, &stream, Version::EMPTY)).expect("stream read");
     assert_eq!(events[0].metadata.causation_id.as_deref(), Some("cmd-1"));
     assert_eq!(events[0].metadata.correlation_id.as_deref(), Some("corr-1"));
+    assert_eq!(
+        events[0].metadata.idempotency_key.as_deref(),
+        Some("key-1"),
+        "the idempotency key round-trips (0.7.5)"
+    );
+    assert_eq!(events[1].metadata.idempotency_key, None);
 }
 
 // The contract is self-testing: the in-memory store ships it, so the

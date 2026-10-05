@@ -183,11 +183,8 @@ async fn a_transfer_stamps_its_metadata_on_both_sides() {
     let store = Arc::new(InMemoryStore::new());
     open_and_fund(&store);
 
-    let metadata = eventyr_core::envelope::Metadata {
-        causation_id: Some("xfer-1".into()),
-        correlation_id: Some("request-9".into()),
-        ..Default::default()
-    };
+    let metadata =
+        eventyr_core::envelope::Metadata::of_ids(Some("xfer-1".into()), Some("request-9".into()));
     let mut machine = transfer_machine(1, 2, 5).with_metadata(metadata.clone());
     let outcome = drive_write_batch(&mut machine, &*store).await;
     let BatchOutcome::Committed { .. } = outcome else {

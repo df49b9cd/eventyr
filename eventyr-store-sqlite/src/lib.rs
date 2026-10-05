@@ -24,6 +24,8 @@
 #[cfg(feature = "snapshots")]
 mod snapshots;
 mod store;
+#[cfg(feature = "views")]
+pub mod views;
 
 use std::sync::Arc;
 
@@ -33,6 +35,9 @@ pub use store::SqliteStore;
 
 #[cfg(feature = "snapshots")]
 pub use snapshots::SqliteSnapshotStore;
+
+#[cfg(feature = "views")]
+pub use views::SqliteViewStore;
 
 /// The crate-level error: store failures are [`StoreError`] once they
 /// leave the store; this is what those `Other` variants wrap.

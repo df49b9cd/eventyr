@@ -20,8 +20,15 @@
 //! module): the subscription owns at-least-once per event, the saga owns
 //! the per-event reaction. The reaction is a pure function of the event,
 //! so a crash between dispatch *n* and the ack re-delivers the event and
-//! re-issues every command — each command's idempotency is the caller's
-//! to keep, exactly as §6 puts it for projections.
+//! re-issues every command.
+//!
+//! Each command therefore carries a deterministic idempotency key
+//! (0.7.5): the triggering event's global sequence and the command's
+//! index in the reaction, under the saga's [`name`](Saga::name). A
+//! re-issued command carries the key it carried the first time, so a
+//! dispatcher that executes it through a keyed write (the repository's
+//! `execute_with_metadata`) commits it once — at-least-once delivery
+//! becomes effectively-once at the command boundary.
 //!
 //! Like every machine here, it never panics on bad input: a driver that
 //! feeds the wrong input for the current phase, or drives a finished
@@ -50,6 +57,13 @@ pub trait Saga: Send {
     /// The commands this saga emits.
     type Command: Send;
 
+    /// The saga's stable name, scoping the idempotency keys of the
+    /// commands it issues (0.7.5). Two sagas reacting to the same event
+    /// must have different names, or their commands' keys collide.
+    /// Like a stored event name, it is part of the storage schema: a
+    /// renamed saga re-issues commands for events it already handled.
+    fn name(&self) -> &str;
+
     /// React to one event: the commands to issue, in order, each paired
     /// with the stream it targets. An empty list is a no-op.
     ///
@@ -71,6 +85,20 @@ pub struct SagaCommand<C> {
     /// layered over the triggering event's own ids — see
     /// [`Metadata::overlay`].
     pub metadata: Metadata,
+}
+
+/// The idempotency key of the `index`-th command `saga` issues for
+/// `event`: `"{saga}:{sequence}:{index}"`.
+///
+/// The global sequence identifies the event for good — redelivery
+/// carries the same envelope — and the reaction is pure, so a re-issued
+/// command lands on the same index.
+pub fn idempotency_key<E>(
+    saga: &str,
+    event: &EventEnvelope<E>,
+    index: usize,
+) -> alloc::string::String {
+    alloc::format!("{saga}:{}:{index}", event.sequence)
 }
 
 /// What the machine wants the driver to do.
@@ -160,14 +188,18 @@ impl<S: Saga> SagaMachine<S> {
             return self.violation("start() on a machine that already progressed");
         }
         let metadata = Metadata::overlay(&self.metadata, &event.metadata, &Metadata::default());
+        let name = self.saga.name();
         self.pending = self
             .saga
             .react(event)
             .into_iter()
-            .map(|(target, command)| SagaCommand {
+            .enumerate()
+            .map(|(index, (target, command))| SagaCommand {
                 command,
                 target,
-                metadata: metadata.clone(),
+                metadata: metadata
+                    .clone()
+                    .with_idempotency_key(idempotency_key(name, event, index)),
             })
             .collect();
         self.phase = Phase::Dispatching;
@@ -229,6 +261,10 @@ mod tests {
         type Event = AccountEvent;
         type Command = AccountCommand;
 
+        fn name(&self) -> &str {
+            "standing-order"
+        }
+
         fn react(&self, event: &EventEnvelope<AccountEvent>) -> Vec<(StreamId, AccountCommand)> {
             match &event.event {
                 AccountEvent::Deposited { amount } if *amount >= self.amount => vec![(
@@ -248,6 +284,10 @@ mod tests {
     impl Saga for Twice {
         type Event = AccountEvent;
         type Command = AccountCommand;
+
+        fn name(&self) -> &str {
+            "twice"
+        }
 
         fn react(&self, _: &EventEnvelope<AccountEvent>) -> Vec<(StreamId, AccountCommand)> {
             vec![
@@ -282,6 +322,62 @@ mod tests {
             from: AccountId(1),
             amount: 10,
         })
+    }
+
+    #[test]
+    fn each_command_carries_a_key_from_the_event_and_its_index() {
+        let mut m = SagaMachine::new(Twice);
+        let SagaAction::Dispatch { command: first } =
+            m.start(&deposit(42, 10, Metadata::default()))
+        else {
+            panic!("dispatch");
+        };
+        let SagaAction::Dispatch { command: second } = m.handle(SagaInput::Dispatched) else {
+            panic!("dispatch");
+        };
+        assert_eq!(
+            first.metadata.idempotency_key.as_deref(),
+            Some("twice:42:0")
+        );
+        assert_eq!(
+            second.metadata.idempotency_key.as_deref(),
+            Some("twice:42:1")
+        );
+    }
+
+    #[test]
+    fn a_redelivered_event_reissues_the_same_keys() {
+        let keys = |sequence| {
+            let mut m = SagaMachine::new(Twice);
+            let mut keys = Vec::new();
+            let mut action = m.start(&deposit(sequence, 10, Metadata::default()));
+            while let SagaAction::Dispatch { command } = action {
+                keys.push(command.metadata.idempotency_key.clone());
+                action = m.handle(SagaInput::Dispatched);
+            }
+            keys
+        };
+        assert_eq!(keys(7), keys(7), "same event, same keys");
+        assert_ne!(keys(7), keys(8), "another event, other keys");
+    }
+
+    #[test]
+    fn the_triggering_events_own_key_is_not_inherited() {
+        // The event was itself produced by a keyed command; the saga's
+        // command is a different command and gets its own key.
+        let event = deposit(
+            3,
+            10,
+            Metadata::default().with_idempotency_key("upstream:1:0"),
+        );
+        let mut m = machine();
+        let SagaAction::Dispatch { command } = m.start(&event) else {
+            panic!("dispatch");
+        };
+        assert_eq!(
+            command.metadata.idempotency_key.as_deref(),
+            Some("standing-order:3:0")
+        );
     }
 
     fn is_protocol_violation(action: &SagaAction<AccountCommand>) -> bool {

@@ -9,7 +9,7 @@ use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 use eventyr_store::notify::{CommitSignal, LocalCommitListener, LocalCommitSignal};
-use eventyr_store::store::{EventStore, QueryAppend, StreamsAll};
+use eventyr_store::store::{EventFilter, EventStore, FilteredRead, QueryAppend, StreamsAll};
 use futures::Stream;
 use futures::stream::iter;
 
@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS events (
     payload         TEXT    NOT NULL,
     causation_id    TEXT,
     correlation_id  TEXT,
+    idempotency_key TEXT,
     created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE (stream_id, stream_version)
 );
@@ -31,8 +32,8 @@ CREATE TABLE IF NOT EXISTS events (
 
 /// The `events` columns every read shares — one place, so adding a
 /// column can't drift across the append/read/read-all queries.
-const EVENT_COLUMNS: &str =
-    "global_sequence, stream_id, stream_version, payload, causation_id, correlation_id";
+const EVENT_COLUMNS: &str = "global_sequence, stream_id, stream_version, payload, causation_id, \
+     correlation_id, idempotency_key";
 
 /// An embedded [`EventStore`] and [`StreamsAll`] over SQLite, via
 /// rusqlite — and, for [`Tagged`] events, [`QueryAppend`] (0.7.1),
@@ -53,6 +54,9 @@ const EVENT_COLUMNS: &str =
 /// one store handle to see all its writes).
 pub struct SqliteStore<E> {
     conn: Arc<Mutex<rusqlite::Connection>>,
+    /// Views folded inside every append transaction (0.7.3).
+    #[cfg(feature = "views")]
+    inline_views: eventyr_projection::inline::InlineViews<E>,
     /// Raised after every commit (0.7.2); shared by clones.
     signal: LocalCommitSignal,
     _event: std::marker::PhantomData<fn() -> E>,
@@ -62,6 +66,8 @@ impl<E> Clone for SqliteStore<E> {
     fn clone(&self) -> Self {
         Self {
             conn: Arc::clone(&self.conn),
+            #[cfg(feature = "views")]
+            inline_views: Arc::clone(&self.inline_views),
             signal: self.signal.clone(),
             _event: std::marker::PhantomData,
         }
@@ -86,16 +92,61 @@ impl<E> SqliteStore<E> {
     /// tables stand on. Run on the same connection the app reads with.
     pub fn from_connection(conn: rusqlite::Connection) -> Result<Self, SqliteStoreError> {
         conn.execute_batch(SCHEMA)?;
+        // Databases created before 0.7.5 lack the column.
+        let has_key: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('events') WHERE name = 'idempotency_key'",
+            [],
+            |row| row.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !has_key {
+            conn.execute_batch("ALTER TABLE events ADD COLUMN idempotency_key TEXT")?;
+        }
+        #[cfg(feature = "views")]
+        conn.execute_batch(crate::views::VIEWS_SCHEMA)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            #[cfg(feature = "views")]
+            inline_views: Arc::from([]),
             signal: LocalCommitSignal::new(),
             _event: std::marker::PhantomData,
         })
     }
 
+    /// Maintain `views` inline (0.7.3): every append folds its committed
+    /// events into the views' rows in the `views` table, inside the
+    /// append's transaction, and a row that cannot be written fails the
+    /// append. Read the rows with [`SqliteViewStore`](crate::SqliteViewStore).
+    #[cfg(feature = "views")]
+    pub fn with_inline_views(
+        mut self,
+        views: Vec<Arc<dyn eventyr_projection::inline::InlineView<E>>>,
+    ) -> Self {
+        self.inline_views = views.into();
+        self
+    }
+
+    /// Fold `committed` into the inline views inside `tx` — a no-op
+    /// without the `views` feature.
+    #[allow(clippy::unused_self, reason = "no-op without the `views` feature")]
+    fn write_views(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        committed: &[EventEnvelope<E>],
+    ) -> Result<(), StoreError> {
+        #[cfg(feature = "views")]
+        {
+            crate::views::write_inline_views(tx, &self.inline_views, committed)
+        }
+        #[cfg(not(feature = "views"))]
+        {
+            let _ = (tx, committed);
+            Ok(())
+        }
+    }
+
     /// The connection, for sibling stores on the same database (the
-    /// snapshot store behind the `snapshots` feature).
-    #[cfg(feature = "snapshots")]
+    /// snapshot and view stores behind their features).
+    #[cfg(any(feature = "snapshots", feature = "views"))]
     pub(crate) fn conn(&self) -> Arc<Mutex<rusqlite::Connection>> {
         Arc::clone(&self.conn)
     }
@@ -127,6 +178,7 @@ struct EventRow {
     payload: String,
     causation_id: Option<String>,
     correlation_id: Option<String>,
+    idempotency_key: Option<String>,
 }
 
 fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
@@ -137,6 +189,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
         payload: row.get(3)?,
         causation_id: row.get(4)?,
         correlation_id: row.get(5)?,
+        idempotency_key: row.get(6)?,
     })
 }
 
@@ -162,7 +215,10 @@ where
                 u64::try_from(row.stream_version).map_err(|_| invalid(row.stream_version))?,
             ),
             event,
-            metadata: Metadata::of_ids(row.causation_id, row.correlation_id),
+            metadata: Metadata {
+                idempotency_key: row.idempotency_key,
+                ..Metadata::of_ids(row.causation_id, row.correlation_id)
+            },
         })
     }
 }
@@ -201,8 +257,8 @@ where
             let payload =
                 serde_json::to_string(&new_event.event).map_err(SqliteStoreError::from)?;
             tx.execute(
-                "INSERT INTO events (stream_id, stream_version, event_type, payload, causation_id, correlation_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO events (stream_id, stream_version, event_type, payload, causation_id, \
+                 correlation_id, idempotency_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     stream_id.as_str(),
                     version as i64,
@@ -210,6 +266,7 @@ where
                     payload,
                     new_event.metadata.causation_id,
                     new_event.metadata.correlation_id,
+                    new_event.metadata.idempotency_key,
                 ],
             )
             .map_err(SqliteStoreError::into_store)?;
@@ -219,10 +276,13 @@ where
                 stream_id: stream_id.clone(),
                 version: Version::new(version),
                 event: new_event.event.clone(),
-                metadata: Metadata::of_ids(
-                    new_event.metadata.causation_id.clone(),
-                    new_event.metadata.correlation_id.clone(),
-                ),
+                metadata: Metadata {
+                    idempotency_key: new_event.metadata.idempotency_key.clone(),
+                    ..Metadata::of_ids(
+                        new_event.metadata.causation_id.clone(),
+                        new_event.metadata.correlation_id.clone(),
+                    )
+                },
             });
         }
         committed.push(written);
@@ -298,6 +358,7 @@ where
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(SqliteStoreError::into_store)?;
         let mut committed = append_within(&tx, &[(stream_id.clone(), expected, events)])?;
+        self.write_views(&tx, &committed[0])?;
         tx.commit().map_err(SqliteStoreError::into_store)?;
         self.notify_if_written(&committed);
         // One stream in the batch: the writes above are the caller's
@@ -319,6 +380,7 @@ where
             .map(|a| (a.stream_id, a.expected, a.events))
             .collect();
         let committed = append_within(&tx, &appends)?;
+        self.write_views(&tx, &committed.concat())?;
         tx.commit().map_err(SqliteStoreError::into_store)?;
         self.notify_if_written(&committed);
         Ok(appends
@@ -366,6 +428,90 @@ where
     ) -> impl Stream<Item = Result<EventEnvelope<E>, StoreError>> + Send {
         iter(read_after(&self.lock(), from))
     }
+
+    /// Filter in the database (0.7.4): one connection, so the scan bound
+    /// and the matching rows come from the same state. The bound is the
+    /// `scan_limit`-th row after `from` (or the head, if nearer).
+    async fn stream_all_filtered(
+        &self,
+        from: Sequence,
+        filter: &EventFilter,
+        max: usize,
+        scan_limit: usize,
+    ) -> Result<FilteredRead<E>, StoreError> {
+        let conn = self.lock();
+        let from_i64 = from.as_u64() as i64;
+        let bound: Option<i64> = conn
+            .query_row(
+                "SELECT max(global_sequence) FROM ( \
+                     SELECT global_sequence FROM events WHERE global_sequence > ?1 \
+                     ORDER BY global_sequence LIMIT ?2)",
+                rusqlite::params![from_i64, scan_limit.max(1) as i64],
+                |row| row.get(0),
+            )
+            .map_err(SqliteStoreError::into_store)?;
+        let Some(bound) = bound else {
+            return Ok(FilteredRead {
+                events: Vec::new(),
+                scanned: from,
+            });
+        };
+        // Built from fixed fragments and numbered placeholders only;
+        // every filter value is a bound parameter.
+        let mut sql = format!(
+            "SELECT {EVENT_COLUMNS} FROM events WHERE global_sequence > ?1 AND global_sequence <= ?2"
+        );
+        let mut params: Vec<rusqlite::types::Value> = vec![from_i64.into(), bound.into()];
+        if !filter.stream_prefixes.is_empty() {
+            let clauses: Vec<String> = filter
+                .stream_prefixes
+                .iter()
+                .map(|prefix| {
+                    params.push(prefix.clone().into());
+                    // substr compares bytes exactly — LIKE would treat
+                    // `%`/`_` in a prefix as wildcards.
+                    format!(
+                        "substr(stream_id, 1, length(?{n})) = ?{n}",
+                        n = params.len()
+                    )
+                })
+                .collect();
+            sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
+        }
+        if !filter.event_types.is_empty() {
+            let placeholders: Vec<String> = filter
+                .event_types
+                .iter()
+                .map(|name| {
+                    params.push(name.clone().into());
+                    format!("?{}", params.len())
+                })
+                .collect();
+            sql.push_str(&format!(" AND event_type IN ({})", placeholders.join(", ")));
+        }
+        params.push((max as i64).into());
+        sql.push_str(&format!(
+            " ORDER BY global_sequence LIMIT ?{}",
+            params.len()
+        ));
+        let rows = conn
+            .prepare(&sql)
+            .and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params_from_iter(params), read_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(SqliteStoreError::into_store)?;
+        let full = rows.len() == max;
+        let events = rows
+            .into_iter()
+            .map(EventEnvelope::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let scanned = match events.last() {
+            Some(last) if full => last.sequence,
+            _ => Sequence::new(bound.max(0) as u64),
+        };
+        Ok(FilteredRead { events, scanned })
+    }
 }
 
 impl<E> QueryAppend for SqliteStore<E>
@@ -405,6 +551,7 @@ where
             .map(|a| (a.stream_id, a.expected, a.events))
             .collect();
         let committed = append_within(&tx, &appends)?;
+        self.write_views(&tx, &committed.concat())?;
         tx.commit().map_err(SqliteStoreError::into_store)?;
         self.notify_if_written(&committed);
         Ok(appends

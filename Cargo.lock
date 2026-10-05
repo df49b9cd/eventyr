@@ -421,6 +421,8 @@ dependencies = [
  "eventyr-core",
  "eventyr-store",
  "eventyr-subscription",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -476,9 +478,11 @@ name = "eventyr-store-sqlite"
 version = "0.1.0"
 dependencies = [
  "eventyr-core",
+ "eventyr-projection",
  "eventyr-store",
  "eventyr-store-sqlite",
  "eventyr-store-testing",
+ "eventyr-subscription",
  "futures",
  "rusqlite",
  "serde",

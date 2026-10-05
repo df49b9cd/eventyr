@@ -273,6 +273,14 @@ pub enum BatchOutcome<E, Err> {
         /// One entry per requested append, as the store recorded it.
         committed: Vec<CommittedStream<E>>,
     },
+    /// The batch carried an idempotency key (0.7.5) whose earlier commit
+    /// is already in the boundary: nothing was decided or appended.
+    /// `committed` lists, per stream, the events that commit appended.
+    AlreadyCommitted {
+        /// The earlier commit's events, per boundary stream that holds
+        /// any.
+        committed: Vec<CommittedStream<E>>,
+    },
     /// The decision produced no events; nothing was appended.
     Noop,
     /// The domain rejected the command.
@@ -327,6 +335,11 @@ pub struct BatchMachine<E, Err, D: Decide<E, Err>> {
     /// (0.5.2): set by [`with_metadata`](Self::with_metadata), applied
     /// to each `StreamAppend`'s events at emit time.
     metadata: crate::envelope::Metadata,
+    /// Loaded events carrying the interaction's idempotency key, per
+    /// stream: the earlier commit, when the batch has run before. A
+    /// batch commits atomically, so finding its key in any boundary
+    /// stream means the whole batch committed (0.7.5).
+    earlier: BTreeMap<StreamId, Vec<EventEnvelope<E>>>,
 }
 
 impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
@@ -370,6 +383,7 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
             versions,
             pending,
             metadata: crate::envelope::Metadata::default(),
+            earlier: BTreeMap::new(),
         }
     }
 
@@ -467,6 +481,14 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
                 fold.apply(&mut **state, &envelope.event);
             }
             self.versions.insert(stream_id.clone(), envelope.version);
+            if self.metadata.idempotency_key.is_some()
+                && envelope.metadata.idempotency_key == self.metadata.idempotency_key
+            {
+                self.earlier
+                    .entry(stream_id.clone())
+                    .or_default()
+                    .push(envelope);
+            }
         }
         if !self.pending.is_empty() {
             // The rest of the boundary is still out: stay in Loading,
@@ -474,6 +496,15 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
             // outstanding streams; re-emit the read for the remainder
             // so the action stream stays a faithful request log.
             return self.load_action(self.pending.iter().cloned().collect());
+        }
+        if !self.earlier.is_empty() {
+            self.phase = Phase::Done;
+            return BatchAction::Done(BatchOutcome::AlreadyCommitted {
+                committed: core::mem::take(&mut self.earlier)
+                    .into_iter()
+                    .map(|(stream_id, events)| CommittedStream { stream_id, events })
+                    .collect(),
+            });
         }
         self.decide_and_emit()
     }
@@ -786,6 +817,48 @@ mod tests {
             stream_id: stream_of(2),
             events: vec![env(&stream_of(2), 1, opened("b"))],
         })
+    }
+
+    // -- idempotency keys (0.7.5) -----------------------------------------
+
+    #[test]
+    fn a_replayed_batch_key_returns_the_earlier_commit() {
+        let mut m = transfer_machine(1, 2, 5, &[1, 2])
+            .with_metadata(Metadata::default().with_idempotency_key("xfer-1"));
+        m.start();
+        let keyed = |stream: &StreamId, version, event| EventEnvelope {
+            metadata: Metadata::default().with_idempotency_key("xfer-1"),
+            ..env(stream, version, event)
+        };
+        m.handle(BatchInput::Loaded {
+            stream_id: stream_of(1),
+            events: vec![
+                env(&stream_of(1), 1, opened("a")),
+                env(&stream_of(1), 2, AccountEvent::Deposited { amount: 10 }),
+                keyed(&stream_of(1), 3, AccountEvent::Withdrawn { amount: 5 }),
+            ],
+        });
+        let action = m.handle(BatchInput::Loaded {
+            stream_id: stream_of(2),
+            events: vec![
+                env(&stream_of(2), 1, opened("b")),
+                keyed(&stream_of(2), 2, AccountEvent::Deposited { amount: 5 }),
+            ],
+        });
+        let BatchAction::Done(BatchOutcome::AlreadyCommitted { committed }) = action else {
+            panic!("expected AlreadyCommitted, got {action:?}");
+        };
+        assert_eq!(committed.len(), 2, "both legs of the earlier transfer");
+        assert!(committed.iter().all(|c| c.events.len() == 1));
+    }
+
+    #[test]
+    fn an_unkeyed_batch_decides_as_before() {
+        let mut m = transfer_machine(1, 2, 5, &[1, 2]);
+        assert!(matches!(
+            load_funded(&mut m),
+            BatchAction::AppendBatch { .. }
+        ));
     }
 
     // -- transitions ----------------------------------------------------

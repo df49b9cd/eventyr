@@ -22,7 +22,7 @@ snapshots = []
 [dependencies]
 eventyr-core = { workspace = true, features = ["serde"] }
 eventyr-store = { workspace = true }
-eventyr-projection = { workspace = true }
+eventyr-projection = { workspace = true, features = ["inline"] }
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
