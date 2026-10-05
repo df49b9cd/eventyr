@@ -41,6 +41,7 @@ where
     a_condition_ignores_matches_at_or_before_its_position(&make_store());
     a_condition_ignores_events_its_query_does_not_select(&make_store());
     stream_expectations_are_still_checked(&make_store());
+    a_conditional_batch_naming_a_stream_twice_is_refused(&make_store());
     the_boundary_machine_commits_and_rejects(&make_store());
     the_boundary_machine_retries_past_a_concurrent_write(&make_store());
 }
@@ -265,6 +266,25 @@ fn stream_expectations_are_still_checked<S: QueryAppend<Event = EnrollmentEvent>
     .expect_err("the stream is not empty");
     assert!(matches!(error, StoreError::Conflict { .. }));
     assert_eq!(head(store), before);
+}
+
+fn a_conditional_batch_naming_a_stream_twice_is_refused<S: QueryAppend<Event = EnrollmentEvent>>(
+    store: &S,
+) {
+    seed(store, "course-c1", vec![defined("c1", 3)]);
+    let before = head(store);
+    let error = append_if(
+        store,
+        vec![
+            to("course-c1", vec![enrolled("c1", "s1")]),
+            to("course-c1", vec![enrolled("c1", "s2")]),
+        ],
+        Query::none(),
+        Sequence::START,
+    )
+    .expect_err("a stream may appear once per batch");
+    assert!(matches!(error, StoreError::Other(_)), "{error:?}");
+    assert_eq!(head(store), before, "nothing was written");
 }
 
 fn the_boundary_machine_commits_and_rejects<S: QueryAppend<Event = EnrollmentEvent>>(store: &S) {

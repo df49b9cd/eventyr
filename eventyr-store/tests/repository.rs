@@ -513,3 +513,56 @@ async fn concurrent_duplicates_of_a_keyed_command_commit_once() {
         "open + one deposit"
     );
 }
+
+// -- stream lifecycle (0.7.6) ----------------------------------------------
+
+#[tokio::test]
+async fn a_command_against_a_closed_stream_fails_with_stream_closed() {
+    let repo = repository();
+    repo.execute(AccountId(1), AccountCommand::Open { owner: "me".into() })
+        .await
+        .expect("open");
+    repo.store()
+        .close_stream(&StreamId::for_aggregate::<Account>(&AccountId(1)))
+        .await
+        .expect("close");
+    let error = repo
+        .execute(AccountId(1), AccountCommand::Deposit { amount: 5 })
+        .await
+        .expect_err("a closed stream refuses the append");
+    assert!(
+        matches!(
+            error,
+            ExecutionError::Store(StoreError::StreamClosed { .. })
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_command_against_a_truncated_stream_fails_rather_than_folding_a_partial_history() {
+    let repo = repository();
+    repo.execute(AccountId(1), AccountCommand::Open { owner: "me".into() })
+        .await
+        .expect("open");
+    repo.execute(AccountId(1), AccountCommand::Deposit { amount: 5 })
+        .await
+        .expect("deposit");
+    repo.store()
+        .truncate_before(
+            &StreamId::for_aggregate::<Account>(&AccountId(1)),
+            Version::new(2),
+        )
+        .await
+        .expect("truncate");
+    // Without the Opened event the fold would say "not open" and reject
+    // a deposit that is valid: the read must fail instead.
+    let error = repo
+        .execute(AccountId(1), AccountCommand::Deposit { amount: 5 })
+        .await
+        .expect_err("the full history is gone");
+    assert!(
+        matches!(error, ExecutionError::Store(StoreError::Truncated { .. })),
+        "{error:?}"
+    );
+}

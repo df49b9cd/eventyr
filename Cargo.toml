@@ -5,6 +5,9 @@ members = [
     "eventyr-core",
     "eventyr-macros",
     "eventyr-projection",
+    "eventyr-shred",
+    "eventyr-shred-aes-gcm",
+    "eventyr-shred-chacha",
     "eventyr-store",
     "eventyr-store-fjall",
     "eventyr-store-postgres",
@@ -29,6 +32,38 @@ eventyr-store-sqlite = { path = "eventyr-store-sqlite", version = "0.1.0" }
 eventyr-store-testing = { path = "eventyr-store-testing", version = "0.1.0" }
 eventyr-subscription = { path = "eventyr-subscription", version = "0.1.0" }
 eventyr-projection = { path = "eventyr-projection", version = "0.1.0" }
+eventyr-shred = { path = "eventyr-shred", version = "0.1.0" }
+eventyr-shred-aes-gcm = { path = "eventyr-shred-aes-gcm", version = "0.1.0" }
+eventyr-shred-chacha = { path = "eventyr-shred-chacha", version = "0.1.0" }
+
+
+# Third-party dependencies versioned once, here. Per-crate manifests inherit
+# the version and add only their own features, so feature sets stay visible
+# at the use site instead of drifting eleven ways.
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+thiserror = { version = "2", default-features = false }
+tokio = { version = "1", default-features = false }
+tracing = { version = "0.1" }
+time = { version = "0.3", default-features = false }
+uuid = { version = "1" }
+tempfile = { version = "3" }
+proptest = { version = "1" }
+trybuild = { version = "1" }
+async-stream = { version = "0.3", default-features = false }
+base64 = { version = "0.22" }
+event-listener = { version = "5" }
+zeroize = { version = "1.9", default-features = false }
+aead = { version = "0.6", default-features = false, features = ["alloc"] }
+aes-gcm = { version = "0.11", default-features = false }
+chacha20poly1305 = { version = "0.11", default-features = false }
+rusqlite = { version = "0.34" }
+fjall = { version = "3" }
+sqlx = { version = "0.9", default-features = false }
+syn = { version = "3" }
+quote = { version = "1" }
+proc-macro2 = { version = "1" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

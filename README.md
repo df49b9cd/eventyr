@@ -20,17 +20,19 @@ user-implementable trait), no ORM, no DDD toolkit.
 |---|---|---|
 | `eventyr` | Umbrella: re-exports core plus, behind features, the store/subscription/projection sides, and a prelude | shipped |
 | `eventyr-core` | `Aggregate`, protocol vocabulary (`StreamId`/`Version`/`Sequence`/`ExpectedVersion`/`StoreError`/envelope/`Metadata`), `WriteMachine`, `BatchMachine`, `BoundaryMachine` (dynamic consistency boundaries: `Tag`/`Tagged`/`Query`/`Decision`), idempotent commands via `Metadata::idempotency_key`, `SubscriptionMachine`, upcast vocabulary (`Upcaster`/`RawEvent`/`UpcastError`) — `no_std + alloc`, zero deps | shipped |
-| `eventyr-store` | `EventStore`/`StreamsAll` ports, the opt-in `QueryAppend` and `CommitSignal` ports, `InMemoryStore`, `drive_write` driver, `AggregateRepository`, prelude | shipped |
+| `eventyr-store` | `EventStore`/`StreamsAll` ports, the opt-in `QueryAppend`, `CommitSignal` and `StreamLifecycle` ports, `InMemoryStore`, `drive_write` driver, `AggregateRepository`, prelude | shipped |
 | `eventyr-macros` | `#[derive(Aggregate)]`, `#[derive(EventName)]` — convention wiring, sugar not API | shipped |
 | `eventyr-store-postgres` | sqlx-based `EventStore`/`StreamsAll` (`PgStore`, `append_events` PL/pgSQL, DESIGN §9's single-table sketch made real) — a standalone crate, not an umbrella feature yet | shipped |
 | `eventyr-projection` | Read-path correctness layer: `UpcasterChain`/`ClosureUpcaster`, `UpcastingSource` (raw→typed), `RebuildPlan`/`SchemaVersion`/`checkpoint_key`; `View`/`ViewProjection`, and inline views written in the append transaction (`inline` feature, run by the Postgres and SQLite stores) | shipped |
-| `eventyr-subscription` | Catch-up runner: `Projection` trait, `Projector`/`drive_projector` (`drive_projector_blocking` too; `wake_on`/`drive_projector_woken` poll on commit instead of after the idle sleep), `Fanout`, `CheckpointStore`/`InMemoryCheckpointStore`, `StoreSubscription`, `FilteredSubscription` (prefix/type filters that checkpoint past skipped events); `EventBus` trait behind its `bus` feature | shipped |
+| `eventyr-subscription` | Catch-up runner: `Projection` trait, `Projector`/`drive_projector` (`drive_projector_blocking` too; `wake_on`/`drive_projector_woken` poll on commit instead of after the idle sleep), `Fanout`, `CheckpointStore`/`InMemoryCheckpointStore`, `StoreSubscription`, `FilteredSubscription` (prefix/type filters that checkpoint past skipped events), `FailurePolicy`/`ParkedStore` (park poison events instead of stalling); `EventBus` trait behind its `bus` feature | shipped |
 | `eventyr-store-fjall` | Embedded `EventStore`/`StreamsAll` over fjall — transactional appends, no server, driveable without an async runtime | shipped |
-| `eventyr-store-testing` | The store contract: `event_store_contract` / `streams_all_contract` / `snapshot_contract` / `query_append_contract` / `commit_signal_contract` / `filtered_read_contract`, self-tested against the in-memory store | shipped |
+| `eventyr-shred` | Crypto-shredding: `Sensitive<T>` personal fields, `Shredder`, the `ShreddingStore` wrapper, and the bring-your-own `Cipher` and `KeyStore` seams with their contracts | shipped |
+| `eventyr-shred-aes-gcm` / `eventyr-shred-chacha` | Cipher adapters for `eventyr-shred`: AES-256-GCM and XChaCha20-Poly1305 | shipped |
+| `eventyr-store-testing` | The store contract: `event_store_contract` / `streams_all_contract` / `snapshot_contract` / `query_append_contract` / `commit_signal_contract` / `filtered_read_contract` / `lifecycle_contract`, self-tested against the in-memory store | shipped |
 
-Postgres persistence is a standalone crate today; the umbrella pulls it in
-as its own feature. The embedded store arrives as `eventyr-store-fjall`,
-also behind its own umbrella feature.
+Postgres persistence is a standalone crate the umbrella pulls in as its
+own feature; the embedded stores (`eventyr-store-fjall`,
+`eventyr-store-sqlite`) likewise.
 
 ## Umbrella features
 
@@ -42,7 +44,11 @@ also behind its own umbrella feature.
 | `subscription` | no | `eventyr::subscription` — `Projection`, `Projector`, checkpoint store |
 | `bus` | no | `subscription` + the `EventBus` live-push trait |
 | `projection` | no | `subscription` + `eventyr::projection` — upcaster chains, rebuilds |
-| `fjall` | no | `eventyr::fjall` — the embedded store |
+| `postgres` | no | `eventyr::postgres` — the Postgres store (`postgres_snapshots` adds its `SnapshotStore`; the old `snapshots` name is the same thing) |
+| `fjall` | no | `eventyr::fjall` — the embedded store (`fjall_snapshots` adds its snapshot store) |
+| `sqlite` | no | `eventyr::sqlite` — the embedded SQLite store; `sqlite_snapshots`, `sqlite_views`, `sqlite_shred`, `sqlite_parked` for its substores |
+| `shred` | no | `eventyr::shred` — crypto-shredding; pick a cipher with `shred_aes_gcm` / `shred_chacha`, and `shred_parked` seals parked events |
+| `metrics` | no | the `Metrics` port's tracing backend |
 
 ## A taste
 

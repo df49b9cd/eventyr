@@ -17,20 +17,30 @@ default = []
 snapshots = []
 # The `views` table: the `ViewStore` port and inline views (0.7.3).
 views = ["dep:eventyr-projection"]
+# A crypto-shredding `KeyStore` (0.7.6).
+shred = ["dep:eventyr-shred"]
+# A `ParkedStore` for subscriptions' poison events (0.7.7).
+parked = ["dep:eventyr-subscription"]
+# A durable `CheckpointStore` for subscriptions.
+checkpoints = ["dep:eventyr-subscription"]
 
 [dependencies]
 eventyr-core = { workspace = true, features = ["serde"] }
 eventyr-store = { workspace = true }
 eventyr-projection = { workspace = true, features = ["inline"], optional = true }
-rusqlite = { version = "0.34", features = ["bundled"] }
-serde = { version = "1", default-features = false, features = ["derive"] }
-serde_json = { version = "1", default-features = false, features = ["alloc"] }
-thiserror = { version = "2", default-features = false }
-futures = { version = "0.3", default-features = false, features = ["alloc"] }
+eventyr-shred = { workspace = true, optional = true }
+eventyr-subscription = { workspace = true, optional = true }
+rusqlite = { workspace = true, features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+futures.workspace = true
 
 # dev-dependency on ourselves so the contract-suite tests can toggle
 # the feature (a crate's own --features don't reach `tests/`).
 [dev-dependencies]
-eventyr-store-sqlite = { path = ".", features = ["snapshots", "views"] }
-eventyr-store-testing = { workspace = true }
-eventyr-subscription = { workspace = true }
+eventyr-store-sqlite = { path = ".", features = ["snapshots", "views", "shred", "parked", "checkpoints"] }
+eventyr-shred = { workspace = true, features = ["testing"] }
+eventyr-shred-chacha = { workspace = true }
+eventyr-store-testing = { workspace = true, features = ["serde"] }
+eventyr-subscription = { workspace = true, features = ["testing"] }

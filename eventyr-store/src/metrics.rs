@@ -12,7 +12,25 @@
 //! and the runtime cost of an unused port is one atomics-free `&dyn`
 //! dispatch. With [`NoopMetrics`] the calls monomorphize to nothing.
 
-pub use eventyr_core::metrics::{Metrics, NoopMetrics, names};
+pub use eventyr_core::metrics::{Metrics, NoopMetrics};
+
+/// The instruments, by protocol boundary: core's
+/// [`names`](eventyr_core::metrics::names), plus the projector driver's
+/// failure counters.
+pub mod names {
+    pub use eventyr_core::metrics::names::*;
+
+    /// Parks the parked store refused (0.7.7): the event was not
+    /// recorded, so the projector backs off and redelivers it instead of
+    /// moving on. Rising steadily means parking is broken — a store
+    /// that is down, or a projector told to park with no parked store —
+    /// and the projection is stalled on the event: alert on it.
+    pub const PARK_FAILURES: &str = "eventyr_park_failures_total";
+    /// Checkpoint writes that failed: the batch is redelivered after a
+    /// backoff. Occasional ones are harmless (at-least-once); a steady
+    /// rate means the projection is not making durable progress.
+    pub const ACK_FAILURES: &str = "eventyr_ack_failures_total";
+}
 
 /// The tracing backend: each instrument call becomes a `tracing` event.
 ///

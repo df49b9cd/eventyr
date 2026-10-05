@@ -19,12 +19,15 @@ snapshots = []
 [dependencies]
 eventyr-core = { workspace = true, features = ["serde"] }
 eventyr-store = { workspace = true }
-fjall = { version = "3" }
-serde = { version = "1", default-features = false, features = ["derive"] }
-serde_json = { version = "1", default-features = false, features = ["alloc"] }
-thiserror = { version = "2", default-features = false }
-futures = { version = "0.3", default-features = false, features = ["alloc"] }
+fjall.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+futures.workspace = true
 
+# dev-dependency on ourselves so the contract-suite tests can turn on
+# the feature (a crate's own --features don't reach `tests/`).
 [dev-dependencies]
-eventyr-store-testing = { workspace = true }
-tempfile = { version = "3" }
+eventyr-store-fjall = { path = ".", features = ["snapshots"] }
+eventyr-store-testing = { workspace = true, features = ["serde"] }
+tempfile.workspace = true

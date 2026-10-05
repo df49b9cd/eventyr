@@ -4,9 +4,10 @@
 //! [`SubscriptionMachine`] consumes driver results ([`SubscriptionInput`])
 //! and emits I/O requests ([`SubscriptionAction`]); the driver performs
 //! them. It is the machine the §7 table calls `ProjectorMachine`; it is
-//! named for its §6-facing role. Its protocol is the §7 table verbatim —
-//! inputs `Fetched`/`ApplyFailed`/`AckFailed`, actions
-//! `Apply`/`Ack`/`Sleep`/`Done` — plus two augmentation steps:
+//! named for its §6-facing role. Its core is the poll → apply → ack
+//! loop — inputs `Fetched`/`Applied`/`ApplyFailed`/`Acked`/`AckFailed`,
+//! actions `Apply`/`Ack`/`Sleep`/`Done` — plus four augmentation
+//! steps:
 //!
 //! - **`Fetch`**: the table's `Batch` input must arrive, and §6's
 //!   `Subscription::poll` plus the [`StreamsAll`](https://docs.rs/eventyr-store)
@@ -21,6 +22,11 @@
 //!   it elapses.
 //! - **`Shutdown`**: graceful stop — drains the in-flight batch, acks,
 //!   and ends at [`Stopped`](SubscriptionOutcome::Stopped).
+//! - **`Park`** (0.7.7): under [`FailurePolicy::Park`], an event the
+//!   projection keeps rejecting is handed to the driver as
+//!   [`Park`](SubscriptionAction::Park); the driver records it and
+//!   answers [`Parked`](SubscriptionInput::Parked) — the machine carries
+//!   on past it — or [`ParkFailed`](SubscriptionInput::ParkFailed).
 //!
 //! Delivery is at-least-once: the checkpoint moves only after the whole
 //! batch applied, and any apply/ack failure falls back to the last ack,
@@ -29,18 +35,19 @@
 //!
 //! ## Testing
 //!
-//! The machine is pure; [`projector_scripted`](crate::testing::projector_scripted)
+//! The machine is pure; [`scripted`](crate::testing::scripted)
+//! (or its named wrapper [`projector_scripted`](crate::testing::projector_scripted))
 //! drives it against a [`Vec`] of scripted inputs — no runtime. Machine
 //! tests feed [`Slept`](SubscriptionInput::Slept) instantly (the duration
 //! is data); only crate-side driver tests touch a wall clock.
 
-use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 use core::time::Duration;
 
 use crate::envelope::EventEnvelope;
-use crate::error::{ProtocolError, StoreError};
+use crate::error::StoreError;
 use crate::vocabulary::Sequence;
 
 /// A subscription's resume position: the last globally-acked sequence.
@@ -158,6 +165,7 @@ pub struct SubscriptionPolicy {
     pub idle_sleep: Duration,
     /// How long the driver waits after
     /// [`ApplyFailed`](SubscriptionInput::ApplyFailed) /
+    /// [`ParkFailed`](SubscriptionInput::ParkFailed) /
     /// [`AckFailed`](SubscriptionInput::AckFailed) before re-fetching
     /// from the last ack.
     pub retry_sleep: Duration,
@@ -169,6 +177,30 @@ pub struct SubscriptionPolicy {
     /// subscription that stopped merely because it caught up would make
     /// `is_done` mean the wrong thing for the perennial case.
     pub stop_at_catch_up: bool,
+    /// What to do with an event the projection keeps rejecting (0.7.7).
+    /// [`Halt`](FailurePolicy::Halt), the default, retries it forever.
+    pub on_failure: FailurePolicy,
+}
+
+/// What a subscription does with an event its projection keeps
+/// rejecting (0.7.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FailurePolicy {
+    /// Back off and redeliver forever: the projection stalls on the
+    /// event until it applies. The default — skipping an event is a
+    /// correctness decision, never one the library makes for you.
+    #[default]
+    Halt,
+    /// Redeliver up to `retries` more times; then
+    /// [`Park`](SubscriptionAction::Park) the event — record it for
+    /// inspection and replay — and carry on past it as if it had
+    /// applied. Only rejections by the projection count: a failed ack
+    /// or fetch is the infrastructure's fault, not the event's.
+    Park {
+        /// Redeliveries before parking. `0` parks on the first
+        /// rejection.
+        retries: u32,
+    },
 }
 
 impl SubscriptionPolicy {
@@ -180,7 +212,14 @@ impl SubscriptionPolicy {
             idle_sleep,
             retry_sleep,
             stop_at_catch_up: false,
+            on_failure: FailurePolicy::Halt,
         }
+    }
+
+    /// `self`, with `policy` for events the projection keeps rejecting.
+    pub const fn on_failure(mut self, policy: FailurePolicy) -> Self {
+        self.on_failure = policy;
+        self
     }
 
     /// `self`, stopping after the first caught-up poll once caught up.
@@ -218,6 +257,19 @@ pub enum SubscriptionAction<E> {
         /// The event to fold.
         envelope: EventEnvelope<E>,
     },
+    /// Record `envelope` as parked (0.7.7): the projection rejected it
+    /// `attempts` times and the [`FailurePolicy`] gave up on it. Answer
+    /// [`Parked`](SubscriptionInput::Parked) once it is durably
+    /// recorded — the machine then carries on past it — or
+    /// [`ParkFailed`](SubscriptionInput::ParkFailed).
+    Park {
+        /// The event given up on.
+        envelope: EventEnvelope<E>,
+        /// How many times it was rejected.
+        attempts: u32,
+        /// The last rejection, rendered.
+        error: StoreError,
+    },
     /// Persist the checkpoint: every event up to `checkpoint` is applied.
     Ack {
         /// The batch's upper bound.
@@ -254,8 +306,8 @@ pub enum SleepReason {
     /// Caught up: the last poll was empty. A wake-up on commit may end
     /// the wait early.
     Idle,
-    /// Backing off after a failed apply or ack. The wait runs its
-    /// course.
+    /// Backing off after a failed apply, park, or ack. The wait runs
+    /// its course.
     Backoff,
 }
 
@@ -272,32 +324,50 @@ pub enum SubscriptionInput<E> {
     /// The projection accepted the event.
     Applied,
     /// The projection rejected the event, carrying a description of the
-    /// rejection so the driver can report it. The machine sleeps and
-    /// re-fetches from the last ack, so the offending (and any later)
-    /// event redelivers — the at-least-once contract. The machine does
-    /// not branch on `error`: the payload exists so a permanently
-    /// unprocessable (poison) event is diagnosable instead of looping
-    /// invisibly; the checkpointer/observer may count repeats and skip
-    /// or dead-letter them.
+    /// rejection so the driver can report it. Under
+    /// [`FailurePolicy::Halt`] the machine sleeps and re-fetches from the
+    /// last ack, so the offending (and any later) event redelivers — the
+    /// at-least-once contract. Under [`FailurePolicy::Park`] the machine
+    /// counts consecutive rejections of the same event (0.7.7) and, once
+    /// the budget is spent, emits [`Park`](SubscriptionAction::Park)
+    /// carrying this `error` instead of backing off.
     ApplyFailed {
         /// Why the projection rejected the event, rendered for logging.
+        error: StoreError,
+    },
+    /// The parked event was recorded (0.7.7).
+    Parked,
+    /// Recording the parked event failed. The event is not skipped:
+    /// the machine backs off and redelivers, as for a rejection. The
+    /// machine does not branch on `error`; it is the driver's to report.
+    ParkFailed {
+        /// Why the parked store refused the record.
         error: StoreError,
     },
     /// The checkpoint write persisted.
     Acked,
     /// The checkpoint write failed. Same as an apply failure: sleep and
-    /// re-fetch from the last ack; the un-acked events re-apply.
-    AckFailed,
+    /// re-fetch from the last ack; the un-acked events re-apply. The
+    /// machine does not branch on `error`; it is the driver's to report.
+    AckFailed {
+        /// Why the checkpoint write failed.
+        error: StoreError,
+    },
     /// The sleep elapsed.
     Slept,
     /// A store operation failed fatally (e.g. [`StoreError::Unavailable`]),
     /// outside the apply/ack paths.
     Failed(StoreError),
     /// Request to stop: finish any in-flight batch, ack it, and end at
-    /// [`Stopped`](SubscriptionOutcome::Stopped). Sleeping and fetching
-    /// phases stop immediately; the checkpoint never regresses and no
-    /// fetched-but-unapplied event is lost — the ack boundary is always
-    /// a whole batch.
+    /// [`Stopped`](SubscriptionOutcome::Stopped). A fetching phase stops
+    /// immediately; a sleeping one re-reads once at close. The checkpoint
+    /// never regresses and no fetched-but-unapplied event is lost — the
+    /// ack boundary is always a whole batch. A shutdown survives a
+    /// failure: if the in-flight batch fails to apply, park, or ack, the
+    /// machine backs off and re-reads once at close, as when shut down
+    /// while sleeping; should that closing attempt fail too, it stops at
+    /// the last ack (the batch redelivers after a restart) rather than
+    /// retrying forever.
     Shutdown,
 }
 
@@ -318,39 +388,96 @@ pub enum SubscriptionOutcome {
         checkpoint: Checkpoint,
     },
     /// A fatal store failure or a protocol violation by the driver
-    /// (as [`StoreError::Other`] carrying a [`ProtocolError`]).
+    /// (as [`StoreError::Other`] carrying a
+    /// [`ProtocolError`](crate::error::ProtocolError)).
     Failed(StoreError),
 }
 
-/// Which input the phase guards accept.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Phase {
-    /// Waiting for `Fetched`.
+/// The batch being applied: the event in flight, the events after it,
+/// and the position the batch acks once drained.
+struct InFlight<E> {
+    /// The event the driver is applying (or parking).
+    current: EventEnvelope<E>,
+    /// The batch's events after `current`, in order.
+    rest: vec::IntoIter<EventEnvelope<E>>,
+    /// The ack target: the batch's last sequence, or the source's scan
+    /// bound when that lies past it.
+    upper: Checkpoint,
+}
+
+/// Which input the machine is waiting for, carrying what that phase
+/// needs.
+enum Phase<E> {
+    /// Waiting for `Fetched`. With a shutdown requested this is the
+    /// closing re-read: an empty answer stops.
     Fetching,
     /// Waiting for `Applied`/`ApplyFailed` while draining the batch.
-    Applying,
+    Applying(InFlight<E>),
+    /// Waiting for `Parked`/`ParkFailed` for the batch's current event.
+    Parking {
+        /// The batch, its current event the one being parked.
+        batch: InFlight<E>,
+        /// The rejections the park records.
+        attempts: u32,
+        /// The last rejection, which the park records.
+        error: StoreError,
+    },
     /// Waiting for `Acked`/`AckFailed`.
-    Acking,
-    /// Waiting for `Slept`; trips back to fetch or stop at catch-up.
+    Acking {
+        /// The position being persisted.
+        checkpoint: Checkpoint,
+    },
+    /// Waiting for `Slept`; trips back to fetch.
     Sleeping,
-    /// Optional inter-phase when a shutdown was requested while
-    /// sleeping: waiting for the *catch-up* fetch's `Fetched`.
-    DrainingForStop,
     /// Terminal.
     Done,
+}
+
+/// How far a requested shutdown has got.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stopping {
+    /// Running normally.
+    No,
+    /// Stop at the next point with nothing in flight: an empty closing
+    /// re-read.
+    Requested,
+    /// A batch failed after the request; the machine backed off and is
+    /// making its one closing attempt. Another failure stops.
+    Retried,
+}
+
+/// The event the projection last rejected, and how many times in a row
+/// (0.7.7).
+#[derive(Clone, Copy)]
+struct Failing {
+    /// The rejected event's global position.
+    sequence: Sequence,
+    /// Consecutive rejections of it.
+    attempts: u32,
+}
+
+/// What a valid [`Batch`] asks of the machine.
+enum Delivery<E> {
+    /// Nothing new: a caught-up poll.
+    CaughtUp,
+    /// No events, but a filtered source scanned past the checkpoint:
+    /// ack the scan bound.
+    ScanOnly(Checkpoint),
+    /// Events to apply.
+    Events(InFlight<E>),
 }
 
 /// The sans-IO machine behind a catch-up subscription: poll → apply each
 /// event → ack → repeat, sleeping on empty or failure.
 ///
-/// The machine owns the acked checkpoint, the pending batch, and the
-/// cursor into it. It never does I/O: the driver performs each
+/// The machine owns the acked checkpoint and, per phase, the batch in
+/// flight. It never does I/O: the driver performs each
 /// [`SubscriptionAction`] and reports back with a [`SubscriptionInput`].
 ///
 /// At-least-once is structural: the checkpoint moves only after the
-/// whole batch applied, and `ApplyFailed`/`AckFailed` drop everything
-/// not yet acked and re-fetch from the last ack — so the projection may
-/// re-see events and must apply idempotently.
+/// whole batch applied, and `ApplyFailed`/`ParkFailed`/`AckFailed` drop
+/// everything not yet acked and re-fetch from the last ack — so the
+/// projection may re-see events and must apply idempotently.
 ///
 /// Machines never panic on bad input: a driver that feeds the wrong
 /// input for the current phase, or drives a finished machine, gets
@@ -358,19 +485,15 @@ enum Phase {
 /// [`Failed(StoreError::Other(ProtocolError))`](SubscriptionOutcome::Failed).
 pub struct SubscriptionMachine<E> {
     policy: SubscriptionPolicy,
-    phase: Phase,
+    phase: Phase<E>,
     /// The persisted position; also the exclusive fetch bound.
     acked: Checkpoint,
-    /// The fetched batch: being applied, or awaiting ack.
-    pending: Vec<EventEnvelope<E>>,
-    /// How much of `pending` is applied (the next `Apply` is
-    /// `pending[cursor]`).
-    cursor: usize,
-    /// A shutdown was requested for after the current batch's ack.
-    stop_after_ack: bool,
-    /// The upper bound of `pending`, captured at `Fetched`.
-    upper: Option<Checkpoint>,
-    _marker: core::marker::PhantomData<E>,
+    /// Whether a shutdown was requested, and whether its closing
+    /// attempt already failed once.
+    stopping: Stopping,
+    /// The event the projection last rejected (0.7.7). Survives
+    /// redelivery; cleared once the event applies or is parked.
+    failing: Option<Failing>,
 }
 
 impl<E: Clone> SubscriptionMachine<E> {
@@ -381,18 +504,15 @@ impl<E: Clone> SubscriptionMachine<E> {
             policy,
             phase: Phase::Fetching,
             acked: resume_from,
-            pending: Vec::new(),
-            cursor: 0,
-            stop_after_ack: false,
-            upper: None,
-            _marker: core::marker::PhantomData,
+            stopping: Stopping::No,
+            failing: None,
         }
     }
 
     /// The first action: read after the resume checkpoint. Idempotent
     /// until the first [`handle`](Self::handle).
     pub fn start(&mut self) -> SubscriptionAction<E> {
-        if self.phase != Phase::Fetching {
+        if !matches!(self.phase, Phase::Fetching) || self.stopping != Stopping::No {
             return self.violation("start() on a machine that already progressed");
         }
         self.fetch()
@@ -405,8 +525,10 @@ impl<E: Clone> SubscriptionMachine<E> {
             SubscriptionInput::Applied => self.on_applied(),
             SubscriptionInput::ApplyFailed { error } => self.on_apply_failed(error),
             SubscriptionInput::Acked => self.on_acked(),
-            SubscriptionInput::AckFailed => self.on_ack_failed(),
+            SubscriptionInput::AckFailed { .. } => self.on_ack_failed(),
             SubscriptionInput::Slept => self.on_slept(),
+            SubscriptionInput::Parked => self.on_parked(),
+            SubscriptionInput::ParkFailed { .. } => self.on_park_failed(),
             SubscriptionInput::Failed(error) => self.on_failed(error),
             SubscriptionInput::Shutdown => self.on_shutdown(),
         }
@@ -419,7 +541,7 @@ impl<E: Clone> SubscriptionMachine<E> {
 
     /// Whether the machine reached its terminal outcome.
     pub fn is_done(&self) -> bool {
-        self.phase == Phase::Done
+        matches!(self.phase, Phase::Done)
     }
 
     fn fetch(&self) -> SubscriptionAction<E> {
@@ -429,25 +551,49 @@ impl<E: Clone> SubscriptionMachine<E> {
         }
     }
 
+    /// Take the current phase, leaving `Done` behind: every transition
+    /// sets the next phase explicitly, and a violation leaves it done.
+    fn take_phase(&mut self) -> Phase<E> {
+        core::mem::replace(&mut self.phase, Phase::Done)
+    }
+
     fn on_fetched(&mut self, batch: Batch<E>) -> SubscriptionAction<E> {
-        if !matches!(self.phase, Phase::Fetching | Phase::DrainingForStop) {
+        if !matches!(self.phase, Phase::Fetching) {
             return self.violation("`Fetched` outside the fetching phase");
         }
-        // Validate while applying bounds: sequences must be strictly
-        // increasing and strictly after the acked checkpoint, so a
-        // re-delivery or mis-ordering bug in the store lands as a
-        // protocol violation, not corruption. Gaps are *not* a
-        // violation: stores backing the global sequence with an identity
-        // column burn values on rolled-back appends, and a gap is never
-        // delivered later and out of order, so skipping it keeps the
-        // at-least-once invariant — the checkpoint only advances past
-        // sequences that were delivered or will never arrive.
-        let floor = self.acked.as_sequence().as_u64();
-        let mut last = floor;
+        match self.validate(batch) {
+            Ok(Delivery::CaughtUp) => self.on_caught_up(),
+            Ok(Delivery::ScanOnly(checkpoint)) => {
+                // Nothing matched, but the scan moved: ack it without
+                // applying anything.
+                self.ack(checkpoint)
+            }
+            Ok(Delivery::Events(batch)) => {
+                let envelope = batch.current.clone();
+                self.phase = Phase::Applying(batch);
+                SubscriptionAction::Apply { envelope }
+            }
+            Err(message) => self.violation(message),
+        }
+    }
+
+    /// Check a fetched batch against the protocol and say what it asks
+    /// for.
+    ///
+    /// Sequences must be strictly increasing and strictly after the
+    /// acked checkpoint, so a re-delivery or mis-ordering bug in the
+    /// store lands as a protocol violation, not corruption. Gaps are
+    /// *not* a violation: stores backing the global sequence with an
+    /// identity column burn values on rolled-back appends, and a gap is
+    /// never delivered later and out of order, so skipping it keeps the
+    /// at-least-once invariant — the checkpoint only advances past
+    /// sequences that were delivered or will never arrive.
+    fn validate(&self, batch: Batch<E>) -> Result<Delivery<E>, &'static str> {
+        let mut last = self.acked.as_sequence().as_u64();
         for envelope in &batch.events {
             let sequence = envelope.sequence.as_u64();
             if sequence <= last {
-                return self.violation(
+                return Err(
                     "`Fetched` delivered a sequence not strictly increasing past the ack bound",
                 );
             }
@@ -458,123 +604,160 @@ impl<E: Clone> SubscriptionMachine<E> {
         // scan that went nowhere is no progress.
         let scanned = match (batch.scanned, batch.upper) {
             (Some(scanned), Some(upper)) if scanned < upper => {
-                return self.violation("`Fetched` reported a scan bound below its last event");
+                return Err("`Fetched` reported a scan bound below its last event");
             }
             (Some(scanned), _) if scanned < self.acked => {
-                return self.violation("`Fetched` reported a scan bound behind the checkpoint");
+                return Err("`Fetched` reported a scan bound behind the checkpoint");
             }
             (Some(scanned), _) if scanned > self.acked => Some(scanned),
             _ => None,
         };
-        match (batch.events.is_empty(), batch.upper) {
-            (true, None) if scanned.is_some() => {
-                // Nothing matched, but the scan moved: ack it without
-                // applying anything.
-                self.upper = scanned;
-                self.stop_after_ack = self.phase == Phase::DrainingForStop;
-                self.phase = Phase::Acking;
-                SubscriptionAction::Ack {
-                    checkpoint: scanned.expect("matched on is_some"),
-                }
+        let mut events = batch.events.into_iter();
+        match (events.next(), batch.upper) {
+            (None, None) => Ok(scanned.map_or(Delivery::CaughtUp, Delivery::ScanOnly)),
+            (Some(current), Some(upper)) if upper.as_sequence().as_u64() == last => {
+                Ok(Delivery::Events(InFlight {
+                    current,
+                    rest: events,
+                    // The ack target: the scan bound when it lies past
+                    // the last event.
+                    upper: scanned.map_or(upper, |scanned| scanned.max(upper)),
+                }))
             }
-            (true, None) => {
-                if self.phase == Phase::DrainingForStop {
-                    let checkpoint = self.acked;
-                    self.phase = Phase::Done;
-                    SubscriptionAction::Done(SubscriptionOutcome::Stopped { checkpoint })
-                } else if self.policy.stop_at_catch_up {
-                    let checkpoint = self.acked;
-                    self.phase = Phase::Done;
-                    SubscriptionAction::Done(SubscriptionOutcome::CaughtUp { checkpoint })
-                } else {
-                    self.phase = Phase::Sleeping;
-                    SubscriptionAction::Sleep {
-                        for_: self.policy.idle_sleep,
-                        reason: SleepReason::Idle,
-                    }
-                }
+            _ => Err("batch upper bound does not match its last event"),
+        }
+    }
+
+    /// Nothing new after the checkpoint: stop if asked to, else idle.
+    fn on_caught_up(&mut self) -> SubscriptionAction<E> {
+        if self.stopping != Stopping::No {
+            self.stop()
+        } else if self.policy.stop_at_catch_up {
+            let checkpoint = self.acked;
+            self.phase = Phase::Done;
+            SubscriptionAction::Done(SubscriptionOutcome::CaughtUp { checkpoint })
+        } else {
+            self.phase = Phase::Sleeping;
+            SubscriptionAction::Sleep {
+                for_: self.policy.idle_sleep,
+                reason: SleepReason::Idle,
             }
-            (false, Some(upper)) if upper.as_sequence().as_u64() == last => {
-                let draining_for_stop = self.phase == Phase::DrainingForStop;
-                // The ack target: the scan bound when it lies past the
-                // last event.
-                self.upper = Some(scanned.map_or(upper, |scanned| scanned.max(upper)));
-                self.pending = batch.events;
-                self.cursor = 0;
-                self.stop_after_ack = draining_for_stop;
-                self.phase = Phase::Applying;
-                SubscriptionAction::Apply {
-                    envelope: self.pending[0].clone(),
-                }
-            }
-            _ => self.violation("batch upper bound does not match its last event"),
         }
     }
 
     fn on_applied(&mut self) -> SubscriptionAction<E> {
-        if self.phase != Phase::Applying {
-            return self.violation("`Applied` outside the applying phase");
+        match self.take_phase() {
+            Phase::Applying(batch) => self.advance(batch),
+            _ => self.violation("`Applied` outside the applying phase"),
         }
-        self.cursor = self.cursor.saturating_add(1);
-        if let Some(envelope) = self.pending.get(self.cursor) {
-            SubscriptionAction::Apply {
-                envelope: envelope.clone(),
+    }
+
+    fn on_parked(&mut self) -> SubscriptionAction<E> {
+        match self.take_phase() {
+            // The event is recorded: carry on past it exactly as if it
+            // had applied.
+            Phase::Parking { batch, .. } => self.advance(batch),
+            _ => self.violation("`Parked` outside the parking phase"),
+        }
+    }
+
+    /// The current event is done with (applied or parked): apply the
+    /// next one, or ack the drained batch.
+    fn advance(&mut self, mut batch: InFlight<E>) -> SubscriptionAction<E> {
+        // Whatever was failing has now applied (or was parked).
+        if self
+            .failing
+            .is_some_and(|failing| failing.sequence == batch.current.sequence)
+        {
+            self.failing = None;
+        }
+        match batch.rest.next() {
+            Some(next) => {
+                batch.current = next;
+                let envelope = batch.current.clone();
+                self.phase = Phase::Applying(batch);
+                SubscriptionAction::Apply { envelope }
             }
-        } else {
-            // Batch drained: ack its upper bound.
-            self.phase = Phase::Acking;
-            let upper = match self.upper {
-                Some(upper) => upper,
-                None => return self.violation("batch drained with no upper bound"),
-            };
-            SubscriptionAction::Ack { checkpoint: upper }
+            None => self.ack(batch.upper),
         }
+    }
+
+    fn ack(&mut self, checkpoint: Checkpoint) -> SubscriptionAction<E> {
+        self.phase = Phase::Acking { checkpoint };
+        SubscriptionAction::Ack { checkpoint }
     }
 
     fn on_acked(&mut self) -> SubscriptionAction<E> {
-        if self.phase != Phase::Acking {
-            return self.violation("`Acked` outside the acking phase");
+        match self.take_phase() {
+            Phase::Acking { checkpoint } => {
+                self.acked = checkpoint;
+                // With a shutdown requested, this is the closing re-read.
+                self.phase = Phase::Fetching;
+                self.fetch()
+            }
+            _ => self.violation("`Acked` outside the acking phase"),
         }
-        if let Some(upper) = self.upper {
-            self.acked = upper;
-        }
-        self.pending.clear();
-        self.cursor = 0;
-        self.upper = None;
-        if self.stop_after_ack {
-            self.phase = Phase::DrainingForStop;
-        } else {
-            self.phase = Phase::Fetching;
-        }
-        self.fetch()
     }
 
-    fn on_apply_failed(&mut self, _error: StoreError) -> SubscriptionAction<E> {
-        if self.phase != Phase::Applying {
+    fn on_apply_failed(&mut self, error: StoreError) -> SubscriptionAction<E> {
+        let Phase::Applying(batch) = self.take_phase() else {
             return self.violation("`ApplyFailed` outside the applying phase");
+        };
+        let sequence = batch.current.sequence;
+        let attempts = match self.failing {
+            Some(failing) if failing.sequence == sequence => failing.attempts.saturating_add(1),
+            _ => 1,
+        };
+        self.failing = Some(Failing { sequence, attempts });
+        match self.policy.on_failure {
+            FailurePolicy::Park { retries } if attempts > retries => {
+                let envelope = batch.current.clone();
+                self.phase = Phase::Parking {
+                    batch,
+                    attempts,
+                    error: error.clone(),
+                };
+                SubscriptionAction::Park {
+                    envelope,
+                    attempts,
+                    error,
+                }
+            }
+            _ => self.drop_batch(),
         }
-        // The error is not the machine's to act on — the policy is
-        // always backoff-and-redeliver — but it has been carried this
-        // far so the driver reports the cause before the retry.
-        self.drop_pending_and_sleep()
+    }
+
+    fn on_park_failed(&mut self) -> SubscriptionAction<E> {
+        if !matches!(self.phase, Phase::Parking { .. }) {
+            return self.violation("`ParkFailed` outside the parking phase");
+        }
+        // Not recorded, so not skipped. The attempt count stands: the
+        // next rejection tries to park again.
+        self.drop_batch()
     }
 
     fn on_ack_failed(&mut self) -> SubscriptionAction<E> {
-        if self.phase != Phase::Acking {
+        if !matches!(self.phase, Phase::Acking { .. }) {
             return self.violation("`AckFailed` outside the acking phase");
         }
-        self.drop_pending_and_sleep()
+        self.drop_batch()
     }
 
-    /// At-least-once fallback: everything past the acked checkpoint is
-    /// re-delivered after the sleep — the checkpoint never moved, so the
-    /// next fetch re-reads it all.
-    fn drop_pending_and_sleep(&mut self) -> SubscriptionAction<E> {
-        self.pending.clear();
-        self.cursor = 0;
-        self.upper = None;
-        // A pending shutdown survives the failure: it re-reads at close.
-        self.stop_after_ack = false;
+    /// At-least-once fallback after a failed apply, park, or ack: back
+    /// off, then re-fetch — everything past the acked checkpoint is
+    /// re-delivered, because the checkpoint never moved.
+    ///
+    /// A requested shutdown survives the failure: the re-fetch after the
+    /// backoff is its closing re-read. If that closing attempt fails as
+    /// well, the machine stops at the acked checkpoint — retrying would
+    /// only redeliver the batch that just failed, forever for an event
+    /// the projection always rejects.
+    fn drop_batch(&mut self) -> SubscriptionAction<E> {
+        match self.stopping {
+            Stopping::No => {}
+            Stopping::Requested => self.stopping = Stopping::Retried,
+            Stopping::Retried => return self.stop(),
+        }
         self.phase = Phase::Sleeping;
         SubscriptionAction::Sleep {
             for_: self.policy.retry_sleep,
@@ -583,7 +766,7 @@ impl<E: Clone> SubscriptionMachine<E> {
     }
 
     fn on_slept(&mut self) -> SubscriptionAction<E> {
-        if self.phase != Phase::Sleeping {
+        if !matches!(self.phase, Phase::Sleeping) {
             return self.violation("`Slept` outside the sleeping phase");
         }
         self.phase = Phase::Fetching;
@@ -591,44 +774,50 @@ impl<E: Clone> SubscriptionMachine<E> {
     }
 
     fn on_shutdown(&mut self) -> SubscriptionAction<E> {
-        match self.phase {
+        let action = match &self.phase {
             // Nothing in flight: stop at the acked checkpoint.
-            Phase::Fetching | Phase::DrainingForStop => {
-                let checkpoint = self.acked;
-                self.phase = Phase::Done;
-                SubscriptionAction::Done(SubscriptionOutcome::Stopped { checkpoint })
-            }
+            Phase::Fetching => return self.stop(),
             Phase::Sleeping => {
                 // Re-read once at close: events since the last poll
-                // may have arrived during the idle wait.
-                self.phase = Phase::DrainingForStop;
+                // may have arrived during the wait.
+                self.phase = Phase::Fetching;
                 self.fetch()
             }
             // A step is in flight: the shutdown does not disturb it. The
             // machine re-issues the pending action — the driver performs
             // it as usual — and stops right after the batch's ack.
-            Phase::Applying => {
-                self.stop_after_ack = true;
-                match self.pending.get(self.cursor) {
-                    Some(envelope) => SubscriptionAction::Apply {
-                        envelope: envelope.clone(),
-                    },
-                    None => self.violation("`Shutdown` while applying a drained batch"),
-                }
-            }
-            Phase::Acking => {
-                self.stop_after_ack = true;
-                match self.upper {
-                    Some(checkpoint) => SubscriptionAction::Ack { checkpoint },
-                    None => self.violation("`Shutdown` while acking with no upper bound"),
-                }
-            }
-            Phase::Done => self.violation("`Shutdown` on a finished machine"),
+            Phase::Applying(batch) => SubscriptionAction::Apply {
+                envelope: batch.current.clone(),
+            },
+            Phase::Parking {
+                batch,
+                attempts,
+                error,
+            } => SubscriptionAction::Park {
+                envelope: batch.current.clone(),
+                attempts: *attempts,
+                error: error.clone(),
+            },
+            Phase::Acking { checkpoint } => SubscriptionAction::Ack {
+                checkpoint: *checkpoint,
+            },
+            Phase::Done => return self.violation("`Shutdown` on a finished machine"),
+        };
+        if self.stopping == Stopping::No {
+            self.stopping = Stopping::Requested;
         }
+        action
+    }
+
+    /// End a requested shutdown at the acked checkpoint.
+    fn stop(&mut self) -> SubscriptionAction<E> {
+        let checkpoint = self.acked;
+        self.phase = Phase::Done;
+        SubscriptionAction::Done(SubscriptionOutcome::Stopped { checkpoint })
     }
 
     fn on_failed(&mut self, error: StoreError) -> SubscriptionAction<E> {
-        if self.phase == Phase::Done {
+        if self.is_done() {
             return self.violation("`Failed` on a finished machine");
         }
         self.phase = Phase::Done;
@@ -637,9 +826,7 @@ impl<E: Clone> SubscriptionMachine<E> {
 
     fn violation(&mut self, message: &'static str) -> SubscriptionAction<E> {
         self.phase = Phase::Done;
-        SubscriptionAction::Done(SubscriptionOutcome::Failed(StoreError::Other(Arc::new(
-            ProtocolError::new(message),
-        ))))
+        SubscriptionAction::Done(SubscriptionOutcome::Failed(StoreError::protocol(message)))
     }
 }
 
@@ -677,12 +864,22 @@ mod tests {
     }
 
     fn is_protocol_violation(action: &SubscriptionAction<AccountEvent>) -> bool {
-        let SubscriptionAction::Done(SubscriptionOutcome::Failed(StoreError::Other(source))) =
-            action
-        else {
-            return false;
-        };
-        source.downcast_ref::<ProtocolError>().is_some()
+        matches!(
+            action,
+            SubscriptionAction::Done(SubscriptionOutcome::Failed(error)) if error.is_protocol_violation()
+        )
+    }
+
+    fn ack_failed() -> SubscriptionInput<AccountEvent> {
+        SubscriptionInput::AckFailed {
+            error: StoreError::Unavailable,
+        }
+    }
+
+    fn park_failed() -> SubscriptionInput<AccountEvent> {
+        SubscriptionInput::ParkFailed {
+            error: StoreError::Unavailable,
+        }
     }
 
     /// Assert `action` is the protocol-violation outcome, naming the
@@ -853,7 +1050,7 @@ mod tests {
             batch: batch(vec![envelope(1)]),
         });
         m.handle(SubscriptionInput::Applied);
-        let action = m.handle(SubscriptionInput::AckFailed);
+        let action = m.handle(ack_failed());
         assert!(matches!(
             action,
             SubscriptionAction::Sleep { for_, reason: SleepReason::Backoff } if for_ == Duration::from_secs(1)
@@ -940,6 +1137,146 @@ mod tests {
             action,
             SubscriptionAction::Done(SubscriptionOutcome::Stopped { checkpoint })
                 if checkpoint == Checkpoint::new(Sequence::new(2))
+        ));
+    }
+
+    /// Fetch `[1, 2]`, ack it, fetch `[3, 4]`, apply 3, and shut down
+    /// with 4 in flight: the acked checkpoint is 2.
+    fn shut_down_mid_second_batch(m: &mut SubscriptionMachine<AccountEvent>) {
+        m.start();
+        m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(1), envelope(2)]),
+        });
+        m.handle(SubscriptionInput::Applied);
+        m.handle(SubscriptionInput::Applied);
+        m.handle(SubscriptionInput::Acked);
+        m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(3), envelope(4)]),
+        });
+        m.handle(SubscriptionInput::Applied);
+        assert!(matches!(
+            m.handle(SubscriptionInput::Shutdown),
+            SubscriptionAction::Apply { ref envelope } if envelope.sequence == Sequence::new(4)
+        ));
+    }
+
+    /// After a failure that follows a shutdown: back off, re-read once
+    /// at close, and — nothing new arriving — stop at the last ack.
+    fn assert_backs_off_then_stops_at(
+        m: &mut SubscriptionMachine<AccountEvent>,
+        failure: SubscriptionAction<AccountEvent>,
+        checkpoint: Checkpoint,
+    ) {
+        assert!(
+            matches!(
+                failure,
+                SubscriptionAction::Sleep {
+                    reason: SleepReason::Backoff,
+                    ..
+                }
+            ),
+            "expected a backoff, got {failure:?}"
+        );
+        assert!(matches!(
+            m.handle(SubscriptionInput::Slept),
+            SubscriptionAction::Fetch { from, .. } if from == checkpoint
+        ));
+        let action = m.handle(SubscriptionInput::Fetched {
+            batch: Batch::empty(),
+        });
+        assert!(
+            matches!(
+                action,
+                SubscriptionAction::Done(SubscriptionOutcome::Stopped { checkpoint: at })
+                    if at == checkpoint
+            ),
+            "expected Stopped at {checkpoint}, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn a_shutdown_survives_a_failed_apply() {
+        let mut m = machine();
+        shut_down_mid_second_batch(&mut m);
+        let failure = m.handle(SubscriptionInput::ApplyFailed {
+            error: StoreError::other("boom"),
+        });
+        assert_backs_off_then_stops_at(&mut m, failure, at(2));
+    }
+
+    #[test]
+    fn a_shutdown_survives_a_failed_ack() {
+        let mut m = machine();
+        shut_down_mid_second_batch(&mut m);
+        m.handle(SubscriptionInput::Applied);
+        let failure = m.handle(ack_failed());
+        assert_backs_off_then_stops_at(&mut m, failure, at(2));
+    }
+
+    #[test]
+    fn a_shutdown_survives_a_failed_park() {
+        let mut m = parking(0);
+        shut_down_mid_second_batch(&mut m);
+        assert!(matches!(
+            m.handle(reject()),
+            SubscriptionAction::Park { .. }
+        ));
+        let failure = m.handle(park_failed());
+        assert_backs_off_then_stops_at(&mut m, failure, at(2));
+    }
+
+    #[test]
+    fn a_shutdown_whose_closing_attempt_fails_again_stops_at_the_last_ack() {
+        let mut m = machine();
+        shut_down_mid_second_batch(&mut m);
+        m.handle(SubscriptionInput::ApplyFailed {
+            error: StoreError::other("poison"),
+        });
+        m.handle(SubscriptionInput::Slept);
+        // The closing re-read redelivers the poison event; it fails
+        // again, and the machine stops instead of retrying forever.
+        m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(3), envelope(4)]),
+        });
+        let action = m.handle(SubscriptionInput::ApplyFailed {
+            error: StoreError::other("poison"),
+        });
+        assert!(matches!(
+            action,
+            SubscriptionAction::Done(SubscriptionOutcome::Stopped { checkpoint }) if checkpoint == at(2)
+        ));
+    }
+
+    #[test]
+    fn a_shutdown_while_parking_re_issues_the_real_rejection() {
+        let mut m = parking(0);
+        m.start();
+        m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(1)]),
+        });
+        m.handle(SubscriptionInput::ApplyFailed {
+            error: StoreError::other("bad payload"),
+        });
+        let SubscriptionAction::Park {
+            envelope,
+            attempts,
+            error,
+        } = m.handle(SubscriptionInput::Shutdown)
+        else {
+            panic!("expected the park re-issued");
+        };
+        assert_eq!(envelope.sequence, Sequence::new(1));
+        assert_eq!(attempts, 1);
+        assert_eq!(error.to_string(), "store failure: bad payload");
+        // Recorded: ack the batch, re-read at close, and stop.
+        assert!(matches!(
+            m.handle(SubscriptionInput::Parked),
+            SubscriptionAction::Ack { checkpoint } if checkpoint == at(1)
+        ));
+        m.handle(SubscriptionInput::Acked);
+        assert!(matches!(
+            m.handle(SubscriptionInput::Fetched { batch: Batch::empty() }),
+            SubscriptionAction::Done(SubscriptionOutcome::Stopped { checkpoint }) if checkpoint == at(1)
         ));
     }
 
@@ -1141,8 +1478,14 @@ mod tests {
                 error: StoreError::other("boom"),
             }),
             Just(SubscriptionInput::Acked),
-            Just(SubscriptionInput::AckFailed),
+            Just(SubscriptionInput::AckFailed {
+                error: StoreError::Unavailable,
+            }),
             Just(SubscriptionInput::Slept),
+            Just(SubscriptionInput::Parked),
+            Just(SubscriptionInput::ParkFailed {
+                error: StoreError::Unavailable,
+            }),
             Just(SubscriptionInput::Failed(StoreError::Unavailable)),
             Just(SubscriptionInput::Shutdown),
         ]
@@ -1212,7 +1555,7 @@ mod tests {
         m.handle(SubscriptionInput::Fetched {
             batch: Batch::empty().scanned_to(at(500)),
         });
-        m.handle(SubscriptionInput::AckFailed);
+        m.handle(ack_failed());
         assert_eq!(m.checkpoint(), Checkpoint::ORIGIN);
         let action = m.handle(SubscriptionInput::Slept);
         assert!(matches!(
@@ -1269,15 +1612,182 @@ mod tests {
         assert!(is_protocol_violation(&action));
     }
 
+    // -- poison events (0.7.7) ----------------------------------------
+
+    fn parking(retries: u32) -> SubscriptionMachine<AccountEvent> {
+        SubscriptionMachine::new(
+            SubscriptionPolicy::default().on_failure(FailurePolicy::Park { retries }),
+            Checkpoint::ORIGIN,
+        )
+    }
+
+    fn reject() -> SubscriptionInput<AccountEvent> {
+        SubscriptionInput::ApplyFailed {
+            error: StoreError::other("poison"),
+        }
+    }
+
+    /// Fetch `[1, 2, 3]`, apply 1, and reject 2.
+    fn reject_the_second(
+        m: &mut SubscriptionMachine<AccountEvent>,
+    ) -> SubscriptionAction<AccountEvent> {
+        m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(1), envelope(2), envelope(3)]),
+        });
+        m.handle(SubscriptionInput::Applied);
+        m.handle(reject())
+    }
+
+    #[test]
+    fn halt_is_the_default_and_never_parks() {
+        let mut m = machine();
+        m.start();
+        for _ in 0..50 {
+            let action = reject_the_second(&mut m);
+            assert!(matches!(
+                action,
+                SubscriptionAction::Sleep {
+                    reason: SleepReason::Backoff,
+                    ..
+                }
+            ));
+            m.handle(SubscriptionInput::Slept);
+        }
+        assert_eq!(m.checkpoint(), Checkpoint::ORIGIN, "stalled, never skipped");
+    }
+
+    #[test]
+    fn an_event_is_parked_after_its_retry_budget_and_the_rest_applies() {
+        let mut m = parking(2);
+        m.start();
+        // Two retries: the first two rejections back off.
+        for _ in 0..2 {
+            assert!(matches!(
+                reject_the_second(&mut m),
+                SubscriptionAction::Sleep { .. }
+            ));
+            m.handle(SubscriptionInput::Slept);
+        }
+        // The third rejection parks it.
+        let action = reject_the_second(&mut m);
+        let SubscriptionAction::Park {
+            envelope, attempts, ..
+        } = action
+        else {
+            panic!("expected Park, got {action:?}");
+        };
+        assert_eq!(envelope.sequence, Sequence::new(2));
+        assert_eq!(attempts, 3);
+        // Recorded: carry on with event 3, then ack the whole batch.
+        let action = m.handle(SubscriptionInput::Parked);
+        assert!(
+            matches!(action, SubscriptionAction::Apply { envelope } if envelope.sequence == Sequence::new(3))
+        );
+        let action = m.handle(SubscriptionInput::Applied);
+        assert!(
+            matches!(action, SubscriptionAction::Ack { checkpoint } if checkpoint == Checkpoint::new(Sequence::new(3)))
+        );
+        m.handle(SubscriptionInput::Acked);
+        assert_eq!(m.checkpoint(), Checkpoint::new(Sequence::new(3)));
+    }
+
+    #[test]
+    fn zero_retries_parks_on_the_first_rejection() {
+        let mut m = parking(0);
+        m.start();
+        assert!(matches!(
+            reject_the_second(&mut m),
+            SubscriptionAction::Park { attempts: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn a_failed_park_never_skips_the_event() {
+        let mut m = parking(0);
+        m.start();
+        reject_the_second(&mut m);
+        let action = m.handle(park_failed());
+        assert!(matches!(
+            action,
+            SubscriptionAction::Sleep {
+                reason: SleepReason::Backoff,
+                ..
+            }
+        ));
+        assert_eq!(m.checkpoint(), Checkpoint::ORIGIN);
+        // Redelivered; the next rejection tries to park again.
+        m.handle(SubscriptionInput::Slept);
+        assert!(matches!(
+            reject_the_second(&mut m),
+            SubscriptionAction::Park { .. }
+        ));
+    }
+
+    #[test]
+    fn an_event_that_recovers_resets_its_count() {
+        let mut m = parking(1);
+        m.start();
+        assert!(matches!(
+            reject_the_second(&mut m),
+            SubscriptionAction::Sleep { .. }
+        ));
+        m.handle(SubscriptionInput::Slept);
+        // This time event 2 applies, and later event 4 is rejected: its
+        // count starts from one, not from event 2's.
+        m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(1), envelope(2), envelope(3)]),
+        });
+        m.handle(SubscriptionInput::Applied);
+        m.handle(SubscriptionInput::Applied);
+        m.handle(SubscriptionInput::Applied);
+        m.handle(SubscriptionInput::Acked);
+        m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(4)]),
+        });
+        assert!(matches!(
+            m.handle(reject()),
+            SubscriptionAction::Sleep { .. }
+        ));
+    }
+
+    #[test]
+    fn failed_acks_do_not_count_against_an_event() {
+        let mut m = parking(0);
+        m.start();
+        m.handle(SubscriptionInput::Fetched {
+            batch: batch(vec![envelope(1)]),
+        });
+        m.handle(SubscriptionInput::Applied);
+        let action = m.handle(ack_failed());
+        assert!(
+            matches!(action, SubscriptionAction::Sleep { .. }),
+            "an ack failure backs off, never parks"
+        );
+    }
+
+    #[test]
+    fn park_answers_outside_the_parking_phase_are_violations() {
+        let mut m = parking(0);
+        m.start();
+        assert!(is_protocol_violation(&m.handle(SubscriptionInput::Parked)));
+        let mut m = parking(0);
+        m.start();
+        assert!(is_protocol_violation(&m.handle(park_failed())));
+    }
+
     proptest! {
         /// The machine never panics on any input sequence, and once it
         /// is done it stays done: every action after the first `Done` is
         /// a protocol-violation `Done`.
         #[test]
         fn never_panics_and_stays_done(
-            script in prop::collection::vec(arb_subscription_input(), 0..16)
+            script in prop::collection::vec(arb_subscription_input(), 0..16),
+            park in proptest::option::of(0u32..3),
         ) {
-            let mut m = machine();
+            let mut m = match park {
+                None => machine(),
+                Some(retries) => parking(retries),
+            };
             let actions = projector_scripted(&mut m, script);
 
             prop_assert!(!actions.is_empty()); // start always emits
@@ -1288,13 +1798,72 @@ mod tests {
             }
         }
 
+        /// A shutdown is never lost: a driver that answers whatever the
+        /// machine asks — failing at random, delivering new events until
+        /// the shutdown and none after — always reaches `Stopped`, at a
+        /// checkpoint that never regressed.
+        #[test]
+        fn a_shutdown_always_ends_in_stopped(
+            failures in prop::collection::vec(any::<bool>(), 0..48),
+            shutdown_at in 0usize..24,
+            park in proptest::option::of(0u32..3),
+        ) {
+            let mut m = match park {
+                None => machine(),
+                Some(retries) => parking(retries),
+            };
+            let mut action = m.start();
+            let mut failures = failures.into_iter();
+            let mut shut_down = false;
+            for step in 0..96 {
+                let fail = failures.next().unwrap_or(false);
+                let input = match &action {
+                    SubscriptionAction::Done(outcome) => {
+                        prop_assert!(shut_down, "done before the shutdown: {outcome:?}");
+                        prop_assert!(
+                            matches!(outcome, SubscriptionOutcome::Stopped { checkpoint } if *checkpoint == m.checkpoint()),
+                            "expected Stopped at the last ack, got {outcome:?}"
+                        );
+                        return Ok(());
+                    }
+                    _ if step == shutdown_at => {
+                        shut_down = true;
+                        SubscriptionInput::Shutdown
+                    }
+                    SubscriptionAction::Fetch { from, .. } if !shut_down => {
+                        let next = from.as_sequence().as_u64();
+                        SubscriptionInput::Fetched {
+                            batch: batch(vec![envelope(next + 1), envelope(next + 2)]),
+                        }
+                    }
+                    SubscriptionAction::Fetch { .. } => SubscriptionInput::Fetched {
+                        batch: Batch::empty(),
+                    },
+                    SubscriptionAction::Apply { .. } if fail => reject(),
+                    SubscriptionAction::Apply { .. } => SubscriptionInput::Applied,
+                    SubscriptionAction::Park { .. } if fail => park_failed(),
+                    SubscriptionAction::Park { .. } => SubscriptionInput::Parked,
+                    SubscriptionAction::Ack { .. } if fail => ack_failed(),
+                    SubscriptionAction::Ack { .. } => SubscriptionInput::Acked,
+                    SubscriptionAction::Sleep { .. } => SubscriptionInput::Slept,
+                };
+                action = m.handle(input);
+            }
+            prop_assert!(false, "no Stopped within 96 steps");
+        }
+
         /// The checkpoint never regresses and never moves before an ack:
         /// `Ack`/`Acked` is the only path by which `checkpoint()` changes.
         #[test]
         fn checkpoint_never_regresses_and_moves_only_on_ack(
-            script in prop::collection::vec(arb_subscription_input(), 0..16)
+            script in prop::collection::vec(arb_subscription_input(), 0..16),
+            park in proptest::option::of(0u32..3),
         ) {
-            let mut m = machine();
+            // Halting and parking machines alike.
+            let mut m = match park {
+                None => machine(),
+                Some(retries) => parking(retries),
+            };
             let mut last = m.checkpoint();
             let _ = m.start();
             for (i, input) in script.into_iter().enumerate() {

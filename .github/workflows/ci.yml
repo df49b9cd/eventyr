@@ -55,7 +55,53 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-features
 
+      # The examples are the §0.5.4 worked domain end to end: run them,
+      # so their asserts gate CI, not just their compilation.
+      - name: Examples run
+        run: |
+          cargo run -p eventyr --example bank --all-features
+          cargo run -p eventyr --example enrollment
+          cargo run -p eventyr --example loan_eligibility
+          cargo run -p eventyr --example inline_view --features sqlite_views
+
       # The Postgres-backed suites are `#[ignore]`d for casual `cargo
       # test`; the service above makes the URL real, so run them here.
+      # Serial only: the inline-views and contract suites each hold
+      # transactions, which deadlocks exhaust a 100-connection container.
       - name: Postgres integration tests
-        run: cargo test -p eventyr-store-postgres --features snapshots -- --ignored
+        run: cargo test -p eventyr-store-postgres --features snapshots,time -- --ignored --test-threads=1
+
+      # The no_std core builds for a bare-metal target: this is where
+      # "no_std" is proven, not asserted.
+      - name: no_std core
+        run: |
+          rustup target add thumbv7em-none-eabihf
+          cargo build -p eventyr-core --no-default-features --target thumbv7em-none-eabihf
+          cargo build -p eventyr-core --no-default-features --features serde,time --target thumbv7em-none-eabihf
+
+      # Feature powersets via cargo-hack: `--each-feature --no-dev-deps`
+      # for every crate, so one feature never depends on another being
+      # on by accident. (Locally the same thing without the install:
+      # check `--no-default-features` per crate and each single feature.)
+      - name: cargo-hack (feature powersets)
+        uses: taiki-e/install-action@cargo-hack
+      - name: Feature checks
+        run: cargo hack check --workspace --each-feature --no-dev-deps
+
+  # Miri over the core: UB checks on the machines and their proptests.
+  # Scoped to what finishes; timed at ~6 minutes locally.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: Miri (eventyr-core)
+        run: cargo miri test -p eventyr-core --lib
+        env:
+          # Proptest's failure-persistence file reads need the sandbox
+          # off; the cases count keeps the job timed like the default.
+          MIRIFLAGS: -Zmiri-disable-isolation
+          PROPTEST_CASES: "4"

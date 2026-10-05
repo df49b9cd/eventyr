@@ -1,0 +1,15 @@
+[package]
+name = "eventyr-shred-chacha"
+description = "XChaCha20-Poly1305 cipher adapter for eventyr-shred."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["event-sourcing", "gdpr", "crypto-shredding", "chacha20poly1305"]
+
+[lints]
+workspace = true
+
+[dependencies]
+eventyr-shred = { workspace = true, features = ["aead", "testing"] }
+chacha20poly1305 = { workspace = true, features = ["alloc", "getrandom"] }

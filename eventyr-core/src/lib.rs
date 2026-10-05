@@ -3,8 +3,18 @@
 //! The pure sans-IO core of event sourcing: the [`Aggregate`] trait, the
 //! protocol vocabulary ([`vocabulary::StreamId`], [`vocabulary::Version`],
 //! [`vocabulary::Sequence`], [`vocabulary::ExpectedVersion`]), and the
-//! [`write::WriteMachine`] — the state machine that runs the
-//! load → fold → decide → append write path.
+//! five state machines every driver runs:
+//!
+//! - [`write::WriteMachine`] — one aggregate's load → fold → decide →
+//!   append, with conflict retry and optional snapshots;
+//! - [`batch::BatchMachine`] — the same across a fixed set of streams,
+//!   committed atomically;
+//! - [`boundary::BoundaryMachine`] — a decision whose consistency
+//!   boundary is a query over tagged events (0.7.1);
+//! - [`subscription::SubscriptionMachine`] — the at-least-once,
+//!   checkpointed catch-up projector, with poison-event parking (0.7.7);
+//! - [`saga::SagaMachine`] — a process manager's reaction to one event,
+//!   dispatched as keyed commands (0.7.5).
 //!
 //! Nothing here performs I/O, sleeps, or knows what a runtime is: the crate
 //! is `no_std + alloc` with zero required dependencies. Drivers (async,
@@ -142,7 +152,7 @@ pub mod prelude {
     pub use crate::aggregate::{Aggregate, AggregateId, Optional};
     pub use crate::batch::{
         AggregateFold, BatchAction, BatchDecision, BatchInput, BatchMachine, BatchOutcome,
-        CommittedStream, Decide, Fold, NoFold, StreamAppend,
+        CommittedStream, Decide, Fold, NoFold, RoutedDecision, StreamAppend,
     };
     pub use crate::boundary::{
         AppendCondition, BoundaryAction, BoundaryDecision, BoundaryInput, BoundaryMachine,
@@ -157,8 +167,8 @@ pub mod prelude {
         HasSnapshotState, OfferSnapshot, Snapshot, SnapshotPolicy, WritePolicy,
     };
     pub use crate::subscription::{
-        Batch, Checkpoint, SleepReason, SubscriptionAction, SubscriptionInput, SubscriptionMachine,
-        SubscriptionOutcome, SubscriptionPolicy,
+        Batch, Checkpoint, FailurePolicy, SleepReason, SubscriptionAction, SubscriptionInput,
+        SubscriptionMachine, SubscriptionOutcome, SubscriptionPolicy,
     };
     pub use crate::testing::{Outcome, Scenario};
     pub use crate::upcast::{RawEvent, Upcaster};

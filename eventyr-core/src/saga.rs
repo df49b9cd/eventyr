@@ -36,11 +36,10 @@
 //! [`Failed(StoreError::Other(ProtocolError))`](SagaOutcome::Failed).
 
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::envelope::{EventEnvelope, Metadata};
-use crate::error::{ProtocolError, StoreError};
+use crate::error::StoreError;
 use crate::vocabulary::StreamId;
 
 /// The saga: pure, stateless — commands from events.
@@ -134,7 +133,7 @@ pub enum SagaOutcome {
     /// was empty).
     Done,
     /// A dispatch failed, or the driver broke the protocol (as
-    /// [`StoreError::Other`] carrying a [`ProtocolError`]).
+    /// [`StoreError::Other`] carrying a [`ProtocolError`](crate::error::ProtocolError)).
     Failed(StoreError),
 }
 
@@ -237,9 +236,7 @@ impl<S: Saga> SagaMachine<S> {
 
     fn violation(&mut self, message: &'static str) -> SagaAction<S::Command> {
         self.phase = Phase::Done;
-        SagaAction::Done(SagaOutcome::Failed(StoreError::Other(Arc::new(
-            ProtocolError::new(message),
-        ))))
+        SagaAction::Done(SagaOutcome::Failed(StoreError::protocol(message)))
     }
 }
 
@@ -383,8 +380,7 @@ mod tests {
     fn is_protocol_violation(action: &SagaAction<AccountCommand>) -> bool {
         matches!(
             action,
-            SagaAction::Done(SagaOutcome::Failed(StoreError::Other(source)))
-                if source.downcast_ref::<ProtocolError>().is_some()
+            SagaAction::Done(SagaOutcome::Failed(error)) if error.is_protocol_violation()
         )
     }
 

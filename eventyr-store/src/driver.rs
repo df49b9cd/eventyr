@@ -260,10 +260,10 @@ where
 ///   the machine needs every one before it decides, so concurrency here
 ///   would only complicate the driver;
 /// - `AppendBatch` → [`append_batch`](EventStore::append_batch),
-///   reporting [`Appended`](BatchInput::Appended), or mapping a
-///   [`StoreError::Conflict`] to
-///   [`Conflict`](BatchInput::Conflict) and anything else to
-///   [`Failed`](BatchInput::Failed);
+///   reporting [`Appended`](BatchInput::Appended), or mapping the
+///   store error through `BatchInput::from` — a
+///   [`StoreError::Conflict`] is [`Conflict`](BatchInput::Conflict),
+///   anything else [`Failed`](BatchInput::Failed);
 /// - `Done` → stop and return the outcome.
 ///
 /// Every store error — load or append — travels through the machine as
@@ -345,23 +345,7 @@ where
                         if matches!(error, StoreError::Conflict { .. }) {
                             metrics.counter(names::CONFLICTS, 1);
                         }
-                        match error {
-                            StoreError::Conflict { stream_id, current } => {
-                                // A batch conflict should name its stream;
-                                // one that doesn't is attributed to the
-                                // boundary's first stream — a wrong guess
-                                // surfaces as a violation, never as a fold
-                                // against the wrong stream's state.
-                                let stream = eventyr_core::error::named_conflict_stream(
-                                    stream_id,
-                                    machine.streams().first().expect(
-                                        "a conflict follows an append to a non-empty boundary",
-                                    ),
-                                );
-                                machine.handle(BatchInput::Conflict { stream, current })
-                            }
-                            other => machine.handle(BatchInput::Failed(other)),
-                        }
+                        machine.handle(error.into())
                     }
                 }
             }

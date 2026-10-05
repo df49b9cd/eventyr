@@ -10,7 +10,7 @@ use eventyr_core::snapshot::Snapshot;
 use eventyr_core::vocabulary::{StreamId, Version};
 use eventyr_store::snapshot_store::SnapshotStore;
 
-use crate::{SqliteStore, SqliteStoreError};
+use crate::{SqliteStore, SqliteStoreError, lock_conn};
 
 /// The SQLite snapshot store, generic in the state type.
 pub struct SqliteSnapshotStore<S> {
@@ -32,20 +32,16 @@ impl<S> SqliteSnapshotStore<S> {
     /// the snapshots live beside the log.
     pub fn new<E>(store: &SqliteStore<E>) -> Result<Self, SqliteStoreError> {
         let conn = store.conn();
-        conn.lock()
-            .map_err(|e| {
-                SqliteStoreError::CorruptRow(format!("snapshot open: lock poisoned: {e}"))
-            })?
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS snapshots (
+        lock_conn(&conn).execute_batch(
+            "CREATE TABLE IF NOT EXISTS snapshots (
                     stream_id   TEXT    PRIMARY KEY,
                     version     INTEGER NOT NULL CHECK (version >= 0),
                     payload     TEXT    NOT NULL,
                     created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
                 );",
-            )?;
+        )?;
         Ok(Self {
-            conn: Arc::clone(&conn),
+            conn,
             _state: std::marker::PhantomData,
         })
     }
@@ -58,10 +54,7 @@ where
     type State = S;
 
     async fn load(&self, stream_id: &StreamId) -> Result<Option<Snapshot<S>>, StoreError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StoreError::other(format!("snapshot lock poisoned: {e}")))?;
+        let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare("SELECT version, payload FROM snapshots WHERE stream_id = ?1")
             .map_err(SqliteStoreError::into_store)?;
@@ -98,10 +91,7 @@ where
                 "snapshot version beyond i64".into(),
             ))
         })?;
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StoreError::other(format!("snapshot lock poisoned: {e}")))?;
+        let conn = lock_conn(&self.conn);
         // Newest wins: a stale offer's UPDATE never matches, so the row
         // cannot regress.
         conn.execute(

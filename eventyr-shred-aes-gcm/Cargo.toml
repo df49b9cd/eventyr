@@ -1,0 +1,15 @@
+[package]
+name = "eventyr-shred-aes-gcm"
+description = "AES-256-GCM cipher adapter for eventyr-shred."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["event-sourcing", "gdpr", "crypto-shredding", "aes-gcm"]
+
+[lints]
+workspace = true
+
+[dependencies]
+eventyr-shred = { workspace = true, features = ["aead", "testing"] }
+aes-gcm = { workspace = true, features = ["aes", "alloc", "getrandom"] }

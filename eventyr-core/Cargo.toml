@@ -1,6 +1,6 @@
 [package]
 name = "eventyr-core"
-description = "Pure sans-IO core for event sourcing: the Aggregate trait, protocol vocabulary, and the write machine."
+description = "Pure sans-IO core for event sourcing: the Aggregate trait, the protocol vocabulary, and the write, batch, boundary, subscription, and saga state machines. no_std + alloc."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,15 +22,11 @@ macros = ["dep:eventyr-macros"]
 # Derives Serialize/Deserialize on the value types (the vocabulary, the
 # envelopes, the metadata) — the serde glue a store needs. Off by default.
 serde = ["dep:serde", "time?/serde"]
-# Opts in to `String`-formatting sugar on the error types. Off here
-# (no_std + alloc by default), on via store-side crates that can use the
-# convenience.
-std = []
 
 [dependencies]
 eventyr-macros = { workspace = true, optional = true }
-serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
-time = { version = "0.3", default-features = false, optional = true }
+serde = { workspace = true, features = ["alloc"], optional = true }
+time = { workspace = true, optional = true }
 
 [dev-dependencies]
-proptest = "1"
+proptest.workspace = true

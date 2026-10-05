@@ -1,0 +1,47 @@
+[package]
+name = "eventyr-shred"
+description = "Crypto-shredding for eventyr: personal fields encrypted per data subject, erased by deleting the subject's key."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["event-sourcing", "gdpr", "crypto-shredding", "encryption"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Zeroize key bytes on drop (`SubjectKey` and the per-call caches).
+# Recipients (a key store on disk, a key management service) may keep
+# their own copies regardless.
+zeroize = ["dep:zeroize"]
+# A generic AEAD `Cipher` over the `aead` traits: an algorithm adapter
+# crate (eventyr-shred-aes-gcm / -chacha) is one newtype over it.
+aead = ["dep:aead", "zeroize"]
+# `ShreddingParkedStore`: a `ParkedStore` wrapper that seals an event's
+# `Sensitive` fields before they are parked (0.7.7).
+parked = ["dep:eventyr-subscription"]
+# Exports `cipher_contract` and `key_store_contract`, for adapter-crate
+# and key store tests. Not for production builds.
+testing = []
+
+[dependencies]
+eventyr-core.workspace = true
+eventyr-store = { workspace = true }
+eventyr-subscription = { workspace = true, optional = true }
+futures = { workspace = true, features = ["executor"] }
+serde = { workspace = true, features = ["alloc"] }
+serde_json = { workspace = true }
+base64.workspace = true
+aead = { version = "0.6", default-features = false, features = ["alloc", "getrandom"], optional = true }
+zeroize = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
+
+[dev-dependencies]
+eventyr-store-testing = { workspace = true }
+# The contracts live behind `testing`; the in-crate suite runs them
+# (self-feature so dev-deps see them).
+eventyr-shred = { path = ".", features = ["testing"] }
+# The parked contract lives behind `testing`; in-crate examples and
+# tests call it like a parked-store implementation's suite would.
+eventyr-subscription = { workspace = true, features = ["testing"] }

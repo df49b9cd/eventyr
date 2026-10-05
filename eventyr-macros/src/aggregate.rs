@@ -54,8 +54,10 @@
 //! reverse conversion is a `match` — the point of a concrete enum.
 //!
 //! The generated enum is plain Rust — clone it, match it, derive on it.
-//! Serde glue arrives with the Postgres store (0.2); until then the
-//! enum is domain-only.
+//! Storage-bound enums opt into their codecs with
+//! `#[eventyr(event_derive(...))]` (extra `#[derive(...)]` paths) and
+//! `#[eventyr(event_attr("..."))]` (any other attribute, e.g. a
+//! `#[serde(...)]` container attribute).
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -81,7 +83,65 @@ struct Wiring {
     proc_crate: Option<Path>,
     events: Option<Vec<Path>>,
     event_enum_name: Option<Ident>,
+    /// Extra `#[derive(...)]` paths for the generated event enum.
+    event_derive: Vec<Path>,
+    /// Any other attribute for the generated event enum, parsed from
+    /// the string (a `#[serde(...)]` container attribute, say).
+    event_attr: Vec<syn::Attribute>,
 }
+
+/// `decide` is a function path, like `apply`'s: accepting any
+/// expression would let it drift (`decide = f(x)`) into shapes the
+/// impl can't wire.
+struct DecidedFn(Path);
+
+impl DecidedFn {
+    fn into_path(self) -> Path {
+        self.0
+    }
+}
+
+impl syn::parse::Parse for DecidedFn {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        match input.parse::<Expr>()? {
+            Expr::Path(path) => Ok(Self(path.path)),
+            other => Err(syn::Error::new(
+                other.span(),
+                "eventyr decide expects a function path",
+            )),
+        }
+    }
+}
+
+/// Newtype over the tokens of `event_attr("...")`: a string of one or
+/// more outer attributes, parsed as attributes.
+struct EventAttrs(Vec<syn::Attribute>);
+
+impl syn::parse::Parse for EventAttrs {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        Ok(Self(input.call(syn::Attribute::parse_outer)?))
+    }
+}
+
+/// The attribute keys `parse_wiring` accepts, in the order the
+/// unknown-attribute error lists them. One list: the error and the
+/// parser cannot drift apart.
+const KEYS: &[&str] = &[
+    "name",
+    "id",
+    "state",
+    "event",
+    "event_enum",
+    "command",
+    "error",
+    "initial",
+    "apply",
+    "decide",
+    "crate",
+    "events",
+    "event_derive",
+    "event_attr",
+];
 
 /// Parses `#[eventyr(...)]` attributes into a [`Wiring`], keeping only
 /// what the attributes actually said (conventions are applied later, so
@@ -94,6 +154,7 @@ fn parse_wiring(input: &DeriveInput) -> Result<Wiring, syn::Error> {
             continue;
         }
         attr.parse_nested_meta(|meta| {
+            // The uniform `key = value` arms.
             if attrs::assign_parsed_lit(&mut wiring.name, "name", &meta)?
                 || attrs::assign_parsed(&mut wiring.id, "id", &meta)?
                 || attrs::assign_parsed(&mut wiring.state, "state", &meta)?
@@ -103,21 +164,11 @@ fn parse_wiring(input: &DeriveInput) -> Result<Wiring, syn::Error> {
                 || attrs::assign_parsed(&mut wiring.error, "error", &meta)?
                 || attrs::assign_parsed(&mut wiring.initial, "initial", &meta)?
                 || attrs::assign_parsed(&mut wiring.apply, "apply", &meta)?
+                || attrs::assign_parsed_map(&mut wiring.decide, "decide", DecidedFn::into_path, &meta)?
             {
                 return Ok(());
             }
-            if meta.path.is_ident("decide") {
-                let value = match meta.value()?.parse::<Expr>()? {
-                    Expr::Path(path) => path.path,
-                    other => {
-                        return Err(syn::Error::new(
-                            other.span(),
-                            "eventyr decide expects a function path",
-                        ));
-                    }
-                };
-                assign(&mut wiring.decide, "decide", &meta, value)
-            } else if meta.path.is_ident("crate") {
+            if meta.path.is_ident("crate") {
                 let value = meta.value()?.parse::<syn::LitStr>()?;
                 let path: Path = value.parse()?;
                 assign(&mut wiring.proc_crate, "crate", &meta, absolutize(path))
@@ -130,11 +181,35 @@ fn parse_wiring(input: &DeriveInput) -> Result<Wiring, syn::Error> {
                     ));
                 }
                 assign(&mut wiring.events, "events", &meta, list)
+            } else if meta.path.is_ident("event_derive") {
+                // Repeatable: two enums rarely want the same extra set
+                // twice, and merging keeps `derive` order predictable.
+                wiring.event_derive.extend(path_list(&meta)?);
+                Ok(())
+            } else if meta.path.is_ident("event_attr") {
+                // One attribute in a string: writing several
+                // `event_attr(...)` keys them apart, and `#[serde(tag
+                // = "t", content = "c")]` is several tokens.
+                let content;
+                if !meta.input.peek(syn::token::Paren) {
+                    return Err(syn::Error::new_spanned(
+                        &meta.path,
+                        r##"expected a parenthesized string, like event_attr("#[serde(tag = "kind")]")"##,
+                    ));
+                }
+                syn::parenthesized!(content in meta.input);
+                let value = content.parse::<syn::LitStr>()?;
+                wiring
+                    .event_attr
+                    .extend(syn::parse_str::<EventAttrs>(&value.value())?.0);
+                Ok(())
             } else {
                 Err(syn::Error::new(
                     meta.path.span(),
-                    "unknown eventyr attribute; expected one of name, id, state, event, \
-                     event_enum, command, error, initial, apply, decide, crate, events",
+                    format!(
+                        "unknown eventyr attribute; expected one of {}",
+                        KEYS.join(", ")
+                    ),
                 ))
             }
         })?;
@@ -143,11 +218,89 @@ fn parse_wiring(input: &DeriveInput) -> Result<Wiring, syn::Error> {
     Ok(wiring)
 }
 
+/// Everything the impl needs, conventions resolved. Produced by
+/// [`Wiring::resolve`]; emission reads only this.
+struct Resolved {
+    core: Path,
+    name: String,
+    id: Path,
+    state: TokenStream,
+    event: Path,
+    command: Path,
+    error: Path,
+    initial: TokenStream,
+    apply: Path,
+    decide: Path,
+    events: Option<Vec<Path>>,
+    enum_ident: Ident,
+    event_derive: Vec<Path>,
+    event_attr: Vec<syn::Attribute>,
+}
+
+impl Wiring {
+    /// Apply the conventions: the `{Ident}...` position defaults, a
+    /// unit struct as its own state, `Default` for the initial state,
+    /// the free `apply`/`decide` functions. Kept apart from
+    /// [`expand`]: validation happens there, defaulting here, emission
+    /// in [`emit`] — so emission never branches on what was given and
+    /// parsing never branches on what is emitted.
+    fn resolve(self, ident: &Ident) -> Resolved {
+        let core = self
+            .proc_crate
+            .unwrap_or_else(crate::attrs::default_core_crate);
+        let name = self
+            .name
+            .unwrap_or_else(|| to_snake_case(&ident.to_string()));
+        // The `{Ident}...` position convention, as paths.
+        let default_path = |suffix| -> Path { format_ident!("{ident}{suffix}").into() };
+        let id = self.id.unwrap_or_else(|| default_path("Id"));
+        let command = self.command.unwrap_or_else(|| default_path("Command"));
+        let error = self.error.unwrap_or_else(|| default_path("Error"));
+        // With `events(...)` the generated enum *is* the event type, so
+        // the `Event` convention follows it — `event = X` overrides, and
+        // `event_enum = X` renames the enum `Event` follows.
+        let enum_ident = self
+            .event_enum_name
+            .unwrap_or_else(|| default_path("Event").segments[0].ident.clone());
+        let event = self.event.unwrap_or_else(|| enum_ident.clone().into());
+        let state = self
+            .state
+            .as_ref()
+            .map_or_else(|| quote! { Self }, |state| quote! { #state });
+        let initial = self.initial.as_ref().map_or_else(
+            || {
+                if self.state.is_some() {
+                    quote! { ::core::default::Default::default() }
+                } else {
+                    // A unit struct is its own state: `Self`.
+                    quote! { Self }
+                }
+            },
+            |initial| quote! { #initial },
+        );
+        let apply = self.apply.unwrap_or_else(|| default_fn("apply"));
+        let decide = self.decide.unwrap_or_else(|| default_fn("decide"));
+        Resolved {
+            core,
+            name,
+            id,
+            state,
+            event,
+            command,
+            error,
+            initial,
+            apply,
+            decide,
+            events: self.events,
+            enum_ident,
+            event_derive: self.event_derive,
+            event_attr: self.event_attr,
+        }
+    }
+}
 /// Expands `#[derive(Aggregate)]` into the `Aggregate` impl (and the
 /// event enum, when `events(...)` was given).
 pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream, syn::Error> {
-    let wiring = parse_wiring(input)?;
-
     // The aggregate marker struct must be a unit struct — the aggregate
     // type is a namespace, not a state holder.
     match &input.data {
@@ -166,60 +319,43 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream, syn::Error> {
             ));
         }
     }
+    emit(input, parse_wiring(input)?.resolve(&input.ident))
+}
 
+/// The tokens: the event enum (when `events(...)` was given) and the
+/// `Aggregate` impl wiring conventions to delegates.
+fn emit(input: &DeriveInput, resolved: Resolved) -> Result<TokenStream, syn::Error> {
+    let Resolved {
+        core,
+        name,
+        id,
+        state,
+        event,
+        command,
+        error,
+        initial,
+        apply,
+        decide,
+        events,
+        enum_ident,
+        event_derive,
+        event_attr,
+    } = resolved;
     let ident = &input.ident;
-    let default_core = crate::attrs::default_core_crate();
-    let core = wiring.proc_crate.as_ref().unwrap_or(&default_core);
-    let name = wiring
-        .name
-        .clone()
-        .unwrap_or_else(|| to_snake_case(&ident.to_string()));
-    // The `{Ident}...` position convention, as paths.
-    let default_id: Path = format_ident!("{}Id", ident).into();
-    let default_command: Path = format_ident!("{}Command", ident).into();
-    let default_error: Path = format_ident!("{}Error", ident).into();
-    let id = wiring.id.as_ref().unwrap_or(&default_id);
-    let command = wiring.command.as_ref().unwrap_or(&default_command);
-    let error = wiring.error.as_ref().unwrap_or(&default_error);
-    // With `events(...)` the generated enum *is* the event type, so the
-    // `Event` convention follows it — `event = X` overrides, and
-    // `event_enum = X` renames the enum `Event` follows.
-    let enum_ident: Ident = wiring
-        .event_enum_name
-        .clone()
-        .unwrap_or_else(|| format_ident!("{}Event", ident));
-    let default_event: Path = if wiring.events.is_some() {
-        enum_ident.clone().into()
-    } else {
-        format_ident!("{}Event", ident).into()
-    };
-    let event = wiring.event.as_ref().unwrap_or(&default_event);
-    let state = wiring
-        .state
-        .as_ref()
-        .map_or_else(|| quote! { Self }, |state| quote! { #state });
-    let initial = wiring.initial.as_ref().map_or_else(
-        || {
-            if wiring.state.is_some() {
-                quote! { ::core::default::Default::default() }
-            } else {
-                // A unit struct is its own state: `Self`.
-                quote! { Self }
-            }
-        },
-        |initial| quote! { #initial },
-    );
-    let default_apply = default_fn("apply");
-    let default_decide = default_fn("decide");
-    let apply = wiring.apply.as_ref().unwrap_or(&default_apply);
-    let decide = wiring.decide.as_ref().unwrap_or(&default_decide);
 
-    let event_enum = match &wiring.events {
-        Some(events) => Some(generate_event_enum(events, &enum_ident, &input.vis, core)?),
+    let event_enum = match &events {
+        Some(events) => Some(generate_event_enum(
+            events,
+            &enum_ident,
+            &input.vis,
+            &core,
+            &event_derive,
+            &event_attr,
+        )?),
         None => None,
     };
 
-    let expanded = quote! {
+    Ok(quote! {
         #event_enum
 
         impl #core::aggregate::Aggregate for #ident {
@@ -249,9 +385,7 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream, syn::Error> {
                 #decide(state, command)
             }
         }
-    };
-
-    Ok(expanded)
+    })
 }
 
 /// Generates the event enum from payload structs (the sourcery pattern):
@@ -265,6 +399,8 @@ fn generate_event_enum(
     enum_ident: &Ident,
     visibility: &syn::Visibility,
     core: &Path,
+    extra_derives: &[Path],
+    extra_attrs: &[syn::Attribute],
 ) -> Result<TokenStream, syn::Error> {
     // `events(Opened, Deposited)` — the variant name is the payload's
     // own name (the last path segment), so `module::Opened` still
@@ -284,7 +420,6 @@ fn generate_event_enum(
                 })
         })
         .collect::<Result<_, _>>()?;
-
     let variants = events
         .iter()
         .zip(&variant_idents)
@@ -316,7 +451,8 @@ fn generate_event_enum(
     Ok(quote! {
         /// The aggregate's domain events, generated from payload
         /// structs by `#[derive(Aggregate)]`.
-        #[derive(Clone, Debug, PartialEq)]
+        #[derive(Clone, Debug, PartialEq, #(#extra_derives),*)]
+        #(#extra_attrs)*
         #visibility enum #enum_ident {
             #(#variants,)*
         }

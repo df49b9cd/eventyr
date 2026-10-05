@@ -48,6 +48,7 @@ where
     a_multi_stream_conflict_commits_nothing::<E, _>(&make_store());
     a_multi_stream_conflict_names_the_stream::<E, _>(&make_store());
     batch_events_are_globally_ordered::<E, _>(&make_store());
+    a_batch_naming_a_stream_twice_is_refused::<E, _>(&make_store());
 }
 
 fn a_single_stream_batch_delegates_to_append<E: ContractEvent, S: EventStore<Event = E>>(
@@ -175,6 +176,40 @@ where
     assert_eq!(
         all.iter().map(|e| e.sequence).collect::<Vec<_>>(),
         vec![Sequence::new(1), Sequence::new(2), Sequence::new(3)]
+    );
+}
+
+fn a_batch_naming_a_stream_twice_is_refused<E, S>(store: &S)
+where
+    E: ContractEvent,
+    S: EventStore<Event = E> + StreamsAll<Event = E>,
+{
+    block_on(append_batch(
+        store,
+        vec![append::<E>("batch-twice", ExpectedVersion::Empty, &[1])],
+    ))
+    .expect("seed batch-twice");
+    // Both entries would be checked against version 1 and written from
+    // it: one event lost, or half the batch committed before the second
+    // entry's check fails. The store refuses the batch instead.
+    let error = block_on(append_batch::<E, S>(
+        store,
+        vec![
+            append("batch-twice", ExpectedVersion::Exact(Version::new(1)), &[2]),
+            append("batch-other", ExpectedVersion::Empty, &[3]),
+            append("batch-twice", ExpectedVersion::Exact(Version::new(1)), &[4]),
+        ],
+    ))
+    .expect_err("a stream may appear once per batch");
+    assert!(matches!(error, StoreError::Other(_)), "{error:?}");
+    let all: Vec<_> =
+        block_on(store.stream_all(Sequence::new(0)).try_collect::<Vec<_>>()).expect("global read");
+    assert_eq!(
+        all.iter()
+            .map(|e| (e.stream_id.as_str().to_owned(), e.version.as_u64()))
+            .collect::<Vec<_>>(),
+        vec![("batch-twice".to_owned(), 1)],
+        "nothing in the refused batch was written"
     );
 }
 

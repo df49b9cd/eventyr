@@ -16,11 +16,11 @@
 //! loss, and `eventyr-core`'s [`Upcaster`](eventyr_core::upcast::Upcaster)
 //! contract forbids it.
 
-use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
 use eventyr_core::subscription::{Batch, Checkpoint};
 use eventyr_core::upcast::RawEvent;
 use eventyr_core::version_registry::VersionedRaw;
+use eventyr_core::vocabulary::Sequence;
 use eventyr_subscription::source::SubscriptionSource;
 
 use crate::chain::UpcasterChain;
@@ -49,39 +49,6 @@ impl<S, E> UpcastingSource<S, E> {
     }
 }
 
-impl<S, E> UpcastingSource<S, E>
-where
-    S: SubscriptionSource<Event = RawEvent>,
-    E: Send,
-{
-    /// Fetch from the raw source and map each envelope's event through
-    /// the chain — the whole body of the port impl, factored out so the
-    /// reference/`Arc` delegations share it instead of duplicating it.
-    async fn fetch_upcasting(&self, from: Checkpoint, max: usize) -> Result<Batch<E>, StoreError> {
-        let batch = self.inner.fetch(from, max).await?;
-        let mut events = Vec::with_capacity(batch.events.len());
-        for envelope in batch.events {
-            // Loud, never skip (see the module docs): a poison payload
-            // aborts the fetch, the batch is never applied, and the
-            // checkpoint never advances past the offending event.
-            let event = self.chain.upcast(envelope.event).map_err(|error| {
-                StoreError::other(format!(
-                    "upcasting sequence {}: {error}",
-                    envelope.sequence.as_u64(),
-                ))
-            })?;
-            events.push(EventEnvelope {
-                sequence: envelope.sequence,
-                stream_id: envelope.stream_id,
-                version: envelope.version,
-                event,
-                metadata: envelope.metadata,
-            });
-        }
-        Ok(Batch::new(events, batch.upper))
-    }
-}
-
 impl<S, E> SubscriptionSource for UpcastingSource<S, E>
 where
     S: SubscriptionSource<Event = RawEvent>,
@@ -90,8 +57,27 @@ where
     type Event = E;
 
     async fn fetch(&self, from: Checkpoint, max: usize) -> Result<Batch<E>, StoreError> {
-        self.fetch_upcasting(from, max).await
+        let batch = self.inner.fetch(from, max).await?;
+        let mut events = Vec::with_capacity(batch.events.len());
+        for envelope in batch.events {
+            // Loud, never skip (see the module docs): a poison payload
+            // aborts the fetch, the batch is never applied, and the
+            // checkpoint never advances past the offending event.
+            let sequence = envelope.sequence;
+            events.push(envelope.try_map_event(|raw| {
+                self.chain
+                    .upcast(raw)
+                    .map_err(|error| upcast_failed(sequence, error))
+            })?);
+        }
+        Ok(Batch::new(events, batch.upper))
     }
+}
+
+/// The store error a failed upcast becomes: the sequence it stopped at,
+/// and why.
+fn upcast_failed(sequence: Sequence, error: impl core::fmt::Display) -> StoreError {
+    StoreError::other(format!("upcasting sequence {}: {error}", sequence.as_u64()))
 }
 
 // Sources are shared like every other port: `&UpcastingSource` and
@@ -126,54 +112,6 @@ impl<S> VersionedSource<S> {
     }
 }
 
-impl<S> VersionedSource<S>
-where
-    S: SubscriptionSource<Event = RawEvent>,
-{
-    /// Fetch from the raw source and run each envelope's event through
-    /// the registry's ladder — the whole body, factored so the
-    /// reference/`Arc` delegations share it.
-    async fn fetch_versioned(
-        &self,
-        from: Checkpoint,
-        max: usize,
-    ) -> Result<Batch<RawEvent>, StoreError> {
-        let batch = self.inner.fetch(from, max).await?;
-        let mut events = Vec::with_capacity(batch.events.len());
-        for envelope in batch.events {
-            // Loud, never skip: a poison payload aborts the fetch, the
-            // batch is never applied, and the checkpoint never advances
-            // past the offending event.
-            let raw = envelope.event;
-            let payload = self
-                .registry
-                .upcast(VersionedRaw {
-                    event_type: raw.event_type.clone(),
-                    version: raw.schema_version,
-                    payload: raw.payload,
-                })
-                .map_err(|error| {
-                    StoreError::other(format!(
-                        "upcasting sequence {}: {error}",
-                        envelope.sequence.as_u64(),
-                    ))
-                })?;
-            events.push(EventEnvelope {
-                sequence: envelope.sequence,
-                stream_id: envelope.stream_id,
-                version: envelope.version,
-                event: RawEvent {
-                    event_type: raw.event_type,
-                    schema_version: raw.schema_version,
-                    payload,
-                },
-                metadata: envelope.metadata,
-            });
-        }
-        Ok(Batch::new(events, batch.upper))
-    }
-}
-
 impl<S> SubscriptionSource for VersionedSource<S>
 where
     S: SubscriptionSource<Event = RawEvent>,
@@ -181,7 +119,30 @@ where
     type Event = RawEvent;
 
     async fn fetch(&self, from: Checkpoint, max: usize) -> Result<Batch<Self::Event>, StoreError> {
-        self.fetch_versioned(from, max).await
+        let batch = self.inner.fetch(from, max).await?;
+        let mut events = Vec::with_capacity(batch.events.len());
+        for envelope in batch.events {
+            // Loud, never skip: a poison payload aborts the fetch, the
+            // batch is never applied, and the checkpoint never advances
+            // past the offending event.
+            let sequence = envelope.sequence;
+            events.push(envelope.try_map_event(|raw| {
+                let payload = self
+                    .registry
+                    .upcast(VersionedRaw {
+                        event_type: raw.event_type.clone(),
+                        version: raw.schema_version,
+                        payload: raw.payload,
+                    })
+                    .map_err(|error| upcast_failed(sequence, error))?;
+                Ok::<_, StoreError>(RawEvent {
+                    event_type: raw.event_type,
+                    schema_version: raw.schema_version,
+                    payload,
+                })
+            })?);
+        }
+        Ok(Batch::new(events, batch.upper))
     }
 }
 

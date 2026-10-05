@@ -13,6 +13,9 @@
 //! [`runner::drive_projector`]) it runs against. The `bus` feature
 //! carries the §6 [`bus::Subscription`] shape and the §2
 //! [`bus::EventBus`] trait — the 0.3 live-push seam — off by default.
+//! The `testing` feature exports
+//! [`parked::parked_store_contract`] for parked-store implementations
+//! to run in their tests.
 //!
 //! ## A taste
 //!
@@ -77,6 +80,7 @@
 #[cfg(feature = "bus")]
 pub mod bus;
 pub mod checkpoint;
+pub mod parked;
 pub mod runner;
 pub mod saga;
 pub mod source;
@@ -88,17 +92,16 @@ pub mod prelude {
     #[cfg(feature = "bus")]
     pub use crate::bus::{EventBus, Subscription};
     pub use crate::checkpoint::{CheckpointStore, InMemoryCheckpointStore};
-    pub use crate::runner::{
-        Projection, Projector, drive_projector, drive_projector_with_metrics, drive_projector_woken,
-    };
+    pub use crate::parked::{InMemoryParkedStore, NoParking, ParkedEvent, ParkedStore};
+    pub use crate::runner::{DriverPorts, Projection, Projector, drive_projector};
     pub use crate::saga::{SagaProjection, drive_saga};
     pub use crate::source::{FilteredSubscription, StoreSubscription, SubscriptionSource};
     pub use eventyr_core::saga::{
         Saga, SagaAction, SagaCommand, SagaInput, SagaMachine, SagaOutcome,
     };
     pub use eventyr_core::subscription::{
-        Batch, Checkpoint, SubscriptionAction, SubscriptionInput, SubscriptionMachine,
-        SubscriptionOutcome, SubscriptionPolicy,
+        Batch, Checkpoint, FailurePolicy, SubscriptionAction, SubscriptionInput,
+        SubscriptionMachine, SubscriptionOutcome, SubscriptionPolicy,
     };
     pub use eventyr_store::notify::{CommitListener, CommitSignal, LocalCommitSignal, NoSignal};
     pub use eventyr_store::store::EventFilter;

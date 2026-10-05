@@ -48,6 +48,14 @@ pub trait EventStore {
     /// expectation (a violation on any stream is reported as
     /// [`StoreError::Conflict`] carrying that stream's id and version).
     ///
+    /// A stream appears at most once per batch: every expectation is
+    /// checked against the state before the batch, so a second entry for
+    /// the same stream has no well-defined base version. A batch naming a
+    /// stream twice fails [`StoreError::Other`] before anything is
+    /// written ([`validate_batch`], which every store calls first); merge
+    /// the stream's events into one [`StreamAppend`] instead. The same
+    /// rule holds for [`QueryAppend::append_if`].
+    ///
     /// This is the port the [`BatchMachine`](eventyr_core::batch::BatchMachine)
     /// drives — the write machine's one-stream [`append`](EventStore::append)
     /// generalized to a fixed set. Stores that cannot commit atomically
@@ -217,6 +225,51 @@ pub struct FilteredRead<E> {
     pub scanned: Sequence,
 }
 
+/// A store that can end a stream's life (0.7.6): close it to further
+/// appends, or drop the oldest part of its history.
+///
+/// Neither operation lets a decision see the wrong state. The write
+/// protocol decides against the stream's whole folded history, so:
+///
+/// - [`close_stream`](Self::close_stream) is a tombstone, not a soft
+///   delete. A deleted stream that later accepted appends would fold an
+///   empty history and then append at version *N + 1*, a decision taken
+///   against state it never saw. A closed stream refuses appends with
+///   [`StoreError::StreamClosed`] instead, and its history stays
+///   readable for projections and audits.
+/// - [`truncate_before`](Self::truncate_before) drops events below a
+///   version, and a read that starts before the cut fails with
+///   [`StoreError::Truncated`] rather than folding a partial history.
+///   Truncate only below a snapshot the readers start from, and only
+///   after every projection that needs the dropped events has passed
+///   them.
+///
+/// Both are permanent. Both reach the global stream as an ordinary
+/// event the caller appends first (a `Closed` or `Archived` variant of
+/// the domain's own enum), so projections see a marker rather than a
+/// silent gap; the port does not invent one, since a store cannot
+/// construct a domain event.
+pub trait StreamLifecycle: EventStore {
+    /// Refuse every later append to `stream_id`. Idempotent. Closing a
+    /// stream that has no events is allowed and reserves the name.
+    fn close_stream(
+        &self,
+        stream_id: &StreamId,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Delete the events of `stream_id` below `version`, keeping
+    /// `version` and everything after it. A later read whose exclusive
+    /// lower bound lies below `version - 1` fails with
+    /// [`StoreError::Truncated`]. Truncating to a version at or below
+    /// the current cut is a no-op; past the stream's end it is an error.
+    /// The global stream loses the same events.
+    fn truncate_before(
+        &self,
+        stream_id: &StreamId,
+        version: Version,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+}
+
 /// A store that can serve dynamic consistency boundaries (0.7.1): read
 /// the events a [`Query`] selects, and append guarded by an
 /// [`AppendCondition`] instead of (only) a stream version.
@@ -253,7 +306,8 @@ where
     /// [`StreamAppend`]'s own expectation is still checked
     /// ([`StoreError::Conflict`] on violation) — the boundary machine
     /// emits [`Any`](ExpectedVersion::Any), but the port does not
-    /// assume it.
+    /// assume it. As for [`append_batch`](EventStore::append_batch), a
+    /// stream appears at most once ([`validate_batch`]).
     fn append_if(
         &self,
         appends: Vec<StreamAppend<Self::Event>>,
@@ -273,6 +327,90 @@ pub fn expected_version_matches(expected: ExpectedVersion, current: u64) -> bool
     }
 }
 
+/// Refuse a batch that names a stream more than once — the rule
+/// [`EventStore::append_batch`] and [`QueryAppend::append_if`] document.
+///
+/// Every store calls it before touching storage, so the refusal is the
+/// same everywhere and nothing is written. An empty batch and a batch of
+/// distinct streams pass.
+pub fn validate_batch<E>(appends: &[StreamAppend<E>]) -> Result<(), StoreError> {
+    let mut seen: Vec<&StreamId> = appends.iter().map(|append| &append.stream_id).collect();
+    seen.sort_unstable();
+    match seen.windows(2).find(|pair| pair[0] == pair[1]) {
+        Some(pair) => Err(StoreError::other(format!(
+            "stream {} appears more than once in one batch; merge its events into one append",
+            pair[0]
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The truncated-read rule (0.7.6), once: a read of `stream_id` from
+/// `from` (exclusive) fails [`StoreError::Truncated`] when it would start
+/// before `first_kept`, the stream's first remaining version (1 for a
+/// stream never truncated). A read that starts at the cut or later is
+/// served.
+pub fn read_starts_before_cut(
+    stream_id: &StreamId,
+    from: Version,
+    first_kept: u64,
+) -> Result<(), StoreError> {
+    if from.as_u64().saturating_add(1) < first_kept {
+        return Err(StoreError::Truncated {
+            stream_id: stream_id.clone(),
+            first: Version::new(first_kept),
+        });
+    }
+    Ok(())
+}
+
+/// What [`StreamLifecycle::truncate_before`] must do, as decided by
+/// [`plan_truncate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TruncatePlan {
+    /// The cut is at or below the current one: nothing to do.
+    Noop,
+    /// Delete the events below this version and record it as the
+    /// stream's first kept version.
+    Cut(u64),
+}
+
+/// The truncation bounds (0.7.6), once: for a stream at `head` whose
+/// first kept version is `first_kept` (1 if never truncated), truncating
+/// before `cut` is
+///
+/// - an error past `head + 1` — there is nothing there to keep;
+/// - a no-op at or below `first_kept` — truncation never un-truncates;
+/// - otherwise a cut at `cut`.
+pub fn plan_truncate(
+    stream_id: &StreamId,
+    head: u64,
+    first_kept: u64,
+    cut: Version,
+) -> Result<TruncatePlan, StoreError> {
+    let at = cut.as_u64();
+    if at > head.saturating_add(1) {
+        return Err(StoreError::other(format!(
+            "cannot truncate {stream_id} before {cut}: it ends at {head}"
+        )));
+    }
+    if at <= first_kept {
+        return Ok(TruncatePlan::Noop);
+    }
+    Ok(TruncatePlan::Cut(at))
+}
+
+/// A version or sequence as a SQL `BIGINT`, saturating at `i64::MAX`.
+///
+/// Positions are `u64` in the protocol and signed 64-bit in SQL. A real
+/// log never gets past `i64::MAX`, so the only values that saturate are
+/// bounds a caller passed in (`stream_all(Sequence::new(u64::MAX))`),
+/// and saturating keeps them meaning "after everything" where a wrapping
+/// cast would turn them into -1, "before everything".
+pub fn sql_position(position: u64) -> i64 {
+    i64::try_from(position).unwrap_or(i64::MAX)
+}
+
 /// The fallback [`EventStore::append_batch`] for stores that cannot
 /// commit atomically across streams: an empty batch commits nothing, a
 /// single-stream batch delegates to [`append`](EventStore::append), and
@@ -283,6 +421,7 @@ pub async fn append_batch_fallback<S: EventStore + ?Sized>(
     store: &S,
     appends: Vec<StreamAppend<S::Event>>,
 ) -> Result<Vec<CommittedStream<S::Event>>, StoreError> {
+    validate_batch(&appends)?;
     let mut appends = appends;
     match appends.len() {
         0 => Ok(Vec::new()),
@@ -361,6 +500,30 @@ macro_rules! impl_port_delegation {
         }
     };
 }
+
+macro_rules! impl_lifecycle_delegation {
+    ($pointer:ty) => {
+        impl<S: StreamLifecycle + ?Sized> StreamLifecycle for $pointer {
+            fn close_stream(
+                &self,
+                stream_id: &StreamId,
+            ) -> impl Future<Output = Result<(), StoreError>> + Send {
+                (**self).close_stream(stream_id)
+            }
+
+            fn truncate_before(
+                &self,
+                stream_id: &StreamId,
+                version: Version,
+            ) -> impl Future<Output = Result<(), StoreError>> + Send {
+                (**self).truncate_before(stream_id, version)
+            }
+        }
+    };
+}
+
+impl_lifecycle_delegation!(&S);
+impl_lifecycle_delegation!(std::sync::Arc<S>);
 
 macro_rules! impl_query_delegation {
     ($pointer:ty) => {

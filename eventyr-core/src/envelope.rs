@@ -24,6 +24,42 @@ pub struct EventEnvelope<E> {
     pub metadata: Metadata,
 }
 
+impl<E> EventEnvelope<E> {
+    /// The same envelope — position, stream, version, metadata — carrying
+    /// `f(event)` instead, or `f`'s error.
+    ///
+    /// The read-side adapters (upcasting, decrypting) change only the
+    /// event; this carries the storage fields across untouched.
+    ///
+    /// ```
+    /// use eventyr_core::envelope::{EventEnvelope, Metadata};
+    /// use eventyr_core::vocabulary::{Sequence, StreamId, Version};
+    ///
+    /// let raw = EventEnvelope {
+    ///     sequence: Sequence::new(7),
+    ///     stream_id: StreamId::from("account-1"),
+    ///     version: Version::new(2),
+    ///     event: "42",
+    ///     metadata: Metadata::default(),
+    /// };
+    /// let typed = raw.try_map_event(str::parse::<u64>).expect("a number");
+    /// assert_eq!(typed.event, 42);
+    /// assert_eq!(typed.sequence, Sequence::new(7));
+    /// ```
+    pub fn try_map_event<T, Err>(
+        self,
+        f: impl FnOnce(E) -> Result<T, Err>,
+    ) -> Result<EventEnvelope<T>, Err> {
+        Ok(EventEnvelope {
+            sequence: self.sequence,
+            stream_id: self.stream_id,
+            version: self.version,
+            event: f(self.event)?,
+            metadata: self.metadata,
+        })
+    }
+}
+
 /// Correlation and causation metadata.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -57,6 +93,27 @@ impl Metadata {
         Self {
             causation_id,
             correlation_id,
+            ..Self::default()
+        }
+    }
+
+    /// Metadata as a store reads it back: the two ids and the
+    /// idempotency key, each from its own column. The timestamp, behind
+    /// the `time` feature, stays `None`; a store that records one sets it
+    /// after.
+    pub fn stored(
+        causation_id: Option<String>,
+        correlation_id: Option<String>,
+        idempotency_key: Option<String>,
+    ) -> Self {
+        #[allow(
+            clippy::needless_update,
+            reason = "no-op without the `time` field; required with it"
+        )]
+        Self {
+            causation_id,
+            correlation_id,
+            idempotency_key,
             ..Self::default()
         }
     }

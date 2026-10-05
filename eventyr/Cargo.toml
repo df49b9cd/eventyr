@@ -12,8 +12,9 @@ workspace = true
 
 [features]
 default = ["time", "macros", "store"]
-# Carries `Metadata::timestamp` through the re-exported core.
-time = ["eventyr-core/time"]
+# Carries `Metadata::timestamp` through the re-exported core — and
+# through the stores that populate it, when they are enabled.
+time = ["eventyr-core/time", "eventyr-store-postgres?/time"]
 # Re-exports the derive macros through the re-exported core.
 macros = ["eventyr-core/macros"]
 # Re-exports the store side: ports, in-memory store, driver, repository.
@@ -25,16 +26,33 @@ bus = ["subscription", "eventyr-subscription/bus"]
 # Re-exports the read-path layer: upcaster chains, raw→typed sources,
 # schema-versioned rebuilds.
 projection = ["subscription", "dep:eventyr-projection"]
-# The Postgres store, with its snapshot persistence enabled.
+# The Postgres store, and its snapshot persistence behind it.
 postgres = ["store", "dep:eventyr-store-postgres"]
-snapshots = ["postgres", "eventyr-store-postgres/snapshots"]
+postgres_snapshots = ["postgres", "eventyr-store-postgres/snapshots"]
+# The outdated name of `postgres_snapshots`: Postgres snapshots, not
+# shared ones. Kept working.
+snapshots = ["postgres_snapshots"]
 # The embedded store over fjall (no server, no runtime needed to drive).
 fjall = ["store", "dep:eventyr-store-fjall"]
+# Its snapshot store.
+fjall_snapshots = ["fjall", "eventyr-store-fjall/snapshots"]
 # The embedded store over SQLite — the contract suite's reference port.
 sqlite = ["store", "dep:eventyr-store-sqlite"]
 sqlite_snapshots = ["sqlite", "eventyr-store-sqlite/snapshots"]
 # SQLite's view store and inline views (0.7.3).
 sqlite_views = ["sqlite", "projection", "eventyr-store-sqlite/views"]
+# Crypto-shredding (0.7.6): `Sensitive` fields, the shredding store
+# wrapper, and the bring-your-own `Cipher` seam. Pick a cipher adapter:
+shred = ["store", "dep:eventyr-shred"]
+shred_aes_gcm = ["shred", "dep:eventyr-shred-aes-gcm"]
+shred_chacha = ["shred", "dep:eventyr-shred-chacha"]
+# SQLite's subject-key store for crypto-shredding.
+sqlite_shred = ["sqlite", "shred", "eventyr-store-sqlite/shred"]
+# SQLite's parked-event store for poison events (0.7.7).
+sqlite_parked = ["sqlite", "subscription", "eventyr-store-sqlite/parked"]
+# `eventyr-shred`'s parked-store wrapper: parked rejects reach the
+# store sealed (0.7.7 + 0.7.6).
+shred_parked = ["shred", "subscription", "eventyr-shred/parked"]
 # The `Metrics` port's tracing backend (0.5.3): store/projector drivers
 # report through it when this feature is on.
 metrics = ["store", "eventyr-store/tracing"]
@@ -47,11 +65,25 @@ eventyr-store-postgres = { workspace = true, optional = true }
 eventyr-store-sqlite = { workspace = true, optional = true }
 eventyr-subscription = { workspace = true, optional = true }
 eventyr-projection = { workspace = true, optional = true }
+eventyr-shred = { workspace = true, optional = true }
+eventyr-shred-aes-gcm = { workspace = true, optional = true }
+eventyr-shred-chacha = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Examples: the bank demo drives the async drivers and reads raw events.
-tokio = { version = "1", features = ["rt", "macros", "time"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
-futures = { version = "0.3", default-features = false }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
+futures.workspace = true
+
+# The bank runs the full shipped surface; the focused examples sit
+# behind exactly what they use, so `--all-targets` under default
+# features skips rather than fails them.
+[[example]]
+name = "bank"
+required-features = ["subscription", "projection", "shred_aes_gcm"]
+
+[[example]]
+name = "inline_view"
+required-features = ["sqlite_views"]
 

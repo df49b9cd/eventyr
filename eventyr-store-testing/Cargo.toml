@@ -10,11 +10,17 @@ keywords = ["event-sourcing", "event-store", "testing"]
 [lints]
 workspace = true
 
+[features]
+default = []
+# Serde derives on the fixture events (`PayloadEvent`, `ParityEvent`), so
+# durable stores can run the contracts on them.
+serde = ["dep:serde"]
+
 [dependencies]
 eventyr-core = { workspace = true }
 eventyr-store = { workspace = true }
-futures = { version = "0.3", default-features = false, features = ["alloc", "executor"] }
+futures = { workspace = true, features = ["executor"] }
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
 

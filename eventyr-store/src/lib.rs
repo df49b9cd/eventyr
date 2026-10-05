@@ -129,7 +129,8 @@ pub mod prelude {
     pub use crate::repository::{AggregateRepository, ExecutionError, ExecutionOutcome};
     pub use crate::snapshot_store::{InMemorySnapshotStore, SnapshotStore};
     pub use crate::store::{
-        EventFilter, EventStore, FilteredRead, QueryAppend, StreamsAll, append_batch_fallback,
-        expected_version_matches,
+        EventFilter, EventStore, FilteredRead, QueryAppend, StreamLifecycle, StreamsAll,
+        TruncatePlan, append_batch_fallback, expected_version_matches, plan_truncate,
+        read_starts_before_cut, sql_position, validate_batch,
     };
 }

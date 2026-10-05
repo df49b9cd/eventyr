@@ -37,6 +37,23 @@ pub(crate) fn assign_parsed<T: syn::parse::Parse>(
     Ok(true)
 }
 
+/// [`assign_parsed`] with a conversion: the attribute still reads
+/// `key = <T>` and lands in the slot as `U` (a restricted shape, e.g.
+/// `decide` takes a function path but not "any expression").
+pub(crate) fn assign_parsed_map<T: syn::parse::Parse, U>(
+    slot: &mut Option<U>,
+    key: &str,
+    map: impl FnOnce(T) -> U,
+    meta: &ParseNestedMeta<'_>,
+) -> Result<bool, Error> {
+    if !meta.path.is_ident(key) {
+        return Ok(false);
+    }
+    let value = map(meta.value()?.parse::<T>()?);
+    assign(slot, key, meta, value)?;
+    Ok(true)
+}
+
 /// The uniform `key = "..."` (string literal) arm — like
 /// [`assign_parsed`], but stores the literal's unquoted value.
 pub(crate) fn assign_parsed_lit(

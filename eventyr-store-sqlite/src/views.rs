@@ -20,7 +20,7 @@ use eventyr_core::vocabulary::Sequence;
 use eventyr_projection::inline::{InlineView, RowKey, StoredRow, fold_inline, rows_touched};
 use eventyr_projection::view::{ViewRow, ViewStore};
 
-use crate::{SqliteStore, SqliteStoreError};
+use crate::{SqliteStore, SqliteStoreError, lock_conn};
 
 pub(crate) const VIEWS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS views (
@@ -58,10 +58,8 @@ impl<V> SqliteViewStore<V> {
         }
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>, StoreError> {
-        self.conn
-            .lock()
-            .map_err(|e| StoreError::other(format!("view store lock poisoned: {e}")))
+    fn lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        lock_conn(&self.conn)
     }
 }
 
@@ -150,7 +148,7 @@ where
     V: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned,
 {
     async fn load(&self, view_name: &str, view_id: &str) -> Result<Option<ViewRow<V>>, StoreError> {
-        let Some(row) = load_row(&*self.lock()?, view_name, view_id)? else {
+        let Some(row) = load_row(&self.lock(), view_name, view_id)? else {
             return Ok(None);
         };
         let value = serde_json::from_value(row.payload).map_err(|error| {
@@ -172,7 +170,7 @@ where
     ) -> Result<(), StoreError> {
         let payload = serde_json::to_value(&row.value).map_err(SqliteStoreError::from)?;
         save_row(
-            &*self.lock()?,
+            &self.lock(),
             view_name,
             view_id,
             &StoredRow {

@@ -69,3 +69,17 @@ pub use eventyr_store_fjall as fjall;
 /// `sqlite_snapshots` for its snapshot store).
 #[cfg(feature = "sqlite")]
 pub use eventyr_store_sqlite as sqlite;
+
+/// Crypto-shredding (0.7.6): personal fields encrypted per data subject
+/// and erased by deleting the subject's key — behind `shred`.
+#[cfg(feature = "shred")]
+pub use eventyr_shred as shred;
+
+/// The AES-256-GCM cipher adapter for [`shred`], behind `shred_aes_gcm`.
+#[cfg(feature = "shred_aes_gcm")]
+pub use eventyr_shred_aes_gcm as shred_aes_gcm;
+
+/// The XChaCha20-Poly1305 cipher adapter for [`shred`], behind
+/// `shred_chacha`.
+#[cfg(feature = "shred_chacha")]
+pub use eventyr_shred_chacha as shred_chacha;
