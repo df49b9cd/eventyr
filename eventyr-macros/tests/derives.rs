@@ -388,3 +388,83 @@ fn the_umbrella_crate_retarget_resolves() {
         "ItemAdded"
     );
 }
+
+/// A stored aggregate's event enum: serde-style derives and a container
+/// attribute through `event_derive(...)` and `event_attr(...)`.
+mod storable {
+    use super::*;
+
+    /// A domain event payload.
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    pub struct Noted {
+        pub note: String,
+    }
+
+    #[derive(Debug)]
+    pub struct AddNote(pub String);
+
+    #[derive(Debug, PartialEq)]
+    pub struct Never;
+    impl fmt::Display for Never {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("never")
+        }
+    }
+
+    #[derive(Debug, Default)]
+    pub struct Notes {
+        pub notes: Vec<String>,
+    }
+
+    pub fn fold(state: &mut Notes, event: &NoteEvent) {
+        match event {
+            NoteEvent::Noted(Noted { note }) => state.notes.push(note.clone()),
+        }
+    }
+
+    pub fn decide_add(_state: &Notes, command: &AddNote) -> Result<Vec<NoteEvent>, Never> {
+        Ok(vec![
+            Noted {
+                note: command.0.clone(),
+            }
+            .into(),
+        ])
+    }
+
+    #[derive(Aggregate)]
+    #[eventyr(
+        id = TestId,
+        state = Notes,
+        command = AddNote,
+        error = Never,
+        apply = fold,
+        decide = decide_add,
+        // Stored as JSON with the variant name in "kind": the
+        // event_derive/event_attr surface exists for exactly this — a
+        // store or a shred pipeline's serde needs.
+        event_enum = NoteEvent,
+        events(Noted),
+        event_derive(serde::Serialize, serde::Deserialize),
+        event_attr("#[serde(tag = \"kind\")]"),
+    )]
+    pub struct Ledger;
+}
+
+#[test]
+fn the_event_enum_takes_extra_derives_and_attributes() {
+    use eventyr_core::aggregate::Aggregate as _;
+    use storable::*;
+
+    assert_eq!(Ledger::NAME, "ledger");
+    // Decide and apply run against the enum under its serde shape.
+    let event: NoteEvent = Ledger::decide(&Notes::default(), &AddNote("hello".to_owned()))
+        .expect("decide")
+        .remove(0);
+    let json = serde_json::to_string(&event).expect("serialize");
+    assert_eq!(json, r#"{"kind":"Noted","note":"hello"}"#);
+    let back: NoteEvent = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, event);
+    let mut state = Notes::default();
+    Ledger::apply(&mut state, &back);
+    assert_eq!(state.notes, ["hello"]);
+}

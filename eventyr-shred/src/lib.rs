@@ -42,21 +42,42 @@
 //! reads fields with [`Sensitive::get`] or [`Sensitive::or`], so erasure
 //! is a value it handles, never an error that stops a rebuild.
 //!
+//! Two features shape the crate: `zeroize` wipes key bytes on drop (the
+//! cipher adapters enable it), and `aead` shares the adapters' cipher
+//! implementation ([`aead::AeadCipher`]); `testing` exports the
+//! contracts for adapter and key store tests.
+//!
 //! Erasure covers the event log. Anything that copied personal data out
-//! of it — a snapshot of folded state, a view row, a log line — holds it
-//! in the clear and must be cleared too: delete the subject's snapshots
-//! and rebuild or delete their view rows after [`Shredder::erase`].
+//! of it — a snapshot of folded state, a view row, a *parked* event
+//! (0.7.7: the poison events a projection gave up on, envelope kept for
+//! replay), a log line — holds it in the clear and must be cleared too.
+//! Wrap the parked store in
+//! [`ShreddingParkedStore`] (the `parked`
+//! feature) so rejects reach it sealed, and note that a parked record's
+//! *rejection text*
+//! ([`ParkedEvent::error`](eventyr_subscription::parked::ParkedEvent::error),
+//! what the projection said about the event) may itself quote personal
+//! data. After [`Shredder::erase`], delete the subject's snapshots,
+//! rebuild or delete their view rows, and mind those rejection logs.
 
+#[cfg(feature = "aead")]
+pub mod aead;
 mod cipher;
+#[cfg(any(test, feature = "testing"))]
 mod contract;
 mod keys;
+#[cfg(feature = "parked")]
+mod parked;
 mod sensitive;
 mod shredder;
 mod store;
 
 pub use cipher::{Cipher, CipherError, SubjectKey};
+#[cfg(any(test, feature = "testing"))]
 pub use contract::{cipher_contract, key_store_contract};
 pub use keys::{InMemoryKeyStore, KeyStore};
+#[cfg(feature = "parked")]
+pub use parked::ShreddingParkedStore;
 pub use sensitive::{Sealed, Sensitive};
 pub use shredder::{ShredError, Shredder};
 pub use store::ShreddingStore;

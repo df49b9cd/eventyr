@@ -2,11 +2,16 @@
 //!
 //! XChaCha20-Poly1305 for [`eventyr_shred`]: 256-bit subject keys, a
 //! random 192-bit nonce per field, and the subject bound as associated
-//! data.
+//! data — [`AeadCipher`] pinned to
+//! this algorithm.
 //!
 //! A sealed field stores `nonce ‖ ciphertext ‖ tag`. The 192-bit nonce
 //! makes random nonces safe at any realistic volume, and the cipher is
 //! fast without AES hardware.
+//!
+//! There is no algorithm-generic API here on purpose: `eventyr-shred`'s
+//! `aead` feature owns the shared code, and this crate is the auditable
+//! pin.
 //!
 //! ```
 //! use eventyr_shred::Cipher;
@@ -19,35 +24,26 @@
 //! # Ok::<(), eventyr_shred::CipherError>(())
 //! ```
 
-use chacha20poly1305::aead::{Aead, Generate, Key, KeyInit, Payload};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce as Nonce};
+use chacha20poly1305::XChaCha20Poly1305;
+use eventyr_shred::aead::AeadCipher;
 use eventyr_shred::{Cipher, CipherError, SubjectKey};
 
 /// The XChaCha20-Poly1305 [`Cipher`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct XChaCha20Poly1305Cipher;
 
-/// Nonce length in bytes.
-const NONCE: usize = 24;
-
-fn engine(key: &SubjectKey) -> Result<XChaCha20Poly1305, CipherError> {
-    XChaCha20Poly1305::new_from_slice(key.as_bytes()).map_err(|_| {
-        CipherError(format!(
-            "an XChaCha20 key is 32 bytes, not {}",
-            key.as_bytes().len()
-        ))
-    })
-}
+/// The shared implementation: both algorithm adapters are this const,
+/// over their algorithm.
+const XCHACHA20_POLY1305: AeadCipher<XChaCha20Poly1305> =
+    AeadCipher::new("xchacha20-poly1305", "256-bit");
 
 impl Cipher for XChaCha20Poly1305Cipher {
     fn algorithm(&self) -> &'static str {
-        "xchacha20-poly1305"
+        XCHACHA20_POLY1305.algorithm()
     }
 
     fn generate_key(&self) -> Result<SubjectKey, CipherError> {
-        let key = Key::<XChaCha20Poly1305>::try_generate()
-            .map_err(|e| CipherError(format!("random source: {e}")))?;
-        Ok(SubjectKey::from_bytes(key.to_vec()))
+        XCHACHA20_POLY1305.generate_key()
     }
 
     fn encrypt(
@@ -56,22 +52,7 @@ impl Cipher for XChaCha20Poly1305Cipher {
         plaintext: &[u8],
         aad: &[u8],
     ) -> Result<Vec<u8>, CipherError> {
-        let engine = engine(key)?;
-        let nonce =
-            Nonce::try_generate().map_err(|e| CipherError(format!("random source: {e}")))?;
-        let sealed = engine
-            .encrypt(
-                &nonce,
-                Payload {
-                    msg: plaintext,
-                    aad,
-                },
-            )
-            .map_err(|_| CipherError("encryption failed".into()))?;
-        let mut out = Vec::with_capacity(NONCE + sealed.len());
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&sealed);
-        Ok(out)
+        XCHACHA20_POLY1305.encrypt(key, plaintext, aad)
     }
 
     fn decrypt(
@@ -80,15 +61,7 @@ impl Cipher for XChaCha20Poly1305Cipher {
         ciphertext: &[u8],
         aad: &[u8],
     ) -> Result<Vec<u8>, CipherError> {
-        let engine = engine(key)?;
-        if ciphertext.len() < NONCE {
-            return Err(CipherError("ciphertext shorter than its nonce".into()));
-        }
-        let (nonce, sealed) = ciphertext.split_at(NONCE);
-        let nonce = Nonce::try_from(nonce).map_err(|_| CipherError("bad nonce".into()))?;
-        engine
-            .decrypt(&nonce, Payload { msg: sealed, aad })
-            .map_err(|_| CipherError("authentication failed".into()))
+        XCHACHA20_POLY1305.decrypt(key, ciphertext, aad)
     }
 }
 

@@ -10,7 +10,7 @@ use crate::keys::KeyStore;
 pub fn cipher_contract<C: Cipher>(cipher: &C) {
     let key = cipher.generate_key().expect("generate a key");
     let other = cipher.generate_key().expect("generate another key");
-    assert_ne!(key, other, "two generated keys are distinct");
+    assert!(!key.same_bytes(&other), "two generated keys are distinct");
 
     let plaintext = b"ada@example.com";
     let sealed = cipher.encrypt(&key, plaintext, b"c-1").expect("encrypt");
@@ -82,50 +82,49 @@ pub fn key_store_contract<K: KeyStore>(make_store: impl Fn() -> K) {
     use futures::executor::block_on;
 
     let key = |byte| SubjectKey::from_bytes(vec![byte; 32]);
+    let some = |found: Option<SubjectKey>, expected: u8| {
+        let found = found.expect("Some");
+        let expected = key(expected);
+        assert!(found.same_bytes(&expected), "the key round-trips");
+    };
 
     let store = make_store();
-    assert_eq!(
-        block_on(store.load("s-1")).expect("load"),
-        None,
+    assert!(
+        block_on(store.load("s-1")).expect("load").is_none(),
         "no key yet"
     );
-    assert_eq!(
-        block_on(store.create("s-1", key(1))).expect("create"),
-        Some(key(1)),
-        "create stores the key"
-    );
-    assert_eq!(block_on(store.load("s-1")).expect("load"), Some(key(1)));
-    assert_eq!(
+    some(block_on(store.create("s-1", key(1))).expect("create"), 1);
+    some(block_on(store.load("s-1")).expect("load"), 1);
+    some(
         block_on(store.create("s-1", key(2))).expect("create again"),
-        Some(key(1)),
-        "a second create keeps the first key (two racing writers agree)"
+        1,
     );
-    assert_eq!(
-        block_on(store.load("s-2")).expect("load"),
-        None,
+    assert!(
+        block_on(store.load("s-2")).expect("load").is_none(),
         "keys are per subject"
     );
 
     block_on(store.delete("s-1")).expect("delete");
-    assert_eq!(
-        block_on(store.load("s-1")).expect("load"),
-        None,
+    assert!(
+        block_on(store.load("s-1")).expect("load").is_none(),
         "the key is gone"
     );
-    assert_eq!(
-        block_on(store.create("s-1", key(3))).expect("create after delete"),
-        None,
+    assert!(
+        block_on(store.create("s-1", key(3)))
+            .expect("create after delete")
+            .is_none(),
         "an erased subject cannot get a new key"
     );
-    assert_eq!(block_on(store.load("s-1")).expect("load"), None);
+    assert!(block_on(store.load("s-1")).expect("load").is_none());
     block_on(store.delete("s-1")).expect("delete is idempotent");
 
     // Erasing a subject that never had a key still bars it.
     let store = make_store();
     block_on(store.delete("s-9")).expect("delete unknown");
-    assert_eq!(
-        block_on(store.create("s-9", key(4))).expect("create"),
-        None,
+    assert!(
+        block_on(store.create("s-9", key(4)))
+            .expect("create")
+            .is_none(),
         "erasure before first use still holds"
     );
 }

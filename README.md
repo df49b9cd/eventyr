@@ -30,9 +30,9 @@ user-implementable trait), no ORM, no DDD toolkit.
 | `eventyr-shred-aes-gcm` / `eventyr-shred-chacha` | Cipher adapters for `eventyr-shred`: AES-256-GCM and XChaCha20-Poly1305 | shipped |
 | `eventyr-store-testing` | The store contract: `event_store_contract` / `streams_all_contract` / `snapshot_contract` / `query_append_contract` / `commit_signal_contract` / `filtered_read_contract` / `lifecycle_contract`, self-tested against the in-memory store | shipped |
 
-Postgres persistence is a standalone crate today; the umbrella pulls it in
-as its own feature. The embedded store arrives as `eventyr-store-fjall`,
-also behind its own umbrella feature.
+Postgres persistence is a standalone crate the umbrella pulls in as its
+own feature; the embedded stores (`eventyr-store-fjall`,
+`eventyr-store-sqlite`) likewise.
 
 ## Umbrella features
 
@@ -44,7 +44,11 @@ also behind its own umbrella feature.
 | `subscription` | no | `eventyr::subscription` — `Projection`, `Projector`, checkpoint store |
 | `bus` | no | `subscription` + the `EventBus` live-push trait |
 | `projection` | no | `subscription` + `eventyr::projection` — upcaster chains, rebuilds |
-| `fjall` | no | `eventyr::fjall` — the embedded store |
+| `postgres` | no | `eventyr::postgres` — the Postgres store (`postgres_snapshots` adds its `SnapshotStore`; the old `snapshots` name is the same thing) |
+| `fjall` | no | `eventyr::fjall` — the embedded store (`fjall_snapshots` adds its snapshot store) |
+| `sqlite` | no | `eventyr::sqlite` — the embedded SQLite store; `sqlite_snapshots`, `sqlite_views`, `sqlite_shred`, `sqlite_parked` for its substores |
+| `shred` | no | `eventyr::shred` — crypto-shredding; pick a cipher with `shred_aes_gcm` / `shred_chacha`, and `shred_parked` seals parked events |
+| `metrics` | no | the `Metrics` port's tracing backend |
 
 ## A taste
 

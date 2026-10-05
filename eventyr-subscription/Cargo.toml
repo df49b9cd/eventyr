@@ -14,6 +14,9 @@ workspace = true
 default = []
 # The §6 Subscription / §2 EventBus seam: ship as transport adapters land (0.3).
 bus = []
+# Exports `parked_store_contract`, for parked-store implementations'
+# tests. Not for production builds.
+testing = []
 
 [dependencies]
 eventyr-core = { workspace = true, features = ["std"] }
@@ -21,4 +24,4 @@ eventyr-store = { workspace = true }
 futures = { version = "0.3", default-features = false, features = ["alloc", "executor"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }

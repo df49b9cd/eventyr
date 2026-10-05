@@ -23,8 +23,8 @@ use eventyr::prelude::*;
 use eventyr::projection::prelude::{ClosureUpcaster, UpcasterChain};
 use eventyr::store::prelude::*;
 use eventyr::subscription::prelude::{
-    InMemoryCheckpointStore, Projection, StoreSubscription, SubscriptionOutcome,
-    drive_projector_with_metrics,
+    DriverPorts, InMemoryCheckpointStore, Projection, StoreSubscription, SubscriptionOutcome,
+    drive_projector,
 };
 
 // -- the domain -----------------------------------------------------
@@ -329,7 +329,7 @@ async fn run() {
     let ledger = Ledger {
         balances: balances.clone(),
     };
-    let outcome = drive_projector_with_metrics(
+    let outcome = drive_projector(
         &mut SubscriptionMachine::new(
             eventyr::prelude::SubscriptionPolicy::default().stop_at_catch_up(),
             eventyr::prelude::Checkpoint::ORIGIN,
@@ -339,7 +339,7 @@ async fn run() {
         &InMemoryCheckpointStore::new(),
         ledger,
         |duration| async move { tokio::time::sleep(duration).await },
-        &eventyr::store::metrics::NoopMetrics,
+        DriverPorts::new().with_metrics(&eventyr::store::metrics::NoopMetrics),
     )
     .await;
     assert!(matches!(outcome, SubscriptionOutcome::CaughtUp { .. }));

@@ -7,11 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use eventyr_core::envelope::{EventEnvelope, Metadata, NewEvent};
 use eventyr_core::error::StoreError;
-use eventyr_core::subscription::{
-    Batch, Checkpoint, SubscriptionAction, SubscriptionInput, SubscriptionMachine,
-    SubscriptionOutcome, SubscriptionPolicy,
-};
-use eventyr_core::testing::projector_scripted;
+use eventyr_core::subscription::{Batch, Checkpoint, SubscriptionOutcome, SubscriptionPolicy};
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 use eventyr_store::memory::InMemoryStore;
 use eventyr_store::store::EventStore;
@@ -152,139 +148,6 @@ async fn names_are_scoped_across_projections() {
             "each projection resumed its own position"
         );
     }
-}
-
-// -- scripted driver: the failure paths a real store can't reach --------
-
-type Scripted = Vec<SubscriptionAction<u64>>;
-
-fn machine() -> SubscriptionMachine<u64> {
-    SubscriptionMachine::new(SubscriptionPolicy::default(), Checkpoint::ORIGIN)
-}
-
-#[test]
-fn apply_failed_redelivers_the_whole_batch() {
-    let mut m = machine();
-    let actions: Scripted = projector_scripted(
-        &mut m,
-        vec![
-            SubscriptionInput::Fetched {
-                batch: Batch::new(
-                    vec![envelope(1, 10), envelope(2, 20)],
-                    Some(Checkpoint::new(Sequence::new(2))),
-                ),
-            },
-            SubscriptionInput::Applied, // applied 1
-            SubscriptionInput::ApplyFailed {
-                error: StoreError::other("boom"),
-            }, // failed 2
-            SubscriptionInput::Slept,
-            SubscriptionInput::Fetched {
-                batch: Batch::new(
-                    vec![envelope(1, 10), envelope(2, 20)],
-                    Some(Checkpoint::new(Sequence::new(2))),
-                ),
-            },
-            SubscriptionInput::Applied, // re-applied 1
-        ],
-    );
-    // Backoff evidence: after ApplyFailed the machine drops the pending
-    // batch and sleeps `retry_sleep` before re-fetching. The sequence is
-    // Fetch[0] → Apply(1)[1] → Apply(2)[2] → (ApplyFailed) Sleep[3].
-    assert!(matches!(
-        actions[3],
-        SubscriptionAction::Sleep { for_, .. } if for_ == SubscriptionPolicy::default().retry_sleep
-    ));
-    assert!(matches!(
-        actions.last(),
-        Some(SubscriptionAction::Apply { envelope })
-            if envelope.sequence == Sequence::new(2)
-    ));
-    // The checkpoint is still at the origin: only events ≤ it count as
-    // durable, so both events redelivered.
-    assert_eq!(m.checkpoint(), Checkpoint::ORIGIN);
-}
-
-#[test]
-fn ack_failed_redelivers_the_whole_batch() {
-    let mut m = machine();
-    let actions: Scripted = projector_scripted(
-        &mut m,
-        vec![
-            SubscriptionInput::Fetched {
-                batch: Batch::new(
-                    vec![envelope(1, 10)],
-                    Some(Checkpoint::new(Sequence::new(1))),
-                ),
-            },
-            SubscriptionInput::Applied,
-            SubscriptionInput::AckFailed {
-                error: StoreError::Unavailable,
-            },
-            SubscriptionInput::Slept,
-            SubscriptionInput::Fetched {
-                batch: Batch::new(
-                    vec![envelope(1, 10)],
-                    Some(Checkpoint::new(Sequence::new(1))),
-                ),
-            },
-        ],
-    );
-    assert!(matches!(
-        actions.last(),
-        Some(SubscriptionAction::Apply { envelope })
-            if envelope.event == 10
-    ));
-    assert_eq!(m.checkpoint(), Checkpoint::ORIGIN);
-}
-
-#[test]
-fn an_idle_poll_stops_at_the_catch_up_policy() {
-    let mut m = SubscriptionMachine::<u64>::new(
-        SubscriptionPolicy::default().stop_at_catch_up(),
-        Checkpoint::new(Sequence::new(5)),
-    );
-    let actions = projector_scripted(
-        &mut m,
-        vec![SubscriptionInput::Fetched {
-            batch: Batch::empty(),
-        }],
-    );
-    assert!(matches!(
-        actions.last(),
-        Some(SubscriptionAction::Done(SubscriptionOutcome::CaughtUp { checkpoint }))
-            if *checkpoint == Checkpoint::new(Sequence::new(5))
-    ));
-}
-
-#[test]
-fn shutdown_during_idle_drains_a_final_poll() {
-    let mut m = machine();
-    let actions = projector_scripted(
-        &mut m,
-        vec![
-            SubscriptionInput::Fetched {
-                batch: Batch::new(
-                    vec![envelope(1, 1)],
-                    Some(Checkpoint::new(Sequence::new(1))),
-                ),
-            },
-            SubscriptionInput::Applied,
-            SubscriptionInput::Acked,
-            SubscriptionInput::Fetched {
-                batch: Batch::empty(),
-            },
-            SubscriptionInput::Shutdown,
-            SubscriptionInput::Fetched {
-                batch: Batch::empty(),
-            },
-        ],
-    );
-    assert!(matches!(
-        actions.last(),
-        Some(SubscriptionAction::Done(SubscriptionOutcome::Stopped { checkpoint }))
-            if *checkpoint == Checkpoint::new(Sequence::new(1))
-    ));
 }
 
 // -- pagination & mid-batch errors through the real runner ----------------
@@ -487,18 +350,24 @@ async fn without_a_signal_an_idle_projector_waits_out_its_sleep() {
 }
 
 /// A backoff is not cut short by commits: a failing projection is
-/// retried on its schedule, not hammered on every write.
-#[tokio::test]
+/// retried on its schedule, not hammered on every write. Paused time:
+/// the clock only moves when every task is waiting, so "not within
+/// 300 ms" is exact, and the hour-long backoff ends when the test waits
+/// for it.
+#[tokio::test(start_paused = true)]
 async fn a_commit_does_not_cut_a_backoff_short() {
     use std::time::Duration;
 
-    struct FailOnce(Arc<Mutex<Vec<u64>>>, bool);
+    struct FailOnce(
+        Arc<Mutex<Vec<u64>>>,
+        Option<tokio::sync::oneshot::Sender<()>>,
+    );
     impl Projection for FailOnce {
         type Event = u64;
         type Error = &'static str;
         async fn apply(&mut self, event: &EventEnvelope<u64>) -> Result<(), Self::Error> {
-            if !self.1 {
-                self.1 = true;
+            if let Some(failed) = self.1.take() {
+                let _ = failed.send(());
                 return Err("first apply fails");
             }
             self.0
@@ -512,11 +381,12 @@ async fn a_commit_does_not_cut_a_backoff_short() {
     let store = Arc::new(InMemoryStore::new());
     populate(&store, &[10]).await;
     let seen = Arc::new(Mutex::new(Vec::new()));
+    let (failed, first_failure) = tokio::sync::oneshot::channel();
     let projector = Projector::new(
         "backoff",
         StoreSubscription::new(Arc::clone(&store)),
         InMemoryCheckpointStore::new(),
-        FailOnce(seen.clone(), false),
+        FailOnce(seen.clone(), Some(failed)),
     )
     .with_policy(SubscriptionPolicy::new(
         64,
@@ -526,8 +396,8 @@ async fn a_commit_does_not_cut_a_backoff_short() {
     .wake_on(Arc::clone(&store));
     let run = tokio::spawn(projector.run_woken(tokio::time::sleep));
 
-    // The first apply failed; the projector is in a one-hour backoff.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The first apply failed; the projector backs off for an hour.
+    first_failure.await.expect("the projection failed once");
     store
         .append(
             &StreamId::from("account-2"),
@@ -542,6 +412,9 @@ async fn a_commit_does_not_cut_a_backoff_short() {
             .is_err(),
         "the backoff ran its course despite the commit"
     );
+    // Once the hour is up the projector retries and catches up.
+    wait_until(&seen, 2).await;
+    assert_eq!(*seen.lock().expect("poisoned"), vec![1, 2]);
     run.abort();
 }
 
@@ -841,25 +714,33 @@ async fn a_poison_event_is_parked_listed_and_replayed() {
     assert!(seen.lock().expect("poisoned").contains(&13));
 }
 
-#[tokio::test]
+/// The default halts: the projector rejects 13 again and again and
+/// its checkpoint never passes the event before it.
+#[tokio::test(start_paused = true)]
 async fn without_parking_a_poison_event_stalls_the_projector() {
-    struct Never;
+    /// Rejects 13, reporting each rejection's sequence.
+    struct Never(tokio::sync::mpsc::UnboundedSender<u64>);
     impl Projection for Never {
         type Event = u64;
         type Error = &'static str;
         async fn apply(&mut self, event: &EventEnvelope<u64>) -> Result<(), &'static str> {
-            if event.event == 13 { Err("no") } else { Ok(()) }
+            if event.event != 13 {
+                return Ok(());
+            }
+            let _ = self.0.send(event.sequence.as_u64());
+            Err("no")
         }
     }
     let store = Arc::new(InMemoryStore::new());
     populate(&store, &[11, 13, 15]).await;
     let checkpoints = Arc::new(InMemoryCheckpointStore::new());
+    let (rejected, mut rejections) = tokio::sync::mpsc::unbounded_channel();
     let run = tokio::spawn(
         Projector::new(
             "stalled",
             StoreSubscription::new(Arc::clone(&store)),
             Arc::clone(&checkpoints),
-            Never,
+            Never(rejected),
         )
         .with_policy(
             SubscriptionPolicy::new(
@@ -871,7 +752,10 @@ async fn without_parking_a_poison_event_stalls_the_projector() {
         )
         .run(tokio::time::sleep),
     );
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Many redeliveries, every one of them the same event.
+    for _ in 0..20 {
+        assert_eq!(rejections.recv().await, Some(2), "13 is redelivered");
+    }
     assert!(
         !run.is_finished(),
         "halting: the projector never gets past 13"
@@ -883,4 +767,189 @@ async fn without_parking_a_poison_event_stalls_the_projector() {
         Checkpoint::new(Sequence::new(1))
     );
     run.abort();
+}
+
+/// Counts every counter it is given, by name.
+#[derive(Default)]
+struct Counters(Mutex<std::collections::BTreeMap<&'static str, u64>>);
+
+impl Counters {
+    fn get(&self, name: &str) -> u64 {
+        self.0
+            .lock()
+            .expect("poisoned")
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+impl eventyr_store::metrics::Metrics for Counters {
+    fn counter(&self, name: &'static str, by: u64) {
+        *self.0.lock().expect("poisoned").entry(name).or_default() += by;
+    }
+    fn gauge(&self, _: &'static str, _: u64) {}
+    fn histogram(&self, _: &'static str, _: std::time::Duration) {}
+}
+
+impl eventyr_store::metrics::Metrics for &'static Counters {
+    fn counter(&self, name: &'static str, by: u64) {
+        (**self).counter(name, by);
+    }
+    fn gauge(&self, _: &'static str, _: u64) {}
+    fn histogram(&self, _: &'static str, _: std::time::Duration) {}
+}
+
+/// Rejects every 13.
+struct NoThirteen;
+impl Projection for NoThirteen {
+    type Event = u64;
+    type Error = &'static str;
+    async fn apply(&mut self, event: &EventEnvelope<u64>) -> Result<(), &'static str> {
+        if event.event == 13 { Err("no") } else { Ok(()) }
+    }
+}
+
+/// The projector reports through the metrics it is given, so the parked
+/// counter — the one to alert on — fires through the bundled runner.
+#[tokio::test]
+async fn a_projector_reports_parks_through_its_metrics() {
+    use eventyr_store::metrics::names::{PARKED_EVENTS, PROJECTED_EVENTS};
+
+    let store = Arc::new(InMemoryStore::new());
+    populate(&store, &[11, 13, 15]).await;
+    let counters: &'static Counters = Box::leak(Box::default());
+    let outcome = Projector::new(
+        "counted",
+        StoreSubscription::new(Arc::clone(&store)),
+        InMemoryCheckpointStore::new(),
+        NoThirteen,
+    )
+    .with_policy(
+        SubscriptionPolicy::new(64, std::time::Duration::ZERO, std::time::Duration::ZERO)
+            .stop_at_catch_up(),
+    )
+    .park_into(
+        InMemoryParkedStore::new(),
+        FailurePolicy::Park { retries: 0 },
+    )
+    .with_metrics(counters)
+    .run(|_| future::ready(()))
+    .await
+    .expect("run");
+
+    assert!(matches!(outcome, SubscriptionOutcome::CaughtUp { .. }));
+    assert_eq!(counters.get(PARKED_EVENTS), 1);
+    assert_eq!(counters.get(PROJECTED_EVENTS), 2);
+}
+
+/// A parking policy with nowhere to park is refused up front, not
+/// retried forever against `NoParking`.
+#[tokio::test]
+async fn a_parking_policy_without_a_parked_store_refuses_to_run() {
+    let store = Arc::new(InMemoryStore::new());
+    populate(&store, &[11, 13]).await;
+    let refused = Projector::new(
+        "misconfigured",
+        StoreSubscription::new(Arc::clone(&store)),
+        InMemoryCheckpointStore::new(),
+        NoThirteen,
+    )
+    .with_policy(
+        SubscriptionPolicy::default()
+            .stop_at_catch_up()
+            .on_failure(FailurePolicy::Park { retries: 0 }),
+    )
+    .run(|_| future::ready(()))
+    .await;
+
+    let Err(error) = refused else {
+        panic!("expected a refusal, got {refused:?}");
+    };
+    assert!(error.to_string().contains("park_into"), "{error}");
+}
+
+/// Driven directly, a park the store refuses — here `NoParking` — is
+/// counted, so a stalled projection shows up on a dashboard.
+#[tokio::test(start_paused = true)]
+async fn a_refused_park_is_counted() {
+    use eventyr_core::subscription::SubscriptionMachine;
+    use eventyr_store::metrics::names::{PARK_FAILURES, PARKED_EVENTS};
+
+    let store = Arc::new(InMemoryStore::new());
+    populate(&store, &[11, 13]).await;
+    let counters: &'static Counters = Box::leak(Box::default());
+    let mut machine = SubscriptionMachine::new(
+        SubscriptionPolicy::new(
+            64,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(1),
+        )
+        .on_failure(FailurePolicy::Park { retries: 0 }),
+        Checkpoint::ORIGIN,
+    );
+    let source = StoreSubscription::new(Arc::clone(&store));
+    let checkpoints = InMemoryCheckpointStore::new();
+    let run = drive_projector(
+        &mut machine,
+        "refused",
+        &source,
+        &checkpoints,
+        NoThirteen,
+        tokio::time::sleep,
+        DriverPorts::new().with_metrics(counters),
+    );
+    // Three backoffs' worth of virtual time, then give up on the run.
+    let timed_out = tokio::time::timeout(std::time::Duration::from_millis(3_500), run).await;
+
+    assert!(timed_out.is_err(), "the projector is stalled on 13");
+    assert_eq!(counters.get(PARK_FAILURES), 4, "one refused park per try");
+    assert_eq!(counters.get(PARKED_EVENTS), 0);
+}
+
+/// A failed checkpoint write is counted and the batch redelivered.
+#[tokio::test]
+async fn a_failed_ack_is_counted() {
+    use eventyr_store::metrics::names::ACK_FAILURES;
+
+    /// Fails the first `store`.
+    struct FlakyOnce {
+        inner: InMemoryCheckpointStore,
+        failed: std::sync::atomic::AtomicBool,
+    }
+    impl CheckpointStore for FlakyOnce {
+        async fn load(&self, name: &str) -> Result<Checkpoint, StoreError> {
+            self.inner.load(name).await
+        }
+        async fn store(&self, name: &str, checkpoint: Checkpoint) -> Result<(), StoreError> {
+            if !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Unavailable);
+            }
+            self.inner.store(name, checkpoint).await
+        }
+    }
+
+    let store = Arc::new(InMemoryStore::new());
+    populate(&store, &[10]).await;
+    let counters: &'static Counters = Box::leak(Box::default());
+    let outcome = Projector::new(
+        "flaky",
+        StoreSubscription::new(Arc::clone(&store)),
+        FlakyOnce {
+            inner: InMemoryCheckpointStore::new(),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        },
+        Seen::default(),
+    )
+    .with_policy(
+        SubscriptionPolicy::new(64, std::time::Duration::ZERO, std::time::Duration::ZERO)
+            .stop_at_catch_up(),
+    )
+    .with_metrics(counters)
+    .run(|_| future::ready(()))
+    .await
+    .expect("run");
+
+    assert!(matches!(outcome, SubscriptionOutcome::CaughtUp { .. }));
+    assert_eq!(counters.get(ACK_FAILURES), 1);
 }

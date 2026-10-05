@@ -186,6 +186,37 @@ fn a_field_moved_to_another_subject_fails_to_open() {
 }
 
 #[test]
+fn a_failed_open_redacts_the_plaintext_from_its_error() {
+    // A ciphertext that authenticates but is not JSON: the open fails
+    // *after* decryption, and the error must say where and of what
+    // kind, never what it decrypted to.
+    use base64::Engine as _;
+    use eventyr_shred::{Cipher as _, KeyStore as _};
+
+    let keys = InMemoryKeyStore::new();
+    let key = SubjectKey::from_bytes(vec![3; 4]);
+    block_on(keys.create("c-1", key.clone())).expect("create");
+    let shredder = Arc::new(Shredder::new(Toy, keys));
+    let ciphertext = Toy.encrypt(&key, b"[not json", b"c-1").expect("encrypt");
+    let event: CustomerEvent = serde_json::from_value(serde_json::json!({
+        "Registered": {
+            "id": "c-1",
+            "customer": "c-1",
+            "email": {
+                "$sensitive": "sealed",
+                "algorithm": "toy",
+                "subject": "c-1",
+                "ciphertext": base64::engine::general_purpose::STANDARD.encode(ciphertext),
+            },
+        }
+    }))
+    .expect("parse");
+    let error = format!("{}", block_on(shredder.open(event)).expect_err("not JSON"));
+    assert!(!error.contains("not json"), "{error}");
+    assert!(error.contains("line"), "{error}");
+}
+
+#[test]
 fn events_without_sensitive_fields_pass_through() {
     let shredder = shredder();
     let order = CustomerEvent::Ordered {
