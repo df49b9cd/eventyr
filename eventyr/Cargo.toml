@@ -35,6 +35,13 @@ sqlite = ["store", "dep:eventyr-store-sqlite"]
 sqlite_snapshots = ["sqlite", "eventyr-store-sqlite/snapshots"]
 # SQLite's view store and inline views (0.7.3).
 sqlite_views = ["sqlite", "projection", "eventyr-store-sqlite/views"]
+# Crypto-shredding (0.7.6): `Sensitive` fields, the shredding store
+# wrapper, and the bring-your-own `Cipher` seam. Pick a cipher adapter:
+shred = ["store", "dep:eventyr-shred"]
+shred_aes_gcm = ["shred", "dep:eventyr-shred-aes-gcm"]
+shred_chacha = ["shred", "dep:eventyr-shred-chacha"]
+# SQLite's subject-key store for crypto-shredding.
+sqlite_shred = ["sqlite", "shred", "eventyr-store-sqlite/shred"]
 # The `Metrics` port's tracing backend (0.5.3): store/projector drivers
 # report through it when this feature is on.
 metrics = ["store", "eventyr-store/tracing"]
@@ -47,6 +54,9 @@ eventyr-store-postgres = { workspace = true, optional = true }
 eventyr-store-sqlite = { workspace = true, optional = true }
 eventyr-subscription = { workspace = true, optional = true }
 eventyr-projection = { workspace = true, optional = true }
+eventyr-shred = { workspace = true, optional = true }
+eventyr-shred-aes-gcm = { workspace = true, optional = true }
+eventyr-shred-chacha = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Examples: the bank demo drives the async drivers and reads raw events.

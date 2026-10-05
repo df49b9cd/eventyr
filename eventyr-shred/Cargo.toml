@@ -1,0 +1,22 @@
+[package]
+name = "eventyr-shred"
+description = "Crypto-shredding for eventyr: personal fields encrypted per data subject, erased by deleting the subject's key."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["event-sourcing", "gdpr", "crypto-shredding", "encryption"]
+
+[lints]
+workspace = true
+
+[dependencies]
+eventyr-core = { workspace = true, features = ["std"] }
+eventyr-store = { workspace = true }
+futures = { version = "0.3", default-features = false, features = ["alloc", "executor"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+[dev-dependencies]
+eventyr-store-testing = { workspace = true }

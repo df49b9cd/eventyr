@@ -5,6 +5,9 @@ members = [
     "eventyr-core",
     "eventyr-macros",
     "eventyr-projection",
+    "eventyr-shred",
+    "eventyr-shred-aes-gcm",
+    "eventyr-shred-chacha",
     "eventyr-store",
     "eventyr-store-fjall",
     "eventyr-store-postgres",
@@ -29,6 +32,9 @@ eventyr-store-sqlite = { path = "eventyr-store-sqlite", version = "0.1.0" }
 eventyr-store-testing = { path = "eventyr-store-testing", version = "0.1.0" }
 eventyr-subscription = { path = "eventyr-subscription", version = "0.1.0" }
 eventyr-projection = { path = "eventyr-projection", version = "0.1.0" }
+eventyr-shred = { path = "eventyr-shred", version = "0.1.0" }
+eventyr-shred-aes-gcm = { path = "eventyr-shred-aes-gcm", version = "0.1.0" }
+eventyr-shred-chacha = { path = "eventyr-shred-chacha", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

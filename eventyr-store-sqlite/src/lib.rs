@@ -21,6 +21,8 @@
 //! fjall's single-writer database does, and `append_batch`'s one
 //! transaction across streams is atomic for the same reason.
 
+#[cfg(feature = "shred")]
+mod keys;
 #[cfg(feature = "snapshots")]
 mod snapshots;
 mod store;
@@ -38,6 +40,9 @@ pub use snapshots::SqliteSnapshotStore;
 
 #[cfg(feature = "views")]
 pub use views::SqliteViewStore;
+
+#[cfg(feature = "shred")]
+pub use keys::SqliteKeyStore;
 
 /// The crate-level error: store failures are [`StoreError`] once they
 /// leave the store; this is what those `Other` variants wrap.

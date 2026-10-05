@@ -157,7 +157,7 @@ impl<E> SqliteStore<E> {
 
     /// The connection, for sibling stores on the same database (the
     /// snapshot and view stores behind their features).
-    #[cfg(any(feature = "snapshots", feature = "views"))]
+    #[cfg(any(feature = "snapshots", feature = "views", feature = "shred"))]
     pub(crate) fn conn(&self) -> Arc<Mutex<rusqlite::Connection>> {
         Arc::clone(&self.conn)
     }

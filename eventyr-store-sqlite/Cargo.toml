@@ -17,11 +17,14 @@ default = []
 snapshots = []
 # The `views` table: the `ViewStore` port and inline views (0.7.3).
 views = ["dep:eventyr-projection"]
+# A crypto-shredding `KeyStore` (0.7.6).
+shred = ["dep:eventyr-shred"]
 
 [dependencies]
 eventyr-core = { workspace = true, features = ["serde"] }
 eventyr-store = { workspace = true }
 eventyr-projection = { workspace = true, features = ["inline"], optional = true }
+eventyr-shred = { workspace = true, optional = true }
 rusqlite = { version = "0.34", features = ["bundled"] }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
@@ -31,6 +34,7 @@ futures = { version = "0.3", default-features = false, features = ["alloc"] }
 # dev-dependency on ourselves so the contract-suite tests can toggle
 # the feature (a crate's own --features don't reach `tests/`).
 [dev-dependencies]
-eventyr-store-sqlite = { path = ".", features = ["snapshots", "views"] }
+eventyr-store-sqlite = { path = ".", features = ["snapshots", "views", "shred"] }
+eventyr-shred-chacha = { workspace = true }
 eventyr-store-testing = { workspace = true }
 eventyr-subscription = { workspace = true }
