@@ -38,7 +38,7 @@ use eventyr::shred_aes_gcm::Aes256GcmCipher;
 use eventyr::store::prelude::*;
 use eventyr::subscription::prelude::{
     EventFilter, FilteredSubscription, InMemoryCheckpointStore, InMemoryParkedStore, ParkedStore,
-    Projection, Projector, SagaProjection, StoreSubscription, SubscriptionOutcome,
+    Projection, Projector, SagaProjection, SkipRedelivered, StoreSubscription, SubscriptionOutcome,
 };
 
 // -- the domain -----------------------------------------------------
@@ -377,16 +377,8 @@ impl Projection for Ledger {
 /// A ledger that refuses any withdrawal over 1_000 — the poison event
 /// for the parking story (0.7.7). Its `Error` is a plain `String`:
 /// projections reject with whatever they can display.
-///
-/// At-least-once is literal: when one event keeps failing, the batch is
-/// redelivered from the last ack, and the events *before* the poison
-/// one arrive again each time. So a projection that can see redelivery
-/// dedupes — here by stream version (each event's `version` is its
-/// position in one stream, so anything at or below the last applied
-/// version is a duplicate fold).
 struct PickyLedger {
     balances: Arc<Mutex<BTreeMap<u64, u64>>>,
-    applied: Arc<Mutex<BTreeMap<u64, u64>>>,
     /// The approval list: the fixed projection lets these through.
     approved: Vec<u64>,
 }
@@ -394,25 +386,12 @@ impl Projection for PickyLedger {
     type Event = AccountEvent;
     type Error = String;
     async fn apply(&mut self, envelope: &EventEnvelope<AccountEvent>) -> Result<(), Self::Error> {
-        let Some(id) = account_of(&envelope.stream_id) else {
-            return Ok(());
-        };
-        {
-            let applied = self.applied.lock().expect("the lock");
-            if envelope.version.as_u64() <= *applied.get(&id).unwrap_or(&0) {
-                return Ok(()); // a redelivery: already folded
-            }
-        }
         if let AccountEvent::Withdrawn(Withdrawn { amount, .. }) = &envelope.event
             && *amount > 1_000
             && !self.approved.contains(amount)
         {
             return Err(format!("withdrawal {amount} needs approval"));
         }
-        self.applied
-            .lock()
-            .expect("the lock")
-            .insert(id, envelope.version.as_u64());
         Ledger {
             balances: self.balances.clone(),
         }
@@ -598,7 +577,10 @@ async fn main() {
     // refuses. `Park { retries: 2 }` lets it reject three times, records
     // the event in the parked store, and carries on past it — one bad
     // event never stalls the projection (Halt stays the default;
-    // skipping is a decision the caller makes).
+    // skipping is a decision the caller makes). `SkipRedelivered` is the
+    // at-least-once help §6 asks every projection to be: the redelivered
+    // batch re-presents the events before the poison one, and the
+    // wrapper skips them by stream version so nothing counts twice.
     repo.execute(AccountId(1), AccountCommand::Deposit { amount: 10_000 })
         .await
         .expect("fund for the big withdrawal");
@@ -606,13 +588,11 @@ async fn main() {
         .await
         .expect("the big withdrawal commits as an event");
     let picky_balances = Arc::new(Mutex::new(BTreeMap::new()));
-    let picky_applied = Arc::new(Mutex::new(BTreeMap::new()));
     let parked = Arc::new(InMemoryParkedStore::new());
-    let sensitive = PickyLedger {
+    let sensitive = SkipRedelivered::new(PickyLedger {
         balances: picky_balances.clone(),
-        applied: picky_applied.clone(),
         approved: Vec::new(),
-    };
+    });
     let outcome = Projector::new(
         "picky",
         StoreSubscription::new(store.clone()),
@@ -637,9 +617,6 @@ async fn main() {
     // projection applies each parked event, and its record is removed.
     let mut fixed = PickyLedger {
         balances: picky_balances.clone(),
-        // A fresh ledger with its own dedupe map: the parked envelope is
-        // replayed from scratch, not redelivered by the subscription.
-        applied: Arc::new(Mutex::new(BTreeMap::new())),
         approved: vec![5_000],
     };
     for entry in poisoned {

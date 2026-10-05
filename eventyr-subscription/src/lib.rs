@@ -94,7 +94,8 @@ pub mod prelude {
     pub use crate::checkpoint::{CheckpointStore, InMemoryCheckpointStore};
     pub use crate::parked::{InMemoryParkedStore, NoParking, ParkedEvent, ParkedStore};
     pub use crate::runner::{
-        DriverPorts, Fanout, Projection, Projector, drive_projector, drive_projector_blocking,
+        DriverPorts, Fanout, Projection, Projector, SkipRedelivered, drive_projector,
+        drive_projector_blocking,
     };
     pub use crate::saga::{SagaProjection, drive_saga};
     pub use crate::source::{FilteredSubscription, StoreSubscription, SubscriptionSource};
