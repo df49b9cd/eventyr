@@ -24,6 +24,8 @@
 - No HTTP/transport layer, no message-bus integrations baked into core (esrs ships rabbit/kafka buses; Eventyr keeps `EventBus` as a trait users implement).
 - No ORM, no code generation beyond optional derive macros.
 - Not a full DDD toolkit (no value-object/entity macros — that's `eventide`'s hexagonal bet).
+- No command bus, query bus, or mediator. Routing a command is a function call in the caller's code; routing it to one node is the caller's load balancer or framework (§15.1).
+- No state-stored aggregates. Every read-side feature (projections, sagas, upcasting, shredding, parking, leases) consumes the event log, and a state-stored aggregate has none (§15.1).
 
 ## 3. Crate layout
 
@@ -408,7 +410,8 @@ The `UNIQUE` constraint's backing index serves the per-stream lookups; no separa
 - **0.4** — shipped: the blocking write driver (`drive_write_blocking` / `drive_write_with_snapshots_blocking` in `eventyr-store`, `drive_projector_blocking` in `eventyr-subscription`), the contract-test crate (`eventyr-store-testing`: `event_store_contract`, `streams_all_contract`, `snapshot_contract`, `event_store_batch_contract` — the eventcore-testing idea as a callable suite, self-tested against the in-memory store and wired to gate the Postgres and fjall stores), the embedded store (`eventyr-store-fjall`: fjall-backed `EventStore`/`StreamsAll`/`SnapshotStore`, serde in the store, no runtime needed to drive), and multi-stream commands (eventcore-style, below).
 
 - **0.5** — **shipped**: no new subsystem, four width pieces — (1) the upcaster registry (`eventyr_core::version_registry`), (2) metadata/correlation made load-bearing at the driver boundary (`with_metadata` on both machines; `execute_with_metadata` on the repository), (3) the `Metrics` port + `tracing` instrumentation behind the `metrics` feature, and (4) **the worked example**: `eventyr/examples/bank.rs` — one domain touching every shipped feature (a derived `Account` aggregate with `Optional` state and payload-shaped events, two metadata-carrying opens, a cross-account transfer on the batch machine, a `Projection` ledger rebuilt off the stream, and the `AmountV1` → `Deposited` rename upcast end to end), runnable as a binary and gated as a test. See below.
-- **0.6** — shipped: sagas, views, SQLite; see §13. **0.7** — in progress (0.7.1–0.7.7 shipped), planned: dynamic consistency boundaries, live push, inline views, erasure, and operational hardening; see §14.
+- **0.6** — shipped: sagas, views, SQLite; see §13. **0.7** — in progress (0.7.1–0.7.9 shipped), planned: dynamic consistency boundaries, live push, inline views, erasure, and operational hardening; see §14.
+- **0.8** — planned: running Eventyr across many processes and stores. Checkpoints a stale projector cannot overwrite, a commit-order lock scoped to one store, read-your-writes tokens, partitioned projections, and store-independent saga keys; hybrid logical clocks evaluated for order across stores. See §15.
 
 ### 0.4 multi-stream commands — the shape
 
@@ -601,6 +604,8 @@ Nothing stops two copies of the same projector from running against one checkpoi
 
 **Shipped.** §7's table gains no row — the lease is driver policy, not a machine transition. `ProjectorLease` (`acquire` → `renew` per due `Fetch` and before every `Ack` on the batch boundary, `release` on exit) lives in `eventyr-subscription`; the driver now carries a third defaulted port (`DriverPorts::lease_with`, `NoLease` when absent) and a new `LeasedProjector` (`Projector::lease_with`/`run_leased`, `.run_woken_leased`) surfaces the lost lease as `RunError::{Store, LeaseLost { name, checkpoint }, Taken { name }}` — `Taken` on entry, `LeaseLost` mid-run with the last acked checkpoint as the resume point. Nothing touches `SubscriptionMachine`'s protocol. Two implementations ship: `InMemoryLeaseStore` (ungated, for tests and single-process runs) and `PgLeaseStore` behind `eventyr-store-postgres`'s `leases` feature as a `projector_leases` row (migration 0012) — the row, not an advisory lock, because advisory locks are connection-pinned and sqlx pools hand renewals to whichever connection is free (the exact cost `PgCommitSignal`'s dedicated connection pays and its docs flag). SQLite and fjall get no impl this round: SQLite's cross-process exclusivity is a `BEGIN IMMEDIATE` transaction that must stay open — blocking the very read model the lease protects — and fjall is single-process by design. A `LeasePolicy { ttl, grace, max_grace }` (5 s / 3 / 12 ⇒ ≈ one minute of accidental captivity) is set on the projector. The lease deliberately does **not** put a fencing token into `CheckpointStore::store` — that would widen a shipped port and co-locate the checkpoint and lease in one transaction; the residual window is a lease lost mid-batch acking onto a successor's write, which the at-least-once idempotent-apply contract already tolerates. Fencing with a token in the checkpoint row is the documented follow-up. `lease_store_contract` (behind `testing`) is the port's gate.
 
+**Revised in §15.** The follow-up is a compare-and-set checkpoint, not a fencing token: that is what Axon, Marten, and Emmett ship, and none of them uses a monotonic token (§15.3, 0.8.1).
+
 
 
 ### Smaller items
@@ -616,3 +621,119 @@ Nothing stops two copies of the same projector from running against one checkpoi
 ### 0.7 — what it is *not*
 
 Still no framework. DCB is a machine and a port. Live push, inline views, filtered reads, lifecycle, and leases are store capabilities behind opt-in traits. Event ids, parking, and erasure extend vocabulary and policy that already exist. Nothing in 0.7 adds a runtime, a transport, or a daemon the caller does not drive.
+
+## 15. Running distributed (2026-10) and roadmap 0.8
+
+§13 and §14 compared features. This pass asks what changes when Eventyr runs across many processes, nodes, and databases, and how the field handles the same problems. The scan covered the Rust crates (`cqrs-es`, `esrs`, `eventually-rs`, `fmodel-rust`, `disintegrate`, `kameo_es`/SierraDB, `sourcery`), Marten (with its async daemon and Wolverine), Emmett, Eventuous, KurrentDB, Axon, Akka Persistence/Projections, Propulsion, and Message DB. Projects' own documentation and source were read; anything below that is inference is marked as such.
+
+### 15.1 Position: event sourcing with its read side, never a CQRS framework
+
+Event sourcing on its own is not a usable product. The log answers "give me stream X" and nothing else, so every other query needs a projection, and that split is CQRS. Eventyr already ships the read side: projections and checkpoints, views (async and inline), sagas, filtered reads, live push, parking, and leases. The crates already list `cqrs` as a crates.io keyword.
+
+Two things that commonly travel under the CQRS name are refused, now as §2 non-goals:
+
+- **Buses and mediators.** A command or query bus routes a call to a handler, which in one process is a function call, and across processes needs a transport §2 already refuses. The field confirms the split: Marten does not route commands, Wolverine (a separate framework) does; Axon's consistent-hash routing and Akka's cluster sharding are framework features, not store features. Eventyr's repository is stateless, so any node can execute any command, and the store's optimistic concurrency settles races. Hot aggregates are the cost: many nodes writing one stream multiply conflict retries. The answer is caller-side routing by stream id (consistent hashing at the load balancer, or a framework that offers it), documented, not built.
+- **State-stored aggregates.** `decide`/`apply` is the Decider shape, and `fmodel-rust` runs one decider over either an event store or a state store. Eventyr could do the same with one machine and a `StateStore` port, but nothing on the read side would work for it: projections, sagas, upcasting, shredding, parking, and leases all consume the log, and a state-stored aggregate produces none. Publishing its changes would need an outbox, which reintroduces the dual write the log exists to avoid. Integration with systems that are not event-sourced goes through the caller's `EventBus`.
+
+### 15.2 What a store is
+
+**A store is one event log with its own global sequence.** Inside one store, every event has a unique `Sequence`, gap-free and in commit order; positions compare inside one store and mean nothing across two. Concretely:
+
+| Backend | One store is | What shares it |
+|---|---|---|
+| Postgres | One `events` table (database + schema) | Every `PgStore`, pool, process, and node pointed at that table |
+| SQLite | One database file | Every connection to the file |
+| fjall | One database directory | One process (fjall is single-process) |
+| In-memory | One `InMemoryStore` value | Whatever holds it |
+
+A store is not the `EventStore` trait (the interface), not a Rust value or a process (twenty nodes on one table are one store), not a database server (one server can host several stores), and not a read replica (a lagging copy of the same store). `SnapshotStore`, `ViewStore`, `CheckpointStore`, `ParkedStore`, `KeyStore`, and the lease store hold derived or side data; "store" alone means the log.
+
+**On Postgres, the sequence and the lock have different scopes.** The sequence is the table's identity column (migration 0001). The commit-order lock is one constant advisory key, `pg_advisory_xact_lock(7300160413598463541)` (migration 0006, repeated by 0007–0010), and advisory locks are database-wide. Two `events` tables in different schemas of one database have independent sequences but still serialize every commit against each other. The `eventyr_commits` NOTIFY channel (0007) is database-wide too, so listeners wake on each other's commits (a spurious poll, not a correctness problem). 0.8.2 fixes the lock's scope.
+
+Eventyr has no store identity in its vocabulary: no `StoreId`, and nothing in an envelope says which log it came from. Every cross-store feature below needs one.
+
+### 15.3 How the field handles distribution
+
+**Global order and the gap problem.** A projector polling `WHERE sequence > checkpoint` skips an event whose sequence was drawn but not yet committed when a later one became visible. Every system answers this one of five ways:
+
+| Approach | Who | Cost |
+|---|---|---|
+| Serialize commits | Eventyr (database-wide lock), Message DB (advisory lock per *category*), KurrentDB and Axon Server (one leader per cluster or context) | Write throughput |
+| Read only below the oldest open transaction (`xid8` and `pg_snapshot_xmin`) | Emmett, `sourcery` | One long transaction stalls every consumer; order is by transaction start, not commit |
+| Detect gaps and wait for evidence | Marten (`pg_locks`, `pg_snapshot_xip`, since 9.23), `disintegrate` (advisory-lock "epoch"), Axon on JPA/JDBC (`GapAwareTrackingToken`) | Complexity; stalls behind idle-in-transaction sessions |
+| Wait at gaps on a timer, or tombstone them | Eventuous, Akka JDBC | Can skip committed events |
+| No global order | `cqrs-es`, `esrs`, `eventually-rs`, SierraDB (gap-free per partition, with a confirmed watermark), Akka R2DBC (1024 slices, timestamp offsets with backtracking) | No cross-stream catch-up, or per-partition only |
+
+The read-side schemes have shipped real event-skipping bugs: Marten's time-based gap skip lost committed events (marten#4964, fixed by evidence-gated waiting), Eventuous Postgres subscriptions skipped events in production (eventuous#222), and Axon on Hibernate pooled sequences assigned indexes out of order (axon#3374). Eventyr's lock is the KurrentDB and Message DB answer, and it stands. Message DB scopes the same lock per category, which is the precedent for 0.8.2.
+
+**Write scaling.** Nobody shards one log while keeping one global order. Marten partitions events by tenant with per-tenant sequences and per-tenant high water marks; Emmett has a partition column over one shared sequence; Axon gives each context its own log and leader; Akka R2DBC spreads 1024 slices across tables and databases; SierraDB hashes streams into replicated partitions. All of them give up order across the split. For Eventyr the unit of the split is the store (§15.2), and the multi-tenancy item in §14's *Deferred* list is the same decision: a tenant is a store, a tag, or a partition.
+
+**Parallel projections.** The common shape partitions the checkpoint: Axon splits a processor into segments (one token each, split and merged at runtime), Akka assigns slice ranges to instances, Message DB's consumer groups take `hash(id) % size = member`, and Eventuous reorders acknowledgements inside one process (`CheckpointCommitHandler`). Marten never shipped user-defined sharding (marten#3703). One consumer per checkpoint, which 0.7.9 enforces, is therefore not a ceiling the field has broken without partitioning.
+
+**One consumer, and stale consumers.** No system in the scan uses monotonic fencing tokens. The strongest pair two things instead: the checkpoint write is a compare-and-set (Axon's `storeToken` fails on an owner mismatch, Marten's progression update carries `WHERE last_seq_id = ?`, Emmett's `store_processor_checkpoint` returns `MISMATCH`), and the projection's writes commit in the same transaction as the checkpoint, so a stale owner's writes roll back with it (inference from Marten's and Axon's source and docs). Akka relies on split-brain-resolver timing and documents that two instances "overwrite each other's offset storage"; Eventuous's SQL checkpoint write is a blind update. Eventyr is at the Eventuous end: the lease renewal is a compare-and-set, but `PgCheckpointStore::store` is a blind upsert (`ON CONFLICT DO UPDATE SET global_sequence = EXCLUDED.global_sequence`).
+
+**Read-your-writes.** Returning the commit position is common (Emmett's `lastEventGlobalPosition`, Eventuous's `GlobalPosition`, KurrentDB's position, Eventyr's committed envelopes). Inline views are common (Marten, Emmett, `esrs`'s `TransactionalEventHandler`, Eventyr 0.7.3). Waiting is rare and carries warnings: Marten's `QueryForNonStaleData` documents timeouts, Emmett's `whenCaughtUp` is for tests. `sourcery` ships the full pattern in Rust: `update_tracked` returns a serializable `ConsistencyToken`, and `wait_for`/`read_after` wait on it. Axon pushes instead of waiting (a subscription query, then the command, then the update). Marten's `FetchLatest` reads the async row and folds the stream's newer events in memory.
+
+**Cross-service idempotency.** Eventyr's key-in-the-stream (0.7.5) is as strong as KurrentDB's event-id idempotency and needs no side table. `kameo_es` keys causation on the *source stream and its version*, not a global position. Wolverine and Akka commit the outbox or offset in the same transaction as the handler's writes, the same principle as the checkpoint above.
+
+### 15.4 What it costs Eventyr today
+
+- **Writes serialize per Postgres database** (per file on SQLite, per directory on fjall). Inline views run inside the locked section, so each one slows every writer, not only its own stream's. Scaling writes means more databases, not more schemas, until 0.8.2.
+- **One consumer per projection.** A projection's throughput is what one consumer sustains.
+- **A stale projector is detected only by its lease.** Between losing the lease and noticing, it can ack a checkpoint behind its successor's. `ViewStore`'s newest-wins guard absorbs that for view rows; a non-idempotent `Projection` or an external side effect does not.
+- **Positions are store-local.** A sequence from one store means nothing to a projection over another, and a view built from two stores has a set of checkpoints, not one.
+- **Saga keys are store-local.** `idempotency_key` is `"{saga}:{sequence}:{index}"`, so two sagas of the same name over different stores can mint the same key.
+- **Waiting after a write couples the write path to the read side.** A command that blocks until a view catches up stalls whenever the projector fails over (up to `ttl × grace`, 15 s at the defaults, while a lease survives missed renewals), and N API nodes polling `CheckpointStore::load` load the checkpoint table. `CommitSignal` does not help: it fires on event commits, not checkpoint writes. Reaching a checkpoint does not mean an event applied, either; parking (0.7.7) advances past it.
+
+### 0.8.1 — Checkpoints a stale projector cannot overwrite
+
+The fencing follow-up 0.7.9 named, in the shape the field ships rather than as a token. An opt-in `ConditionalCheckpoints` port beside `CheckpointStore`: `store_if(name, expected, checkpoint)` writes only if the stored checkpoint is still `expected`, and reports a mismatch. The driver keeps the last acked checkpoint already, so it knows `expected`. A mismatch ends the run as `RunError::LeaseLost`, the same outcome a lost renewal produces, with the stored checkpoint as the resume point. Postgres and SQLite implement it with one `UPDATE … WHERE global_sequence = $expected`; the contract suite gains a case where two drivers race one name.
+
+That detects a stale writer at the ack; it does not undo what the stale writer applied before it. The second half is a transactional projection: a `Projection` whose batch writes and checkpoint commit in one database transaction, so a failed `store_if` rolls the batch back (Marten's and Axon's shape). That needs a projection that can run inside the driver's transaction, which `ViewProjection` over `PgViewStore` can and an arbitrary `Projection` cannot; it ships for views first. `CheckpointStore` itself is not widened.
+
+### 0.8.2 — A commit-order lock per store
+
+Derive the advisory key from the store instead of a constant: the `events` table's OID, or a hash of its schema, so two stores in one database stop serializing against each other and "a store" means the same thing for the sequence and the lock. The per-stream locks (`hashtext(stream_id)`) share the same key space; a collision over-serializes and never deadlocks, as 0006 already notes. The NOTIFY channel takes the schema into its name for the same reason. This is a migration, and it is the cheapest way to scale Postgres writes inside one database.
+
+**Store identity** lands with it: a caller-assigned store name (`PgStore::named`, and the equivalent on the other stores), carried in positions that leave the store. It is the vocabulary 0.8.3 and the cross-store work below need.
+
+### 0.8.3 — Read-your-writes tokens
+
+Replace "wait until the projector catches up" with a token checked on the read side. A committed write yields a `Position { store, sequence }` (the highest sequence it committed). The client carries it to the query. For a single-row read, compare the row's own `ViewRow::version` to the token: every saved row records the sequence of the newest event folded into it, so this needs no checkpoint read, works on a read replica (the version travels with the row), and works on any node. It applies only to rows the command's events fold into. For list and multi-row reads, fall back to the checkpoint, with the parking caveat stated in the result type ("position reached", not "event applied"). Both wait for a bounded time and then return an explicit stale result rather than blocking.
+
+`sourcery` is the Rust precedent; Marten's timeout warnings are a requirement. This is a small driver-side helper in `eventyr-subscription`, not a machine. It is for production reads; tests wait on the driver's idle boundary instead (§14's *Smaller items*). Marten's `FetchLatest` (row plus an in-memory fold of newer events) was considered and set aside: a view row records a global sequence while a stream read starts from a stream version, so catching a row up means reading its whole stream and skipping by sequence, and a row that folds several streams cannot be caught up from one.
+
+### 0.8.4 — Partitioned projections
+
+The parallelism 0.7.9 deferred until a lease existed. `EventFilter` gains a hash partition (`member` of `count`, selected by a stable hash of the stream id); each member runs its own checkpoint name and its own lease, so nothing in `SubscriptionMachine` changes and no gap bookkeeping appears (Eventuous's commit handler stays rejected, per 0.7.9). Per-stream order holds; order across streams does not, which is what Axon, Akka, and Message DB also give. The open question is the hash: the Postgres and SQLite filtered-read overrides must compute exactly the Rust hash in SQL. Either the hash is defined in SQL-friendly terms, or the append stores a partition bucket column. Changing `count` means a rebuild in the first cut; Axon-style split and merge is deferred.
+
+### 0.8.5 — Saga keys that survive more than one store
+
+Key saga-issued commands on the triggering event's stream and version, as `kameo_es` does: `"{saga}:{stream}:{version}:{index}"`. Stream ids are unique across stores where the caller makes them so, and the key no longer depends on a store-local sequence. The change has one hazard: an event delivered before the upgrade under the old key and redelivered after it under the new key is a duplicate the stream cannot recognise. Upgrade with the saga projector drained (caught up and stopped), or have the write machine accept both key shapes for one release.
+
+### 15.5 Global order across stores
+
+Within one store, Eventyr keeps the commit-order lock (§15.3). The documented escape hatch, if a single database's write throughput becomes the bottleneck, is Emmett's and `sourcery`'s transaction-id read (`xid8` plus `pg_snapshot_xmin`): writers stop serializing, readers wait below the oldest open transaction, and `Checkpoint` becomes a `(transaction id, sequence)` pair. It is not scheduled; the lock has not yet been the bottleneck for anyone.
+
+Across stores there is no order today. The candidate mechanism is a hybrid logical clock.
+
+**What an HLC is.** Kulkarni, Demirbas et al. (2014): a timestamp `(l, c)`, where `l` is the largest physical time seen and `c` a counter that breaks ties while `l` stands still. A local event takes `l = max(l, now)`; receiving a timestamp takes `l = max(l, remote.l, now)`, with `c` advanced to stay above both. Compared as a pair, it guarantees that if `e` happened before `f`, `hlc(e) < hlc(f)`, and it never drifts from wall time by more than the clock-skew bound. It fits in 64 bits. CockroachDB (MVCC versions), YugabyteDB (hybrid time), MongoDB (cluster time), and Kudu all build on it, and Zenoh stamps every write with one.
+
+**What it does not give.** It is not gap-free, not a total order (equal stamps need a node-id tie-break), and above all it does not tell a reader that *nothing at or below T can still appear*. Two transactions can commit in the opposite order to their HLCs, exactly as identity columns can. Every system that runs a change feed on HLCs adds a separate watermark for that: CockroachDB's closed timestamps (a promise not to write below T, about 3 s behind by default, kept moving on idle ranges by a side transport) and resolved timestamps (the minimum of that and the oldest open transaction); MongoDB's no-op writes that move an idle shard's clock forward; Spanner's and Kudu's commit wait. Akka R2DBC, often cited here, uses no HLC at all: it orders by transaction start time and rescans a two-minute window to catch late commits. The common shape: a watermark always needs either a per-writer progress record with a promise not to write below it, or a wait sized to the skew bound. The HLC is only the coordinate system the watermark is written in.
+
+**Within one store, an HLC replaces nothing.** A poller reading `WHERE hlc > checkpoint` skips the slower of two concurrent commits, so it needs the commit-order lock (or `xid8`) as much as `Sequence` does. `mnesis` reached the same conclusion (mnesis#144: carry the HLC in metadata, do not index it, because "HLC is a poor subscription cursor"), and Restate keeps its log sequence number as the authority with the HLC beside it. `Sequence` stays the cursor.
+
+**Across stores, it is the right merge order.** Planned shape, not scheduled:
+
+- **Stamping.** Each store stamps every append with an HLC *inside* its commit-order lock, so HLC order equals `Sequence` order within the store. On Postgres the database is the clock node: the stamp is `max(last stamp, caller's stamp, the server's clock)` with the counter rules above, computed in `append_events` and persisted with the row, so it survives restarts and needs no clock agreement among application nodes. The stamp travels in `Metadata`; the HLC value type is vocabulary (no clock in it), so it fits core's placement rule, and reading the clock stays store-side.
+- **Causality only where propagated.** The ordering guarantee holds only for timestamps that travel. The command carries the caller's HLC in its metadata, the store advances past it before stamping, and `SagaMachine` puts the triggering event's HLC on each dispatched command. Causality that flows outside Eventyr (an HTTP round trip, a UI) is lost unless the caller threads the stamp through.
+- **A merged projection.** A projection over several stores emits in `(hlc, store, sequence)` order, but only up to `W = min over stores of closed(store)`, where `closed` is the stamp below which that store will never commit again. Under the commit-order lock, a store's closed stamp is simply its newest stamp, so no intent tracking is needed. An idle store must advance it with a heartbeat append or a dedicated row, or one quiet store freezes the merge; merge latency is the slowest heartbeat plus the skew allowance. The resume cursor is the vector `{store → Sequence}`, which is exact; the HLC orders the merge and never resumes it. That is the split Fly's Corrosion fork of cr-sqlite uses (a per-site version vector for progress, a `uhlc` stamp for time).
+- **Tokens.** For one store, `Position { store, sequence }` (0.8.3) is exact and stays the token. An HLC token is the compact form when one token must span several stores (MongoDB's `afterClusterTime`), and it needs the closed-stamp machinery above to decide when a reader has caught up. A vector of positions is the exact alternative.
+- **Bounding a bad clock.** An HLC absorbs a remote stamp from the future. CockroachDB rejects stamps beyond a max offset and stops a node whose clock drifts too far; `uhlc` rejects past a configurable `max_delta`. Stamps arriving in command metadata are caller input, so the store rejects any that run further ahead than a configured bound.
+- **Implementation.** The algorithm is about thirty lines, `no_std`, with no dependencies — owned in core rather than imported. `uhlc` (Zenoh, Corrosion) is the mature reference; `hlc-gen` packs a lock-free 64-bit form.
+
+**Status.** The stamp in metadata (stamping, propagation, and the bound) is cheap, store-local, and useful on its own for cross-store causality and audit; it is the first piece if a user runs several stores. The merged projection and the HLC token wait until someone needs a view over more than one store.
+
+### 0.8 — what it is *not*
+
+Still no framework. No command routing, no cluster membership, no leader election, no sharding of one store. Every 0.8 item is a port, a store migration, or a driver helper, and the caller still decides how many stores to run and where commands go.
