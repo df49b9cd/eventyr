@@ -44,9 +44,9 @@ own feature; the embedded stores (`eventyr-store-fjall`,
 | `subscription` | no | `eventyr::subscription` — `Projection`, `Projector`, checkpoint store |
 | `bus` | no | `subscription` + the `EventBus` live-push trait |
 | `projection` | no | `subscription` + `eventyr::projection` — upcaster chains, rebuilds |
-| `postgres` | no | `eventyr::postgres` — the Postgres store (`postgres_snapshots` adds its `SnapshotStore`; the old `snapshots` name is the same thing) |
+| `postgres` | no | `eventyr::postgres` — the Postgres store (`postgres_snapshots` adds its `SnapshotStore`, the old `snapshots` name being the same thing; `postgres_checkpoints`, `postgres_leases`, `postgres_views` add its checkpoint, lease, and view stores) |
 | `fjall` | no | `eventyr::fjall` — the embedded store (`fjall_snapshots` adds its snapshot store) |
-| `sqlite` | no | `eventyr::sqlite` — the embedded SQLite store; `sqlite_snapshots`, `sqlite_views`, `sqlite_shred`, `sqlite_parked` for its substores |
+| `sqlite` | no | `eventyr::sqlite` — the embedded SQLite store; `sqlite_snapshots`, `sqlite_views`, `sqlite_checkpoints`, `sqlite_shred`, `sqlite_parked` for its substores |
 | `shred` | no | `eventyr::shred` — crypto-shredding; pick a cipher with `shred_aes_gcm` / `shred_chacha`, and `shred_parked` seals parked events |
 | `metrics` | no | the `Metrics` port's tracing backend |
 
@@ -145,6 +145,16 @@ match repository.execute(AccountId(1), AccountCommand::Deposit { amount: 50 }).a
 #         .block_on(demo());
 # }
 ```
+
+## Examples
+
+| Example | Shows |
+|---|---|
+| [`bank`](eventyr/examples/bank.rs) | Every shipped feature in one domain, end to end |
+| [`enrollment`](eventyr/examples/enrollment.rs) | A dynamic consistency boundary |
+| [`loan_eligibility`](eventyr/examples/loan_eligibility.rs) | A narrowed validation query; the blocking boundary driver |
+| [`inline_view`](eventyr/examples/inline_view.rs) | Inline and async views over SQLite |
+| [`distributed`](eventyr/examples/distributed.rs) | Several nodes writing and projecting at once: conflicts, a cross-node retry, projector failover, read-your-writes — on SQLite, and on Postgres when `EVENTYR_PG_URL` is set |
 
 ## Design
 
