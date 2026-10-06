@@ -63,6 +63,11 @@ jobs:
           cargo run -p eventyr --example enrollment
           cargo run -p eventyr --example loan_eligibility
           cargo run -p eventyr --example inline_view --features sqlite_views
+          cargo run -p eventyr --example distributed --features sqlite_views,sqlite_checkpoints,postgres_checkpoints,postgres_leases,postgres_views
+        # The distributed example's clustered half runs against the
+        # service database, in a throwaway schema.
+        env:
+          EVENTYR_PG_URL: ${{ env.EVENTYR_TEST_PG_URL }}
 
       # The Postgres-backed suites are `#[ignore]`d for casual `cargo
       # test`; the service above makes the URL real, so run them here.

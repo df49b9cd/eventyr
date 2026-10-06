@@ -29,6 +29,12 @@ projection = ["subscription", "dep:eventyr-projection"]
 # The Postgres store, and its snapshot persistence behind it.
 postgres = ["store", "dep:eventyr-store-postgres"]
 postgres_snapshots = ["postgres", "eventyr-store-postgres/snapshots"]
+# Postgres's durable checkpoints, projector leases (0.7.9), and view
+# store with inline views (0.7.3): the ports a multi-node deployment
+# keeps beside the log.
+postgres_checkpoints = ["postgres", "subscription", "eventyr-store-postgres/checkpoints"]
+postgres_leases = ["postgres", "subscription", "eventyr-store-postgres/leases"]
+postgres_views = ["postgres", "projection", "eventyr-store-postgres/views"]
 # The outdated name of `postgres_snapshots`: Postgres snapshots, not
 # shared ones. Kept working.
 snapshots = ["postgres_snapshots"]
@@ -41,6 +47,8 @@ sqlite = ["store", "dep:eventyr-store-sqlite"]
 sqlite_snapshots = ["sqlite", "eventyr-store-sqlite/snapshots"]
 # SQLite's view store and inline views (0.7.3).
 sqlite_views = ["sqlite", "projection", "eventyr-store-sqlite/views"]
+# SQLite's durable checkpoint store.
+sqlite_checkpoints = ["sqlite", "subscription", "eventyr-store-sqlite/checkpoints"]
 # Crypto-shredding (0.7.6): `Sensitive` fields, the shredding store
 # wrapper, and the bring-your-own `Cipher` seam. Pick a cipher adapter:
 shred = ["store", "dep:eventyr-shred"]
@@ -71,7 +79,10 @@ eventyr-shred-chacha = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Examples: the bank demo drives the async drivers and reads raw events.
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+# The distributed example's Postgres backend: a pool per node, in a
+# throwaway schema.
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio"] }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 futures.workspace = true
@@ -86,4 +97,14 @@ required-features = ["subscription", "projection", "shred_aes_gcm"]
 [[example]]
 name = "inline_view"
 required-features = ["sqlite_views"]
+
+[[example]]
+name = "distributed"
+required-features = [
+    "sqlite_views",
+    "sqlite_checkpoints",
+    "postgres_checkpoints",
+    "postgres_leases",
+    "postgres_views",
+]
 
