@@ -6,11 +6,15 @@
 //! one's unapplied batches. The runner cannot see this — exclusivity is
 //! a *driver* property, not a machine transition.
 //!
-//! A lease is acquired before the checkpoint is read, renewed before
-//! each fetch that is due and before every ack (the renewal is the
-//! guard on the checkpoint write), and released when the driver stops.
-//! Losing it ends the run with the last *successfully acked* checkpoint
-//! as the resume point.
+//! A lease is acquired before the driver reads the checkpoint it
+//! reports as the resume point and before any checkpoint write,
+//! renewed before each fetch that is due and before every ack (the
+//! renewal is the guard on the checkpoint write), and released when the
+//! driver stops. (`LeasedProjector` reads the machine's starting
+//! checkpoint before acquiring; that read only seeds the fetch
+//! position, and at-least-once delivery covers it.) Losing the lease
+//! ends the run with the last *successfully acked* checkpoint as the
+//! resume point.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
