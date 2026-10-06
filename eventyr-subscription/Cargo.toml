@@ -14,14 +14,20 @@ workspace = true
 default = []
 # The §6 Subscription / §2 EventBus seam: ship as transport adapters land (0.3).
 bus = []
-# Exports `parked_store_contract`, for parked-store implementations'
-# tests. Not for production builds.
+# Exports `parked_store_contract` and `lease_store_contract`, for store
+# implementations' tests. Not for production builds.
 testing = []
+# A `Catch` impl for `Arc<tokio::sync::Notify>`: the `caught_up` port's
+# ready-made listener for tokio-based runners. Off by default — the
+# machine runs without tokio; this is the tests' and services' seam.
+tokio_notify = ["tokio/sync"]
 
 [dependencies]
 eventyr-core.workspace = true
 eventyr-store = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
+# The `Catch` impl for `Arc<tokio::sync::Notify>` (feature `tokio_notify`).
+tokio = { workspace = true, optional = true, features = ["sync"] }
 uuid.workspace = true
 
 [dev-dependencies]

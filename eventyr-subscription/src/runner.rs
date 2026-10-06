@@ -149,8 +149,30 @@ where
     }
 }
 
+/// The driver's `caught_up` hook: called once per idle sleep, the pulse
+/// that says the projection has caught up to its source's head. A test
+/// that wants to assert on a live read model waits on it instead of on a
+/// timer (Emmett's `whenCaughtUp()`).
+///
+/// The trait is one method so any notification primitive can serve as
+/// the listener — a `tokio::sync::Notify`, an event-listener, a test's
+/// counter — and the driver carries a `&dyn Catch` like its metrics.
+pub trait Catch: Send + Sync {
+    /// Fire the pulse.
+    fn caught_up(&self);
+}
+
+/// The no-signal catch: the default port.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoCatch;
+
+impl Catch for NoCatch {
+    fn caught_up(&self) {}
+}
+
 /// The driver's optional ports: what [`drive_projector`] wakes on,
-/// parks into, and reports to. Each defaults to doing nothing.
+/// parks into, signals on catch-up, and reports to. Each defaults to
+/// doing nothing.
 ///
 /// ```
 /// use eventyr_store::metrics::NoopMetrics;
@@ -167,16 +189,19 @@ pub struct DriverPorts<'m, W = NoSignal, K = NoParking> {
     wake: W,
     parked: K,
     metrics: &'m dyn Metrics,
+    catch: &'m dyn Catch,
 }
 
 impl DriverPorts<'static> {
     /// No wake-ups (idle sleeps run their course), no parked store
-    /// ([`NoParking`] refuses every park), and [`NoopMetrics`].
+    /// ([`NoParking`] refuses every park), [`NoopMetrics`], and no
+    /// catch-up pulse.
     pub fn new() -> Self {
         Self {
             wake: NoSignal,
             parked: NoParking,
             metrics: &NoopMetrics,
+            catch: &NoCatch,
         }
     }
 }
@@ -205,6 +230,7 @@ impl<'m, W, K> DriverPorts<'m, W, K> {
             wake: listener,
             parked: self.parked,
             metrics: self.metrics,
+            catch: self.catch,
         }
     }
 
@@ -217,17 +243,38 @@ impl<'m, W, K> DriverPorts<'m, W, K> {
             wake: self.wake,
             parked,
             metrics: self.metrics,
+            catch: self.catch,
         }
     }
 
     /// Report each fetch, apply, park, and ack through `metrics`
     /// (0.5.3): projection progress, latency, and failures become
     /// observable.
-    pub fn with_metrics<'n>(self, metrics: &'n dyn Metrics) -> DriverPorts<'n, W, K> {
+    pub fn with_metrics<'n>(self, metrics: &'n dyn Metrics) -> DriverPorts<'n, W, K>
+    where
+        'm: 'n,
+    {
         DriverPorts {
             wake: self.wake,
             parked: self.parked,
             metrics,
+            catch: self.catch,
+        }
+    }
+
+    /// Signal `catch` on every idle sleep of the run (§14): the
+    /// projection has caught up to its source's head and the driver is
+    /// pausing. A test waiting on the pulse reads the read model the
+    /// batch just wrote instead of guessing a polling gap.
+    pub fn caught_up_on<'n>(self, catch: &'n dyn Catch) -> DriverPorts<'n, W, K>
+    where
+        'm: 'n,
+    {
+        DriverPorts {
+            wake: self.wake,
+            parked: self.parked,
+            metrics: self.metrics,
+            catch,
         }
     }
 }
@@ -280,6 +327,7 @@ where
         wake,
         parked,
         metrics,
+        catch,
     } = ports;
     let mut wake = Some(wake);
     let mut action = machine.start();
@@ -370,6 +418,9 @@ where
                 }
             }
             SubscriptionAction::Sleep { for_, reason } => {
+                if reason == SleepReason::Idle {
+                    catch.caught_up();
+                }
                 wait(&mut sleep, for_, reason, &mut wake).await;
                 machine.handle(SubscriptionInput::Slept)
             }
@@ -524,6 +575,7 @@ where
         wake,
         parked,
         metrics,
+        catch,
     } = ports;
     let mut wake = Some(wake);
     let mut renewed_at = std::time::Instant::now();
@@ -618,6 +670,9 @@ where
                 }
             }
             SubscriptionAction::Sleep { for_, reason } => {
+                if reason == SleepReason::Idle {
+                    catch.caught_up();
+                }
                 wait(&mut sleep, for_, reason, &mut wake).await;
                 machine.handle(SubscriptionInput::Slept)
             }
@@ -826,6 +881,16 @@ impl<S, C, P, W, K> Projector<S, C, P, W, K> {
         }
     }
 
+    /// Signal `catch` on every idle sleep of the run (§14's catch-up
+    /// pulse): a test asserts the read model is fresh the moment the
+    /// projector would pause, not after a wall-clock sleep.
+    pub fn caught_up_on<'m>(self, catch: &'m dyn Catch) -> ProjectorWithCatch<'m, S, C, P, W, K> {
+        ProjectorWithCatch {
+            projector: self,
+            catch,
+        }
+    }
+
     /// Park events the projection keeps rejecting (0.7.7): set
     /// `policy` and record parked events in `store`. With
     /// [`FailurePolicy::Park`]
@@ -848,6 +913,29 @@ impl<S, C, P, W, K> Projector<S, C, P, W, K> {
     /// The name the checkpoint is stored under.
     pub fn name(&self) -> &str {
         &self.name
+    }
+}
+
+impl<S, C, P, K> Projector<S, C, P, NoSignal, K> {
+    /// [`run`](Self::run) with the catch-up pulse: `catch` fires once
+    /// per idle sleep, so a test asserts read-model state the moment
+    /// the projector catches up instead of waiting a wall clock.
+    pub async fn run_caught<F, Fut>(
+        self,
+        sleep: F,
+        catch: &dyn Catch,
+    ) -> Result<SubscriptionOutcome, StoreError>
+    where
+        S: SubscriptionSource<Event = P::Event>,
+        C: CheckpointStore,
+        P: Projection,
+        P::Error: core::fmt::Display,
+        F: FnMut(core::time::Duration) -> Fut,
+        Fut: Future<Output = ()>,
+        P::Event: Clone + Send,
+        K: ParkedStore<P::Event>,
+    {
+        self.drive_caught(sleep, catch, NoSignal).await
     }
 }
 
@@ -876,6 +964,29 @@ impl<S, C, P, K> Projector<S, C, P, NoSignal, K> {
 }
 
 impl<S, C, P, W: CommitSignal, K> Projector<S, C, P, W, K> {
+    /// [`run_woken`](Self::run_woken) with the catch-up pulse. See
+    /// [`run_caught`](Projector::run_caught).
+    pub async fn run_woken_caught<F, Fut>(
+        self,
+        sleep: F,
+        catch: &dyn Catch,
+    ) -> Result<SubscriptionOutcome, StoreError>
+    where
+        S: SubscriptionSource<Event = P::Event>,
+        C: CheckpointStore,
+        P: Projection,
+        P::Error: core::fmt::Display,
+        F: FnMut(core::time::Duration) -> Fut,
+        Fut: Future<Output = ()>,
+        P::Event: Clone + Send,
+        K: ParkedStore<P::Event>,
+    {
+        let listener = self.wake.subscribe().await?;
+        self.drive_caught(sleep, catch, listener).await
+    }
+}
+
+impl<S, C, P, W: CommitSignal, K> Projector<S, C, P, W, K> {
     /// Arm the commit listener, load the persisted checkpoint, then
     /// drive the subscription to completion — waiting via `sleep`
     /// between polls, or less when a commit arrives first.
@@ -899,6 +1010,53 @@ impl<S, C, P, W: CommitSignal, K> Projector<S, C, P, W, K> {
     {
         let listener = self.wake.subscribe().await?;
         self.drive(sleep, listener).await
+    }
+}
+
+/// A [`Projector`] bound to a [`Catch`] pulse (§14): its drivers signal
+/// each idle sleep, so a test reads the read model the run just brought
+/// current.
+pub struct ProjectorWithCatch<'m, S, C, P, W, K> {
+    projector: Projector<S, C, P, W, K>,
+    catch: &'m dyn Catch,
+}
+
+impl<S, C, P, K> ProjectorWithCatch<'_, S, C, P, NoSignal, K> {
+    /// [`Projector::run`] with the pulse.
+    pub async fn run<F, Fut>(self, sleep: F) -> Result<SubscriptionOutcome, StoreError>
+    where
+        S: SubscriptionSource<Event = P::Event>,
+        C: CheckpointStore,
+        P: Projection,
+        P::Error: core::fmt::Display,
+        F: FnMut(core::time::Duration) -> Fut,
+        Fut: Future<Output = ()>,
+        P::Event: Clone + Send,
+        K: ParkedStore<P::Event>,
+    {
+        self.projector
+            .drive_caught(sleep, self.catch, NoSignal)
+            .await
+    }
+}
+
+impl<S, C, P, W: CommitSignal, K> ProjectorWithCatch<'_, S, C, P, W, K> {
+    /// [`Projector::run_woken`] with the pulse.
+    pub async fn run_woken<F, Fut>(self, sleep: F) -> Result<SubscriptionOutcome, StoreError>
+    where
+        S: SubscriptionSource<Event = P::Event>,
+        C: CheckpointStore,
+        P: Projection,
+        P::Error: core::fmt::Display,
+        F: FnMut(core::time::Duration) -> Fut,
+        Fut: Future<Output = ()>,
+        P::Event: Clone + Send,
+        K: ParkedStore<P::Event>,
+    {
+        let listener = self.projector.wake.subscribe().await?;
+        self.projector
+            .drive_caught(sleep, self.catch, listener)
+            .await
     }
 }
 
@@ -1092,6 +1250,57 @@ impl<S, C, P, W, K> Projector<S, C, P, W, K> {
             .wake_on(listener)
             .park_into(self.parked)
             .with_metrics(metrics);
+        Ok(drive_projector(
+            &mut machine,
+            &self.name,
+            &self.source,
+            &self.checkpoints,
+            self.projection,
+            sleep,
+            ports,
+        )
+        .await)
+    }
+
+    /// As [`drive`](Self::drive) with the pulse the driver fires on every
+    /// idle sleep (§14's `whenCaughtUp`).
+    async fn drive_caught<F, Fut, L>(
+        self,
+        sleep: F,
+        catch: &dyn Catch,
+        listener: L,
+    ) -> Result<SubscriptionOutcome, StoreError>
+    where
+        S: SubscriptionSource<Event = P::Event>,
+        C: CheckpointStore,
+        P: Projection,
+        P::Error: core::fmt::Display,
+        F: FnMut(core::time::Duration) -> Fut,
+        Fut: Future<Output = ()>,
+        P::Event: Clone + Send,
+        L: CommitListener,
+        K: ParkedStore<P::Event>,
+    {
+        if matches!(self.policy.on_failure, FailurePolicy::Park { .. })
+            && !<K as ParkedStore<P::Event>>::RECORDS
+        {
+            return Err(StoreError::other(format!(
+                "projector `{}` parks failing events but has no parked store; \
+                 give it one with `park_into`",
+                self.name
+            )));
+        }
+        let resume = self.checkpoints.load(&self.name).await?;
+        let mut machine = SubscriptionMachine::new(self.policy, resume);
+        let metrics: &dyn Metrics = match &self.metrics {
+            Some(metrics) => &**metrics,
+            None => &NoopMetrics,
+        };
+        let ports = DriverPorts::new()
+            .wake_on(listener)
+            .park_into(self.parked)
+            .with_metrics(metrics)
+            .caught_up_on(catch);
         Ok(drive_projector(
             &mut machine,
             &self.name,
