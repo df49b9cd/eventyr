@@ -87,10 +87,13 @@ impl<S: Clone + Send> SnapshotStore for InMemorySnapshotStore<S> {
     type State = S;
 
     async fn load(&self, stream_id: &StreamId) -> Result<Option<Snapshot<S>>, StoreError> {
+        // No user code runs under this lock beyond a `HashMap` get, and
+        // a panic there leaves the store consistent enough to continue —
+        // the recover-on-poison policy the other in-memory stores share.
         let guard = self
             .inner
             .lock()
-            .map_err(|e| StoreError::other(alloc::format!("snapshot store lock poisoned: {e}")))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(guard.get(stream_id).cloned())
     }
 
@@ -98,7 +101,7 @@ impl<S: Clone + Send> SnapshotStore for InMemorySnapshotStore<S> {
         let mut guard = self
             .inner
             .lock()
-            .map_err(|e| StoreError::other(alloc::format!("snapshot store lock poisoned: {e}")))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Newest wins: an offer arriving behind the persisted version
         // (two commits racing, offers applied out of order) is dropped,
         // so the stored snapshot can never regress.

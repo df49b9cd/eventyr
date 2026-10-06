@@ -12,9 +12,9 @@ use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, StreamId, Version};
 use eventyr_store::store::{EventStore, StreamsAll};
 
-use eventyr_store_postgres::PgStore;
-
 use serde::{Deserialize, Serialize};
+
+mod common;
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 enum BankEvent {
@@ -38,9 +38,10 @@ fn new_stream() -> StreamId {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 async fn append_read_conflict_stream_all() {
-    let url = std::env::var("EVENTYR_TEST_PG_URL")
-        .expect("EVENTYR_TEST_PG_URL must point at a real Postgres");
-    let store = PgStore::connect(&url).await.expect("connect and migrate");
+    let url = common::url();
+    // A fresh schema, not the default one: this test writes streams,
+    // and a dev database should not keep them.
+    let store = common::fresh_store_async::<BankEvent>(&url, "roundtrip", 2).await;
     let stream = new_stream();
 
     // 1. ExpectEmpty on a brand-new stream.
@@ -224,4 +225,5 @@ async fn append_read_conflict_stream_all() {
     assert_eq!(back[0].metadata.correlation_id, Some("corr-7".into()));
     #[cfg(feature = "time")]
     assert!(back[0].metadata.timestamp.is_some());
+    common::cleanup_schemas().await;
 }

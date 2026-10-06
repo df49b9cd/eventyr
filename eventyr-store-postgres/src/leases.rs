@@ -106,7 +106,7 @@ impl ProjectorLease for PgLeaseStore {
         let ttl_ms = millis(ttl);
         // Bump version only if this holder still owns the row; an
         // empty row set means the lease is gone.
-        let row: Option<(i64,)> = sqlx::query_as(
+        let row = sqlx::query_as(
             "UPDATE projector_leases SET \
                  renewed_at = now(), \
                  ttl_ms = $3, \
@@ -125,11 +125,28 @@ impl ProjectorLease for PgLeaseStore {
         .bind(i64::from(max_grace))
         .bind(lease.version)
         .fetch_optional(&self.pool)
-        .await
-        .map_err(|error| LeaseError::Store {
-            error: PgStoreError::into_store(error),
-            renewed_until: None,
-        })?;
+        .await;
+        let row = match row {
+            Ok(row) => row,
+            Err(error) => {
+                // The renewal never reached a decision — a pool timeout,
+                // a dropped connection. The row still says how long the
+                // lease was last known good for, so ask it: a transient
+                // blip rides the grace window instead of stopping the
+                // projector. The row's own stored policy and the
+                // database's clock decide — no client skew in the
+                // arithmetic. A row that is gone (taken over), a row
+                // already past its bounds, or a store that cannot answer
+                // at all is a lost lease: the driver stops rather than
+                // guess.
+                let error = PgStoreError::into_store(error);
+                let renewed_until = self.presumed_held_until(&lease.name, lease.holder).await;
+                return Err(LeaseError::Store {
+                    error,
+                    renewed_until,
+                });
+            }
+        };
         match row {
             Some((version,)) => {
                 lease.version = version;
@@ -150,7 +167,38 @@ impl ProjectorLease for PgLeaseStore {
     }
 }
 
-/// `Duration` to whole milliseconds, matching the row's schema.
+impl PgLeaseStore {
+    /// How long the named lease is presumed still held by `holder`:
+    /// the smaller of its grace and max-grace bounds, from the row's
+    /// own stored policy and the database's clock. `None` when the row
+    /// is gone, past both bounds, or the store cannot answer.
+    async fn presumed_held_until(&self, name: &str, holder: uuid::Uuid) -> Option<Instant> {
+        let row = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT \
+                 ceil(extract(epoch FROM (renewed_at \
+                     + (ttl_ms * grace) * INTERVAL '1 ms' - now())) * 1000)::bigint, \
+                ceil(extract(epoch FROM (acquired_at \
+                     + (ttl_ms * max_grace) * INTERVAL '1 ms' - now())) * 1000)::bigint \
+             FROM projector_leases WHERE name = $1 AND holder = $2",
+        )
+        .bind(name)
+        .bind(holder)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()??;
+        let (grace_left_ms, max_left_ms) = row;
+        let left_ms = grace_left_ms.min(max_left_ms);
+        if left_ms <= 0 {
+            return None;
+        }
+        Instant::now().checked_add(Duration::from_millis(u64::try_from(left_ms).ok()?))
+    }
+}
+
+/// `Duration` to whole milliseconds, matching the row's schema. A
+/// duration past `i64` milliseconds saturates: the interval arithmetic
+/// in the queries errors into a store failure, which is reportable —
+/// a panic in the driver loop is not.
 fn millis(duration: Duration) -> i64 {
-    i64::try_from(duration.as_millis()).expect("a lease policy's ttl fits in milliseconds")
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }

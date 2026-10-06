@@ -14,8 +14,9 @@ use eventyr_core::envelope::EventEnvelope;
 use crate::runner::Projection;
 
 /// A test scenario for one projection: `given` the envelopes to fold,
-/// `run` (or `when` for a custom drive), then `then` the assertion on
-/// the projection itself.
+/// `when` (or `when_driven` for a custom drive), then `then` the
+/// assertion on the projection itself — the read-side counterpart of
+/// core's `Scenario::when`.
 pub struct ProjectionScenario<P: Projection> {
     name: String,
     projection: P,
@@ -35,14 +36,14 @@ impl<P: Projection> ProjectionScenario<P> {
     /// Seed the history the run folds through the projection, in order.
     /// Versions and sequence numbers come from the fixture's envelopes —
     /// a scenario is a projection test, not a store test.
-    pub fn given(mut self, history: Vec<EventEnvelope<P::Event>>) -> Self {
-        self.history = history;
+    pub fn given(mut self, history: impl IntoIterator<Item = EventEnvelope<P::Event>>) -> Self {
+        self.history = history.into_iter().collect();
         self
     }
 
     /// Fold the seeded history through the projection: every `apply` in
     /// order, panicking with the scenario's name on a rejection.
-    pub async fn run(self) -> ProjectionOutcome<P>
+    pub async fn when(self) -> ProjectionOutcome<P>
     where
         P::Event: Send,
         P::Error: core::fmt::Debug,
@@ -62,7 +63,7 @@ impl<P: Projection> ProjectionScenario<P> {
     /// direct `apply`, anything — then continue to `then`. The drive
     /// takes the projection and returns it, so arbitrary awaits may sit
     /// between its folds.
-    pub async fn when<F, Fut, E>(self, drive: F) -> ProjectionOutcome<P>
+    pub async fn when_driven<F, Fut, E>(self, drive: F) -> ProjectionOutcome<P>
     where
         F: FnOnce(P) -> Fut,
         Fut: Future<Output = Result<P, E>>,
@@ -86,10 +87,11 @@ pub struct ProjectionOutcome<P: Projection> {
 }
 
 impl<P: Projection> ProjectionOutcome<P> {
-    /// Check the projection's state. Returning `self` lets a test chain
-    /// several assertions under one scenario.
-    pub fn then(self, check: impl FnOnce(&P)) -> Self {
-        check(&self.projection);
+    /// Check the projection's state. The scenario's name is passed so
+    /// an assertion failure names the scenario it broke. Returning
+    /// `self` lets a test chain several assertions under one scenario.
+    pub fn then(self, check: impl FnOnce(&str, &P)) -> Self {
+        check(&self.name, &self.projection);
         self
     }
 

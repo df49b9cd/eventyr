@@ -24,71 +24,13 @@ fn policy(every: u64) -> SnapshotPolicy {
 
 // -- the snapshot store itself -------------------------------------------
 
-#[tokio::test]
-async fn in_memory_snapshot_store_roundtrips_the_newest() {
-    let store = InMemorySnapshotStore::new();
-    let stream = StreamId::from("account-1");
-
-    assert!(
-        store.load(&stream).await.expect("load").is_none(),
-        "an unknown stream has no snapshot"
-    );
-
-    let snap = |version: u64, balance: u64| Snapshot {
-        stream_id: stream.clone(),
-        version: Version::new(version),
-        state: AccountState {
-            open: true,
-            balance,
-        },
-    };
-
-    store.save(snap(3, 30)).await.expect("save 3");
-    let found = store.load(&stream).await.expect("load 3").expect("present");
-    assert_eq!(found.version, Version::new(3));
-    assert_eq!(found.state.balance, 30);
-
-    // The store's "newest wins" rule: a newer save replaces; an older
-    // one is dropped without touching the persisted snapshot — the
-    // snapshot is a cache, and a stale snapshot is self-correcting via
-    // the delta fold on the next load.
-    store.save(snap(7, 70)).await.expect("save 7");
-    let found = store.load(&stream).await.expect("load 7").expect("present");
-    assert_eq!(found.version, Version::new(7));
-}
-
-#[tokio::test]
-async fn in_memory_snapshot_store_never_regresses_the_version() {
-    let store = InMemorySnapshotStore::new();
-    let stream = StreamId::from("account-1");
-    let snap = |version: u64, balance: u64| Snapshot {
-        stream_id: stream.clone(),
-        version: Version::new(version),
-        state: AccountState {
-            open: true,
-            balance,
-        },
-    };
-
-    store.save(snap(7, 70)).await.expect("save 7");
-
-    // An out-of-order offer racing the persisted snapshot (two commits,
-    // offers applied out of order) is dropped, not stored over it.
-    store.save(snap(5, 50)).await.expect("save 5");
-    let found = store.load(&stream).await.expect("load").expect("present");
-    assert_eq!(
-        found.version,
-        Version::new(7),
-        "an older offer cannot regress the row"
-    );
-    assert_eq!(found.state.balance, 70);
-
-    // The same version does not count as newer either: the first of two
-    // same-version offers stays (identical states by construction —
-    // the machine snapshots the committed fold).
-    store.save(snap(7, 70)).await.expect("save 7 again");
-    let found = store.load(&stream).await.expect("load").expect("present");
-    assert_eq!(found.version, Version::new(7));
+/// The port's rules are the shared contract's (unknown → `None`,
+/// newest wins, a stale or same-version save never regresses) — this
+/// suite runs it against the in-memory store; the durable stores run
+/// it in their own test crates.
+#[test]
+fn the_in_memory_snapshot_store_passes_the_contract() {
+    eventyr_store_testing::snapshot_contract::<u64, _>(InMemorySnapshotStore::new);
 }
 
 // -- the snapshot-off repository is unchanged -----------------------------

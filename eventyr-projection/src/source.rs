@@ -19,7 +19,6 @@
 use eventyr_core::error::StoreError;
 use eventyr_core::subscription::{Batch, Checkpoint};
 use eventyr_core::upcast::RawEvent;
-use eventyr_core::version_registry::VersionedRaw;
 use eventyr_core::vocabulary::Sequence;
 use eventyr_subscription::source::SubscriptionSource;
 
@@ -88,13 +87,12 @@ fn upcast_failed(sequence: Sequence, error: impl core::fmt::Display) -> StoreErr
 /// The versioned sibling of [`UpcastingSource`]: runs an
 /// [`UpcasterRegistry`] — the 0.5.1 read-side — instead of a chain.
 ///
-/// Each fetched [`RawEvent`] becomes a
-/// [`VersionedRaw`] — the
-/// same `event_type` and payload, its `schema_version` — and the
-/// registry walks that type's ladder. The output is the raw bytes of the
-/// current schema version; the caller decodes from those bytes into the
-/// current `E`. Nothing about the protocol changes: a failure still
-/// becomes a store error inside the existing `Fetch`, loud and final.
+/// Each fetched [`RawEvent`] goes through the registry, which walks
+/// that type's ladder from its `schema_version` to the current one.
+/// The output is the raw bytes of the current schema version; the
+/// caller decodes from those bytes into the current `E`. Nothing about
+/// the protocol changes: a failure still becomes a store error inside
+/// the existing `Fetch`, loud and final.
 pub struct VersionedSource<S> {
     inner: S,
     registry: UpcasterRegistry,
@@ -127,19 +125,9 @@ where
             // past the offending event.
             let sequence = envelope.sequence;
             events.push(envelope.try_map_event(|raw| {
-                let payload = self
-                    .registry
-                    .upcast(VersionedRaw {
-                        event_type: raw.event_type.clone(),
-                        version: raw.schema_version,
-                        payload: raw.payload,
-                    })
-                    .map_err(|error| upcast_failed(sequence, error))?;
-                Ok::<_, StoreError>(RawEvent {
-                    event_type: raw.event_type,
-                    schema_version: raw.schema_version,
-                    payload,
-                })
+                self.registry
+                    .upcast(raw)
+                    .map_err(|error| upcast_failed(sequence, error))
             })?);
         }
         Ok(Batch::new(events, batch.upper))

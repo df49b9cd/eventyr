@@ -56,7 +56,7 @@ pub use batch_store::event_store_batch_contract;
 pub use commit_signal::commit_signal_contract;
 pub use event_store::{ContractEvent, event_store_contract};
 pub use filtered::filtered_read_contract;
-pub use fixtures::{ParityEvent, PayloadEvent};
+pub use fixtures::{Counted, ParityEvent, PayloadEvent};
 pub use lifecycle::{lifecycle_contract, lifecycle_query_append_contract};
 pub use query_append::query_append_contract;
 pub use snapshot_store::snapshot_contract;

@@ -125,34 +125,27 @@ impl Metadata {
         self
     }
 
-    /// Compose three layers, least-authoritative first: set fields on
-    /// `interaction` win over the event's own ids, which win over `own`
-    /// (the record a write *in progress* carries). This is the saga
+    /// Compose two layers, least-authoritative first: set fields on
+    /// `interaction` win over the event's own ids. This is the saga
     /// pipeline's seam: the boundary answers the request, the event
-    /// answers the causal chain, the command's own stamp is the first
-    /// draft.
+    /// answers the causal chain.
     ///
     /// The idempotency key is never taken from `event`: it names the
     /// command that produced the event, and a command issued in reaction
     /// to it is a different command.
-    pub fn overlay(interaction: &Metadata, event: &Metadata, own: &Metadata) -> Self {
+    pub fn overlay(interaction: &Metadata, event: &Metadata) -> Self {
         Self {
             causation_id: interaction
                 .causation_id
                 .clone()
-                .or_else(|| event.causation_id.clone())
-                .or_else(|| own.causation_id.clone()),
+                .or_else(|| event.causation_id.clone()),
             correlation_id: interaction
                 .correlation_id
                 .clone()
-                .or_else(|| event.correlation_id.clone())
-                .or_else(|| own.correlation_id.clone()),
-            idempotency_key: interaction
-                .idempotency_key
-                .clone()
-                .or_else(|| own.idempotency_key.clone()),
+                .or_else(|| event.correlation_id.clone()),
+            idempotency_key: interaction.idempotency_key.clone(),
             #[cfg(feature = "time")]
-            timestamp: interaction.timestamp.or(event.timestamp).or(own.timestamp),
+            timestamp: interaction.timestamp.or(event.timestamp),
         }
     }
 }

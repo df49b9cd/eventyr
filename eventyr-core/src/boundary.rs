@@ -430,11 +430,6 @@ impl<D: Decision> BoundaryMachine<D> {
         }
     }
 
-    /// The decision this machine runs.
-    pub fn decision(&self) -> &D {
-        &self.decision
-    }
-
     /// Whether the machine reached its terminal outcome.
     pub fn is_done(&self) -> bool {
         self.phase == Phase::Done
@@ -798,7 +793,7 @@ mod tests {
         BoundaryMachine::new(Enroll::new("c1", "s1"), RetryPolicy::new(1))
     }
 
-    fn is_violation<E, Err>(action: &BoundaryAction<E, Err>) -> bool {
+    fn is_protocol_violation<E, Err>(action: &BoundaryAction<E, Err>) -> bool {
         matches!(
             action,
             BoundaryAction::Done(BoundaryOutcome::Failed(error)) if error.is_protocol_violation()
@@ -1036,7 +1031,7 @@ mod tests {
         let action = m.handle(BoundaryInput::Read {
             events: vec![envelope(2, defined(2)), envelope(2, enrolled("c1", "s2"))],
         });
-        assert!(is_violation(&action));
+        assert!(is_protocol_violation(&action));
 
         // An event the query does not select.
         let mut m = machine();
@@ -1044,7 +1039,7 @@ mod tests {
         let action = m.handle(BoundaryInput::Read {
             events: vec![envelope(1, enrolled("c9", "s9"))],
         });
-        assert!(is_violation(&action));
+        assert!(is_protocol_violation(&action));
 
         // A conflict at or before the condition's position.
         let mut m = machine();
@@ -1055,20 +1050,20 @@ mod tests {
         let action = m.handle(BoundaryInput::Conflict {
             sequence: Sequence::new(3),
         });
-        assert!(is_violation(&action));
+        assert!(is_protocol_violation(&action));
 
         // Appended while reading.
         let mut m = machine();
         m.start();
-        assert!(is_violation(
+        assert!(is_protocol_violation(
             &m.handle(BoundaryInput::Appended { committed: vec![] })
         ));
 
         // Driving a finished machine.
-        assert!(is_violation(
+        assert!(is_protocol_violation(
             &m.handle(BoundaryInput::Failed(StoreError::Unavailable))
         ));
-        assert!(is_violation(&m.start()));
+        assert!(is_protocol_violation(&m.start()));
     }
 
     #[test]
@@ -1110,7 +1105,7 @@ mod tests {
                 let was_done = done;
                 let action = m.handle(input);
                 if was_done {
-                    prop_assert!(is_violation(&action));
+                    prop_assert!(is_protocol_violation(&action));
                 }
                 done |= matches!(action, BoundaryAction::Done(_));
                 prop_assert_eq!(done, m.is_done());

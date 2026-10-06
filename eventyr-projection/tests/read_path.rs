@@ -42,10 +42,7 @@ impl SubscriptionSource for ScriptedSource {
                 metadata: Default::default(),
             })
             .collect();
-        let upper = events
-            .last()
-            .map(|envelope| Checkpoint::new(envelope.sequence));
-        Ok(Batch::new(events, upper))
+        Ok(Batch::of(events))
     }
 }
 

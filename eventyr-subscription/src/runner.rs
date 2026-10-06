@@ -22,7 +22,8 @@ use eventyr_core::subscription::{
     SubscriptionOutcome, SubscriptionPolicy,
 };
 use eventyr_store::metrics::names::{
-    ACK_FAILURES, PARK_FAILURES, PARKED_EVENTS, PROJECTED_EVENTS, PROJECTION_FETCH_SPAN,
+    ACK_FAILURES, LEASE_LOST, LEASE_RELEASE_FAILURES, LEASE_RENEW_FAILURES, LEASE_RENEWALS,
+    PARK_FAILURES, PARKED_EVENTS, PROJECTED_EVENTS, PROJECTION_FETCH_SPAN,
 };
 use eventyr_store::metrics::{Metrics, NoopMetrics};
 use eventyr_store::notify::{CommitListener, CommitSignal, NoSignal};
@@ -168,6 +169,16 @@ pub struct NoCatch;
 
 impl Catch for NoCatch {
     fn caught_up(&self) {}
+}
+
+/// The ready-made tokio listener: every idle sleep wakes the pulse's
+/// waiters (behind `tokio_notify`). `notify_waiters`, not `notify_one`:
+/// no permit is stored, so no spurious wake outlives the pulse.
+#[cfg(feature = "tokio_notify")]
+impl Catch for std::sync::Arc<tokio::sync::Notify> {
+    fn caught_up(&self) {
+        self.notify_waiters();
+    }
 }
 
 /// The driver's optional ports: what [`drive_projector`] wakes on,
@@ -337,96 +348,213 @@ where
     loop {
         action = match action {
             SubscriptionAction::Fetch { from, limit } => {
-                let fetched = source.fetch(from, limit).await;
-                // The sequence span this fetch covered: zero on a
-                // caught-up poll.
-                if let Ok(batch) = &fetched {
-                    let last = batch
-                        .events
-                        .last()
-                        .map_or(from.as_sequence().as_u64(), |e| e.sequence.as_u64());
-                    metrics.gauge(
-                        PROJECTION_FETCH_SPAN,
-                        last.saturating_sub(from.as_sequence().as_u64()),
-                    );
-                }
-                match fetched {
-                    Ok(batch) => machine.handle(SubscriptionInput::Fetched { batch }),
-                    Err(error) => machine.handle(SubscriptionInput::Failed(error)),
-                }
+                fetch_batch(machine, source, metrics, from, limit).await
             }
             SubscriptionAction::Apply { envelope } => {
-                let sequence = envelope.sequence;
-                if batch_started.is_none() {
-                    batch_started = Some(std::time::Instant::now());
-                }
-                let result = projection.apply(&envelope).await;
-                match result {
-                    Ok(()) => {
-                        metrics.counter(PROJECTED_EVENTS, 1);
-                        machine.handle(SubscriptionInput::Applied)
-                    }
-                    Err(error) => {
-                        batch_started = None;
-                        machine.handle(SubscriptionInput::ApplyFailed {
-                            error: StoreError::other(format!(
-                                "projection applying sequence {sequence}: {error}"
-                            )),
-                        })
-                    }
-                }
+                apply_one(
+                    machine,
+                    &mut projection,
+                    metrics,
+                    &mut batch_started,
+                    envelope,
+                )
+                .await
             }
             SubscriptionAction::Park {
                 envelope,
                 attempts,
                 error,
             } => {
-                batch_started = None;
-                let event = ParkedEvent {
-                    subscription: name.to_owned(),
+                park_one(
+                    machine,
+                    &parked,
+                    metrics,
+                    &mut batch_started,
+                    name,
                     envelope,
                     attempts,
-                    error: error.to_string(),
-                };
-                let recorded = parked.park(event).await;
-                let recorded = recorded.inspect_err(|_| metrics.counter(PARK_FAILURES, 1));
-                match recorded {
-                    Ok(()) => {
-                        metrics.counter(PARKED_EVENTS, 1);
-                        machine.handle(SubscriptionInput::Parked)
-                    }
-                    Err(error) => machine.handle(SubscriptionInput::ParkFailed { error }),
-                }
+                    error,
+                )
+                .await
             }
             SubscriptionAction::Ack { checkpoint } => {
-                let stored = checkpoints.store(name, checkpoint).await;
-                let stored = stored.inspect_err(|_| metrics.counter(ACK_FAILURES, 1));
-                match stored {
-                    Ok(()) => {
-                        if let Some(start) = batch_started.take() {
-                            metrics.histogram(
-                                eventyr_store::metrics::names::PROJECT_BATCH_LATENCY,
-                                start.elapsed(),
-                            );
-                        }
-                        machine.handle(SubscriptionInput::Acked)
-                    }
-                    Err(error) => {
-                        batch_started = None;
-                        machine.handle(SubscriptionInput::AckFailed { error })
-                    }
-                }
+                ack_batch(
+                    machine,
+                    checkpoints,
+                    metrics,
+                    &mut batch_started,
+                    name,
+                    checkpoint,
+                )
+                .await
+                .0
             }
             SubscriptionAction::Sleep { for_, reason } => {
-                if reason == SleepReason::Idle {
-                    catch.caught_up();
-                }
-                wait(&mut sleep, for_, reason, &mut wake).await;
-                machine.handle(SubscriptionInput::Slept)
+                sleep_one(machine, &mut sleep, &mut wake, catch, for_, reason).await
             }
             SubscriptionAction::Done(outcome) => return outcome,
         };
     }
+}
+
+/// One `Fetch`: read from the source, gauge the sequence span the read
+/// covered (zero on a caught-up poll), and report the answer.
+async fn fetch_batch<E, S>(
+    machine: &mut SubscriptionMachine<E>,
+    source: &S,
+    metrics: &dyn Metrics,
+    from: eventyr_core::subscription::Checkpoint,
+    limit: usize,
+) -> SubscriptionAction<E>
+where
+    S: SubscriptionSource<Event = E>,
+    E: Clone + Send,
+{
+    let fetched = source.fetch(from, limit).await;
+    if let Ok(batch) = &fetched {
+        let last = batch
+            .events
+            .last()
+            .map_or(from.as_sequence().as_u64(), |e| e.sequence.as_u64());
+        metrics.gauge(
+            PROJECTION_FETCH_SPAN,
+            last.saturating_sub(from.as_sequence().as_u64()),
+        );
+    }
+    match fetched {
+        Ok(batch) => machine.handle(SubscriptionInput::Fetched { batch }),
+        Err(error) => machine.handle(SubscriptionInput::Failed(error)),
+    }
+}
+
+/// One `Apply`: fold `envelope`, counting the projection and timing the
+/// batch it opens. A rejection drops the batch's timing window.
+async fn apply_one<E, P>(
+    machine: &mut SubscriptionMachine<E>,
+    projection: &mut P,
+    metrics: &dyn Metrics,
+    batch_started: &mut Option<std::time::Instant>,
+    envelope: EventEnvelope<E>,
+) -> SubscriptionAction<E>
+where
+    P: Projection<Event = E>,
+    P::Error: core::fmt::Display,
+    E: Clone + Send,
+{
+    let sequence = envelope.sequence;
+    if batch_started.is_none() {
+        *batch_started = Some(std::time::Instant::now());
+    }
+    match projection.apply(&envelope).await {
+        Ok(()) => {
+            metrics.counter(PROJECTED_EVENTS, 1);
+            machine.handle(SubscriptionInput::Applied)
+        }
+        Err(error) => {
+            *batch_started = None;
+            machine.handle(SubscriptionInput::ApplyFailed {
+                error: StoreError::other(format!(
+                    "projection applying sequence {sequence}: {error}"
+                )),
+            })
+        }
+    }
+}
+
+/// One `Park`: record the given-up event, counting the record and its
+/// refusal, and report the answer.
+#[allow(clippy::too_many_arguments)] // the action's own payload, unpacked
+async fn park_one<E, K>(
+    machine: &mut SubscriptionMachine<E>,
+    parked: &K,
+    metrics: &dyn Metrics,
+    batch_started: &mut Option<std::time::Instant>,
+    name: &str,
+    envelope: EventEnvelope<E>,
+    attempts: u32,
+    error: StoreError,
+) -> SubscriptionAction<E>
+where
+    K: ParkedStore<E>,
+    E: Clone + Send,
+{
+    *batch_started = None;
+    let event = ParkedEvent {
+        subscription: name.to_owned(),
+        envelope,
+        attempts,
+        error: error.to_string(),
+    };
+    let recorded = parked.park(event).await;
+    let recorded = recorded.inspect_err(|_| metrics.counter(PARK_FAILURES, 1));
+    match recorded {
+        Ok(()) => {
+            metrics.counter(PARKED_EVENTS, 1);
+            machine.handle(SubscriptionInput::Parked)
+        }
+        Err(error) => machine.handle(SubscriptionInput::ParkFailed { error }),
+    }
+}
+
+/// One `Ack`: persist `checkpoint`, counting a failure and the batch's
+/// latency, and report the answer. The `bool` says whether the
+/// checkpoint persisted — the leased driver records the last acked
+/// position only then.
+async fn ack_batch<E, C>(
+    machine: &mut SubscriptionMachine<E>,
+    checkpoints: &C,
+    metrics: &dyn Metrics,
+    batch_started: &mut Option<std::time::Instant>,
+    name: &str,
+    checkpoint: eventyr_core::subscription::Checkpoint,
+) -> (SubscriptionAction<E>, bool)
+where
+    C: CheckpointStore,
+    E: Clone + Send,
+{
+    let stored = checkpoints.store(name, checkpoint).await;
+    let stored = stored.inspect_err(|_| metrics.counter(ACK_FAILURES, 1));
+    match stored {
+        Ok(()) => {
+            if let Some(start) = batch_started.take() {
+                metrics.histogram(
+                    eventyr_store::metrics::names::PROJECT_BATCH_LATENCY,
+                    start.elapsed(),
+                );
+            }
+            (machine.handle(SubscriptionInput::Acked), true)
+        }
+        Err(error) => {
+            *batch_started = None;
+            (
+                machine.handle(SubscriptionInput::AckFailed { error }),
+                false,
+            )
+        }
+    }
+}
+
+/// One `Sleep`: fire the catch-up pulse on an idle sleep, wait (an
+/// idle one racing the commit listener), and report `Slept`.
+async fn sleep_one<E, F, Fut, W>(
+    machine: &mut SubscriptionMachine<E>,
+    sleep: &mut F,
+    wake: &mut Option<W>,
+    catch: &dyn Catch,
+    for_: core::time::Duration,
+    reason: SleepReason,
+) -> SubscriptionAction<E>
+where
+    F: FnMut(core::time::Duration) -> Fut,
+    Fut: Future<Output = ()>,
+    W: CommitListener,
+    E: Clone + Send,
+{
+    if reason == SleepReason::Idle {
+        catch.caught_up();
+    }
+    wait(sleep, for_, reason, wake).await;
+    machine.handle(SubscriptionInput::Slept)
 }
 
 /// How a leased projector run ended before the machine finished (0.7.9).
@@ -476,52 +604,11 @@ impl From<StoreError> for RunError {
     }
 }
 
-/// Release the held lease when the driver leaves the loop, on any path.
-struct LeaseGuard<'l, Le: ProjectorLease> {
-    leases: &'l Le,
-    lease: Option<Le::Lease>,
-}
-
-impl<Le: ProjectorLease> LeaseGuard<'_, Le> {
-    /// `lease` here; releasing it is the destructor's work. A lease
-    /// dropped this way never reports to the return value — a lost
-    /// one's release is best-effort Ok either way.
-    fn new<'l>(leases: &'l Le, lease: Le::Lease) -> LeaseGuard<'l, Le> {
-        LeaseGuard {
-            leases,
-            lease: Some(lease),
-        }
-    }
-
-    /// The held lease mutably, for the renewal.
-    fn lease_mut(&mut self) -> &mut Le::Lease {
-        self.lease.as_mut().expect("the guard holds its lease")
-    }
-
-    /// Disarm: the run is over, hand the lease out for release
-    /// without the Drop. The caller awaits the release.
-    async fn disarm(mut self) -> Result<(), RunError> {
-        let lease = self.lease.take().expect("the guard holds its lease");
-        self.leases.release(lease).await?;
-        core::mem::forget(self);
-        Ok(())
-    }
-}
-
-impl<Le: ProjectorLease> Drop for LeaseGuard<'_, Le> {
-    fn drop(&mut self) {
-        // The lease release is async, so the guard cannot await it here;
-        // the name expires on its grace bound regardless. Only the
-        // disarming path (a completed run, or `lost`) awaits release.
-        let _ = self.lease.take();
-    }
-}
-
 /// [`drive_projector`] under a [`ProjectorLease`] (0.7.9): hold the
-/// named lease from before the checkpoint is read until the run ends —
-/// renewed when due before every `Fetch` and before every `Ack` (the
-/// renewal is the fence on the checkpoint write) — and stop on a loss
-/// with the last acked position, never writing again.
+/// named lease from before the run's first checkpoint write until it
+/// ends — renewed when due before every `Fetch` and before every `Ack`
+/// (the renewal is the fence on the checkpoint write) — and stop on a
+/// loss with the last acked position, never writing again.
 ///
 /// The `SubscriptionMachine`'s protocol is untouched: nothing here is
 /// a transition it can make (§7); the driver simply refuses to keep
@@ -552,17 +639,19 @@ where
     Le: ProjectorLease,
     E: Clone + Send,
 {
-    let lease = match leases
+    let mut lease = match leases
         .acquire(name, policy.ttl, policy.grace, policy.max_grace)
         .await
     {
         Ok(lease) => lease,
         Err(LeaseError::Taken) => {
+            ports.metrics.counter(LEASE_LOST, 1);
             return Err(RunError::Taken {
                 name: name.to_owned(),
             });
         }
         Err(LeaseError::Lost) => {
+            ports.metrics.counter(LEASE_LOST, 1);
             return Err(RunError::LeaseLost {
                 name: name.to_owned(),
                 checkpoint: eventyr_core::subscription::Checkpoint::ORIGIN,
@@ -570,7 +659,6 @@ where
         }
         Err(LeaseError::Store { error, .. }) => return Err(RunError::Store(error)),
     };
-    let mut guard = LeaseGuard::new(leases, lease);
     let DriverPorts {
         wake,
         parked,
@@ -578,7 +666,11 @@ where
         catch,
     } = ports;
     let mut wake = Some(wake);
-    let mut renewed_at = std::time::Instant::now();
+    // The next renewal is due at `due_at`: a full `ttl` past a
+    // successful renewal, or the store's own presumed-held deadline
+    // when a renewal failed against a live store — renew AT that
+    // deadline, not a ttl past it.
+    let mut due_at = std::time::Instant::now() + policy.ttl;
     let mut last_acked = checkpoints.load(name).await.map_err(RunError::Store)?;
     let mut action = machine.start();
     let mut batch_started: Option<std::time::Instant> = None;
@@ -587,148 +679,150 @@ where
             SubscriptionAction::Fetch { from, limit } => {
                 // Renew once due; the fetch's answer is covered by a
                 // currently-held lease.
-                if std::time::Instant::now() >= renewed_at + policy.ttl {
-                    match renew_lease(leases, guard.lease_mut(), policy).await {
-                        RenewOutcome::Renewed(at) => renewed_at = at,
+                if std::time::Instant::now() >= due_at {
+                    match renew_lease(leases, &mut lease, policy, metrics).await {
+                        RenewOutcome::Due(at) => due_at = at,
                         RenewOutcome::Lost => {
-                            return Err(guard.lost(name, last_acked).await);
+                            return Err(lease_lost(leases, lease, name, last_acked).await);
                         }
                     }
                 }
-                match source.fetch(from, limit).await {
-                    Ok(batch) => machine.handle(SubscriptionInput::Fetched { batch }),
-                    Err(error) => machine.handle(SubscriptionInput::Failed(error)),
-                }
+                fetch_batch(machine, source, metrics, from, limit).await
             }
             SubscriptionAction::Apply { envelope } => {
-                let sequence = envelope.sequence;
-                if batch_started.is_none() {
-                    batch_started = Some(std::time::Instant::now());
-                }
-                match projection.apply(&envelope).await {
-                    Ok(()) => {
-                        metrics.counter(PROJECTED_EVENTS, 1);
-                        machine.handle(SubscriptionInput::Applied)
-                    }
-                    Err(error) => {
-                        batch_started = None;
-                        machine.handle(SubscriptionInput::ApplyFailed {
-                            error: StoreError::other(format!(
-                                "projection applying sequence {sequence}: {error}"
-                            )),
-                        })
-                    }
-                }
+                apply_one(
+                    machine,
+                    &mut projection,
+                    metrics,
+                    &mut batch_started,
+                    envelope,
+                )
+                .await
             }
             SubscriptionAction::Park {
                 envelope,
                 attempts,
                 error,
             } => {
-                batch_started = None;
-                let event = ParkedEvent {
-                    subscription: name.to_owned(),
+                park_one(
+                    machine,
+                    &parked,
+                    metrics,
+                    &mut batch_started,
+                    name,
                     envelope,
                     attempts,
-                    error: error.to_string(),
-                };
-                let recorded = parked.park(event).await;
-                let recorded = recorded.inspect_err(|_| metrics.counter(PARK_FAILURES, 1));
-                match recorded {
-                    Ok(()) => {
-                        metrics.counter(PARKED_EVENTS, 1);
-                        machine.handle(SubscriptionInput::Parked)
-                    }
-                    Err(error) => machine.handle(SubscriptionInput::ParkFailed { error }),
-                }
+                    error,
+                )
+                .await
             }
             SubscriptionAction::Ack { checkpoint } => {
                 // Renew first: the renewal *is* the fence on the
                 // checkpoint write.
-                match renew_lease(leases, guard.lease_mut(), policy).await {
-                    RenewOutcome::Renewed(at) => renewed_at = at,
+                match renew_lease(leases, &mut lease, policy, metrics).await {
+                    RenewOutcome::Due(at) => due_at = at,
                     RenewOutcome::Lost => {
-                        return Err(guard.lost(name, last_acked).await);
+                        return Err(lease_lost(leases, lease, name, last_acked).await);
                     }
                 }
-                match checkpoints.store(name, checkpoint).await {
-                    Ok(()) => {
-                        last_acked = checkpoint;
-                        if let Some(start) = batch_started.take() {
-                            metrics.histogram(
-                                eventyr_store::metrics::names::PROJECT_BATCH_LATENCY,
-                                start.elapsed(),
-                            );
-                        }
-                        metrics.counter(eventyr_store::metrics::names::LEASE_RENEWALS, 1);
-                        machine.handle(SubscriptionInput::Acked)
-                    }
-                    Err(error) => {
-                        batch_started = None;
-                        machine.handle(SubscriptionInput::AckFailed { error })
-                    }
+                let (action, persisted) = ack_batch(
+                    machine,
+                    checkpoints,
+                    metrics,
+                    &mut batch_started,
+                    name,
+                    checkpoint,
+                )
+                .await;
+                if persisted {
+                    last_acked = checkpoint;
                 }
+                action
             }
             SubscriptionAction::Sleep { for_, reason } => {
-                if reason == SleepReason::Idle {
-                    catch.caught_up();
-                }
-                wait(&mut sleep, for_, reason, &mut wake).await;
-                machine.handle(SubscriptionInput::Slept)
+                sleep_one(machine, &mut sleep, &mut wake, catch, for_, reason).await
             }
             SubscriptionAction::Done(outcome) => {
-                guard.disarm().await?;
+                // Best-effort release: the outcome is the run's answer,
+                // and a failed release only means the name frees at its
+                // grace bound instead of at once — counted, never fatal.
+                if leases.release(lease).await.is_err() {
+                    metrics.counter(LEASE_RELEASE_FAILURES, 1);
+                }
                 return Ok(outcome);
             }
         };
     }
 }
 
-/// The driver's two renewal outcomes.
+/// The driver's two renewal answers: when the next renewal is due, or
+/// that the lease is gone and the run must stop.
 enum RenewOutcome {
-    Renewed(std::time::Instant),
+    /// Renewed (or presumed held); due again at the carried instant.
+    Due(std::time::Instant),
     Lost,
 }
 
-/// Renew the lease, translating the port's error into the driver's
-/// two-way answer and counting renewals.
+/// Renew the lease, counting the attempt's outcome, and translate the
+/// port's error into the driver's two-way answer. [`RenewOutcome::Due`]
+/// carries *when the next renewal is due*: a full `ttl` past a
+/// successful renewal, or the store's own presumed-held deadline when
+/// the renewal failed against a live store. A failed renewal that
+/// still presumes the lease held counts a failure but not a renewal —
+/// the renewal did not happen.
 async fn renew_lease<Le: ProjectorLease>(
     leases: &Le,
     lease: &mut Le::Lease,
     policy: LeasePolicy,
+    metrics: &dyn Metrics,
 ) -> RenewOutcome {
     match leases
         .renew(lease, policy.ttl, policy.grace, policy.max_grace)
         .await
     {
-        Ok(at) => RenewOutcome::Renewed(at),
-        Err(LeaseError::Lost) => RenewOutcome::Lost,
-        Err(LeaseError::Taken) => RenewOutcome::Lost, // unreachable on renew in any conforming store
-        Err(LeaseError::Store { renewed_until, .. }) => match renewed_until {
-            Some(deadline) if std::time::Instant::now() < deadline => {
-                RenewOutcome::Renewed(deadline)
+        Ok(at) => {
+            metrics.counter(LEASE_RENEWALS, 1);
+            RenewOutcome::Due(at + policy.ttl)
+        }
+        Err(LeaseError::Lost) => {
+            metrics.counter(LEASE_LOST, 1);
+            RenewOutcome::Lost
+        }
+        // Unreachable on renew in any conforming store; the name is
+        // still not this run's, so it counts and stops as lost.
+        Err(LeaseError::Taken) => {
+            metrics.counter(LEASE_LOST, 1);
+            RenewOutcome::Lost
+        }
+        Err(LeaseError::Store { renewed_until, .. }) => {
+            metrics.counter(LEASE_RENEW_FAILURES, 1);
+            match renewed_until {
+                Some(deadline) if std::time::Instant::now() < deadline => {
+                    RenewOutcome::Due(deadline)
+                }
+                _ => {
+                    metrics.counter(LEASE_LOST, 1);
+                    RenewOutcome::Lost // doubtful and out of renewals stops
+                }
             }
-            _ => RenewOutcome::Lost, // doubtful and out of renewals stops
-        },
+        }
     }
 }
 
-impl<Le: ProjectorLease> LeaseGuard<'_, Le> {
-    /// Disarm with the lease lost: release best-effort, then return the
-    /// last acked checkpoint as the resume point.
-    async fn lost(
-        mut self,
-        name: &str,
-        last_acked: eventyr_core::subscription::Checkpoint,
-    ) -> RunError {
-        if let Some(lease) = self.lease.take() {
-            let _ = self.leases.release(lease).await;
-        }
-        core::mem::forget(self);
-        RunError::LeaseLost {
-            name: name.to_owned(),
-            checkpoint: last_acked,
-        }
+/// Release best-effort and build the [`RunError::LeaseLost`] the run
+/// ends with: the last acked checkpoint is the next driver's resume
+/// point. The release of an already-lost lease carries no signal —
+/// the row is gone — so it is silent.
+async fn lease_lost<Le: ProjectorLease>(
+    leases: &Le,
+    lease: Le::Lease,
+    name: &str,
+    last_acked: eventyr_core::subscription::Checkpoint,
+) -> RunError {
+    let _ = leases.release(lease).await;
+    RunError::LeaseLost {
+        name: name.to_owned(),
+        checkpoint: last_acked,
     }
 }
 
@@ -917,29 +1011,6 @@ impl<S, C, P, W, K> Projector<S, C, P, W, K> {
 }
 
 impl<S, C, P, K> Projector<S, C, P, NoSignal, K> {
-    /// [`run`](Self::run) with the catch-up pulse: `catch` fires once
-    /// per idle sleep, so a test asserts read-model state the moment
-    /// the projector catches up instead of waiting a wall clock.
-    pub async fn run_caught<F, Fut>(
-        self,
-        sleep: F,
-        catch: &dyn Catch,
-    ) -> Result<SubscriptionOutcome, StoreError>
-    where
-        S: SubscriptionSource<Event = P::Event>,
-        C: CheckpointStore,
-        P: Projection,
-        P::Error: core::fmt::Display,
-        F: FnMut(core::time::Duration) -> Fut,
-        Fut: Future<Output = ()>,
-        P::Event: Clone + Send,
-        K: ParkedStore<P::Event>,
-    {
-        self.drive_caught(sleep, catch, NoSignal).await
-    }
-}
-
-impl<S, C, P, K> Projector<S, C, P, NoSignal, K> {
     /// Load the persisted checkpoint, then drive the subscription to
     /// completion, waiting via `sleep` between polls.
     ///
@@ -960,29 +1031,6 @@ impl<S, C, P, K> Projector<S, C, P, NoSignal, K> {
         K: ParkedStore<P::Event>,
     {
         self.drive(sleep, NoSignal).await
-    }
-}
-
-impl<S, C, P, W: CommitSignal, K> Projector<S, C, P, W, K> {
-    /// [`run_woken`](Self::run_woken) with the catch-up pulse. See
-    /// [`run_caught`](Projector::run_caught).
-    pub async fn run_woken_caught<F, Fut>(
-        self,
-        sleep: F,
-        catch: &dyn Catch,
-    ) -> Result<SubscriptionOutcome, StoreError>
-    where
-        S: SubscriptionSource<Event = P::Event>,
-        C: CheckpointStore,
-        P: Projection,
-        P::Error: core::fmt::Display,
-        F: FnMut(core::time::Duration) -> Fut,
-        Fut: Future<Output = ()>,
-        P::Event: Clone + Send,
-        K: ParkedStore<P::Event>,
-    {
-        let listener = self.wake.subscribe().await?;
-        self.drive_caught(sleep, catch, listener).await
     }
 }
 
@@ -1072,6 +1120,7 @@ impl<S, C, P, K> Projector<S, C, P, NoSignal, K> {
             projector: self,
             leases,
             policy: LeasePolicy::default(),
+            catch: None,
         }
     }
 }
@@ -1087,6 +1136,7 @@ impl<S, C, P, W: CommitSignal, K> Projector<S, C, P, W, K> {
             projector: self,
             leases,
             policy: LeasePolicy::default(),
+            catch: None,
         }
     }
 }
@@ -1097,6 +1147,7 @@ pub struct LeasedProjector<S, C, P, W, K, Le> {
     projector: Projector<S, C, P, W, K>,
     leases: Le,
     policy: LeasePolicy,
+    catch: Option<Arc<dyn Catch>>,
 }
 
 impl<S, C, P, W, K, Le> LeasedProjector<S, C, P, W, K, Le> {
@@ -1109,6 +1160,14 @@ impl<S, C, P, W, K, Le> LeasedProjector<S, C, P, W, K, Le> {
     /// The projector's name — the lease's name.
     pub fn name(&self) -> &str {
         self.projector.name()
+    }
+
+    /// Signal `catch` on every idle sleep of the leased run (§14's
+    /// catch-up pulse): the leased driver fires it exactly as the
+    /// plain one does.
+    pub fn caught_up_on(mut self, catch: impl Catch + 'static) -> Self {
+        self.catch = Some(Arc::new(catch));
+        self
     }
 
     /// Drive the subscription under the lease.
@@ -1153,11 +1212,7 @@ impl<S, C, P, W, K, Le> LeasedProjector<S, C, P, W, K, Le> {
         if matches!(self.projector.policy.on_failure, FailurePolicy::Park { .. })
             && !<K as ParkedStore<P::Event>>::RECORDS
         {
-            return Err(RunError::Store(StoreError::other(format!(
-                "projector `{}` parks failing events but has no parked store; \
-                 give it one with `park_into`",
-                self.projector.name
-            ))));
+            return Err(RunError::Store(self.projector.park_refusal()));
         }
         let mut machine = SubscriptionMachine::new(
             self.projector.policy,
@@ -1167,14 +1222,13 @@ impl<S, C, P, W, K, Le> LeasedProjector<S, C, P, W, K, Le> {
                 .await
                 .map_err(RunError::Store)?,
         );
-        let metrics: &dyn Metrics = match &self.projector.metrics {
-            Some(metrics) => &**metrics,
-            None => &NoopMetrics,
-        };
-        let ports = DriverPorts::new()
+        let mut ports = DriverPorts::new()
             .wake_on(listener)
             .park_into(self.projector.parked)
-            .with_metrics(metrics);
+            .with_metrics(metrics_or_noop(&self.projector.metrics));
+        if let Some(catch) = self.catch.as_deref() {
+            ports = ports.caught_up_on(catch);
+        }
         drive_projector_leased(
             &mut machine,
             &self.projector.name,
@@ -1215,6 +1269,17 @@ impl<S, C, P, W: CommitSignal, K, Le> LeasedProjector<S, C, P, W, K, Le> {
 }
 
 impl<S, C, P, W, K> Projector<S, C, P, W, K> {
+    /// The misconfiguration answer: a parking policy with no parked
+    /// store refuses to run rather than retry the event forever
+    /// against [`NoParking`].
+    fn park_refusal(&self) -> StoreError {
+        StoreError::other(format!(
+            "projector `{}` parks failing events but has no parked store; \
+             give it one with `park_into`",
+            self.name
+        ))
+    }
+
     async fn drive<F, Fut, L>(
         self,
         sleep: F,
@@ -1234,22 +1299,14 @@ impl<S, C, P, W, K> Projector<S, C, P, W, K> {
         if matches!(self.policy.on_failure, FailurePolicy::Park { .. })
             && !<K as ParkedStore<P::Event>>::RECORDS
         {
-            return Err(StoreError::other(format!(
-                "projector `{}` parks failing events but has no parked store; \
-                 give it one with `park_into`",
-                self.name
-            )));
+            return Err(self.park_refusal());
         }
         let resume = self.checkpoints.load(&self.name).await?;
         let mut machine = SubscriptionMachine::new(self.policy, resume);
-        let metrics: &dyn Metrics = match &self.metrics {
-            Some(metrics) => &**metrics,
-            None => &NoopMetrics,
-        };
         let ports = DriverPorts::new()
             .wake_on(listener)
             .park_into(self.parked)
-            .with_metrics(metrics);
+            .with_metrics(metrics_or_noop(&self.metrics));
         Ok(drive_projector(
             &mut machine,
             &self.name,
@@ -1284,22 +1341,14 @@ impl<S, C, P, W, K> Projector<S, C, P, W, K> {
         if matches!(self.policy.on_failure, FailurePolicy::Park { .. })
             && !<K as ParkedStore<P::Event>>::RECORDS
         {
-            return Err(StoreError::other(format!(
-                "projector `{}` parks failing events but has no parked store; \
-                 give it one with `park_into`",
-                self.name
-            )));
+            return Err(self.park_refusal());
         }
         let resume = self.checkpoints.load(&self.name).await?;
         let mut machine = SubscriptionMachine::new(self.policy, resume);
-        let metrics: &dyn Metrics = match &self.metrics {
-            Some(metrics) => &**metrics,
-            None => &NoopMetrics,
-        };
         let ports = DriverPorts::new()
             .wake_on(listener)
             .park_into(self.parked)
-            .with_metrics(metrics)
+            .with_metrics(metrics_or_noop(&self.metrics))
             .caught_up_on(catch);
         Ok(drive_projector(
             &mut machine,
@@ -1311,5 +1360,31 @@ impl<S, C, P, W, K> Projector<S, C, P, W, K> {
             ports,
         )
         .await)
+    }
+}
+
+/// The metrics to report through — [`NoopMetrics`] when none was
+/// given. A free function over the field, so the drive methods can
+/// move the rest of `self` while it is alive.
+fn metrics_or_noop(metrics: &Option<Arc<dyn Metrics>>) -> &dyn Metrics {
+    match metrics {
+        Some(metrics) => &**metrics,
+        None => &NoopMetrics,
+    }
+}
+
+#[cfg(all(test, feature = "tokio_notify"))]
+mod tokio_notify_tests {
+    use super::Catch;
+
+    #[tokio::test]
+    async fn a_notify_catch_wakes_its_waiters() {
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut notified = core::pin::pin!(notify.notified());
+        // Register the waiter before firing: `notify_waiters` wakes only
+        // the waiters registered when it runs.
+        notified.as_mut().enable();
+        Catch::caught_up(&notify);
+        notified.await;
     }
 }

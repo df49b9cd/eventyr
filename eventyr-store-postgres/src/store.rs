@@ -15,7 +15,7 @@ use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 use eventyr_store::store::{
     EventFilter, EventStore, FilteredRead, QueryAppend, StreamLifecycle, StreamsAll, TruncatePlan,
-    plan_truncate, read_starts_before_cut, sql_position, validate_batch,
+    all_events, plan_truncate, read_starts_before_cut, sql_position, validate_batch,
 };
 use futures::Stream;
 use sqlx::postgres::PgPool;
@@ -345,11 +345,7 @@ where
         let rows = append_events_tx(&mut *conn, append.stream_id.as_str(), args)
             .await
             .map_err(PgStoreError::into_store)?;
-        let events = rows
-            .into_iter()
-            .map(EventEnvelope::try_from)
-            .collect::<Result<Vec<_>, PgStoreError>>()
-            .map_err(StoreError::from)?;
+        let events = decode_rows(rows)?;
         committed.push(CommittedStream {
             stream_id: append.stream_id,
             events,
@@ -411,14 +407,6 @@ async fn query_page<'c>(
 }
 
 const QUERY_PAGE: i64 = 512;
-
-/// The events of every append, in commit order, for the inline views.
-fn all_events<E: Clone>(committed: &[CommittedStream<E>]) -> Vec<EventEnvelope<E>> {
-    committed
-        .iter()
-        .flat_map(|stream| stream.events.iter().cloned())
-        .collect()
-}
 
 impl<E> EventStore for PgStore<E>
 where
@@ -578,21 +566,9 @@ where
     ) -> impl Stream<Item = Result<EventEnvelope<E>, StoreError>> + Send {
         let pool = self.pool.clone();
         Box::pin(async_stream::stream! {
-            const PAGE: i64 = 512;
             let mut cursor = sql_position(from.as_u64());
             loop {
-                let query = sqlx::AssertSqlSafe(format!(
-                    "SELECT {EVENT_COLUMNS} FROM events WHERE global_sequence > $1 \
-                     ORDER BY global_sequence LIMIT $2"
-                ));
-                let rows = sqlx::query_as::<_, EventRow>(query)
-                    .bind(cursor)
-                    .bind(PAGE)
-                    .fetch_all(&pool)
-                    .await
-                    .map_err(PgStoreError::into_store);
-
-                let rows = match rows {
+                let rows = match query_page(&pool, None, cursor, QUERY_PAGE).await {
                     Ok(rows) => rows,
                     Err(error) => {
                         yield Err(error);
@@ -605,7 +581,7 @@ where
                     yield EventEnvelope::try_from(row).map_err(StoreError::from);
                 }
                 // An empty (or short) page is the end of the log.
-                if page_len < PAGE as usize {
+                if page_len < QUERY_PAGE as usize {
                     return;
                 }
             }

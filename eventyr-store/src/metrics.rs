@@ -40,10 +40,16 @@ pub mod names {
     /// [`LeaseLost`](eventyr_core::subscription::SubscriptionOutcome)-side
     /// loss and stop.
     pub const LEASE_RENEW_FAILURES: &str = "eventyr_lease_renew_failures_total";
-    /// Leases lost mid-run: another holder owns the name, or the holder
-    /// can no longer renew. Each one ends a driver run; a repeating one
-    /// means two projectors are configured on one name.
+    /// Leases a driver run ended without: another holder owns the name
+    /// (an entry refusal or a takeover), or the holder can no longer
+    /// renew. Each one ends a driver run; a repeating one means two
+    /// projectors are configured on one name.
     pub const LEASE_LOST: &str = "eventyr_lease_lost_total";
+    /// Releases of a completed run's lease that failed: the run's
+    /// outcome is unaffected — the name frees at its grace bound
+    /// instead of at once. A steady rate means the lease store is
+    /// flaky at exactly the moment runs end.
+    pub const LEASE_RELEASE_FAILURES: &str = "eventyr_lease_release_failures_total";
 }
 
 /// The tracing backend: each instrument call becomes a `tracing` event.

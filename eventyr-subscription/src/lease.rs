@@ -106,45 +106,37 @@ pub struct LeasePolicy {
     pub max_grace: u32,
 }
 
-impl Default for LeasePolicy {
-    fn default() -> Self {
+impl LeasePolicy {
+    /// A policy: renew every `ttl`, survive `grace` missed renewals,
+    /// never live past `max_grace` renewals from acquire.
+    ///
+    /// # Panics
+    ///
+    /// When `ttl` is zero, `grace` is zero, or `max_grace` undercuts
+    /// `grace`: a zero ttl makes every lease instantly stale, and a
+    /// zero grace never holds one — the second `acquire` succeeds while
+    /// the first holder still runs. The struct literal stays available
+    /// to tests that need exactly those degenerates. A store may be
+    /// stricter (Postgres requires `max_grace > grace`); its refusal
+    /// surfaces as [`LeaseError::Store`].
+    pub const fn new(ttl: Duration, grace: u32, max_grace: u32) -> Self {
+        assert!(!ttl.is_zero(), "a lease's ttl must be positive");
+        assert!(grace >= 1, "a lease's grace must allow one missed renewal");
+        assert!(
+            max_grace >= grace,
+            "a lease's max_grace cannot undercut its grace"
+        );
         Self {
-            ttl: Duration::from_secs(5),
-            grace: 3,
-            max_grace: 12,
+            ttl,
+            grace,
+            max_grace,
         }
     }
 }
 
-/// A lease for drivers that do not want one — the default third port.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoLease;
-
-impl ProjectorLease for NoLease {
-    type Lease = ();
-
-    async fn acquire(
-        &self,
-        _: &str,
-        _: Duration,
-        _: u32,
-        _: u32,
-    ) -> Result<Self::Lease, LeaseError> {
-        Ok(())
-    }
-
-    async fn renew(
-        &self,
-        _: &mut Self::Lease,
-        _: Duration,
-        _: u32,
-        _: u32,
-    ) -> Result<Instant, LeaseError> {
-        Ok(Instant::now())
-    }
-
-    async fn release(&self, _: Self::Lease) -> Result<(), StoreError> {
-        Ok(())
+impl Default for LeasePolicy {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(5), 3, 12)
     }
 }
 
@@ -198,24 +190,39 @@ impl InMemoryLeaseStore {
             .is_some_and(|row| row.held_at(Instant::now()))
     }
 
-    /// Force `name` to expire — the test seam for "the holder died".
+    /// Force `name` past its grace — the test seam for "the holder
+    /// stalled": the next renewal or acquire sees the lease as expired.
     #[cfg(any(test, feature = "testing"))]
     pub fn expire(&self, name: &str) {
         if let Some(row) = self.lock().get_mut(name) {
             row.renewed_at = Instant::now()
                 .checked_sub(row.ttl * row.grace + Duration::from_secs(1))
-                .unwrap_or_else(Instant::now);
+                .expect("the monotonic clock predates the lease window");
+        }
+    }
+
+    /// Force `name` past its `max_grace` while renewed within its
+    /// grace — the test seam for "no lease outlives max_grace": the
+    /// next renewal fails on the acquired-at bound alone. Backdating
+    /// both anchors would not discriminate: the grace clause would
+    /// fail first, and a store with no acquired-at check would pass.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn expire_at_max_grace(&self, name: &str) {
+        if let Some(row) = self.lock().get_mut(name) {
+            row.acquired_at = Instant::now()
+                .checked_sub(row.ttl * row.max_grace + Duration::from_secs(1))
+                .expect("the monotonic clock predates the lease window");
         }
     }
 }
 
-/// The in-memory lease handle: the holder id and when it was acquired.
+/// The in-memory lease handle: the holder id and the name it holds.
+/// The time state lives in the store's row — the handle's copy could
+/// only drift.
 #[derive(Debug)]
 pub struct InMemoryLease {
     name: String,
     holder: Uuid,
-    renewed_at: Instant,
-    acquired_at: Instant,
 }
 
 impl ProjectorLease for InMemoryLeaseStore {
@@ -250,8 +257,6 @@ impl ProjectorLease for InMemoryLeaseStore {
         Ok(InMemoryLease {
             name: name.to_owned(),
             holder,
-            renewed_at: now,
-            acquired_at: now,
         })
     }
 
@@ -274,8 +279,6 @@ impl ProjectorLease for InMemoryLeaseStore {
         row.ttl = ttl;
         row.grace = grace;
         row.max_grace = max_grace;
-        lease.renewed_at = now;
-        lease.acquired_at = row.acquired_at;
         Ok(now)
     }
 
@@ -328,9 +331,12 @@ macro_rules! impl_lease_delegation {
 impl_lease_delegation!(&L);
 impl_lease_delegation!(std::sync::Arc<L>);
 
-/// Run the [`ProjectorLease`] contract against `make_store`'s fresh
-/// stores. Every implementation runs it, behind this crate's `testing`
-/// feature.
+/// Run the [`ProjectorLease`] contract against `make_store`'s stores.
+/// Every implementation runs it, behind this crate's `testing`
+/// feature. A fresh store per call is not required — each case uses
+/// its own name, so one shared store (a clone of one pool, say)
+/// works; the factory is called per case so a fresh store *can* be
+/// given.
 #[cfg(any(test, feature = "testing"))]
 pub fn lease_store_contract<L: ProjectorLease>(make_store: impl Fn() -> L) {
     use futures::executor::block_on;
@@ -382,4 +388,48 @@ pub fn lease_store_contract<L: ProjectorLease>(make_store: impl Fn() -> L) {
         block_on(store.renew(&mut lease, zero.ttl, zero.grace, zero.max_grace)),
         Err(LeaseError::Lost)
     ));
+
+    // A lease renewed on schedule still dies at `ttl * max_grace` from
+    // acquire — a stuck holder cannot jail the name forever. The
+    // renewal lands within grace; the final check lands past
+    // max_grace but within grace of that renewal, so the acquired-at
+    // bound is the one that fails. (Sleeping past max_grace *without*
+    // renewing would not do: the grace bound lapses first, and a store
+    // without the acquired-at check would pass.)
+    let store = make_store();
+    let bounded = LeasePolicy {
+        ttl: Duration::from_millis(100),
+        grace: 3,
+        max_grace: 4,
+    };
+    let mut lease =
+        block_on(store.acquire("max-grace", bounded.ttl, bounded.grace, bounded.max_grace))
+            .expect("acquire");
+    std::thread::sleep(Duration::from_millis(200)); // within grace (300 ms)
+    block_on(store.renew(&mut lease, bounded.ttl, bounded.grace, bounded.max_grace))
+        .expect("renewed in time");
+    std::thread::sleep(Duration::from_millis(260)); // past max_grace (400 ms)
+    assert!(matches!(
+        block_on(store.renew(&mut lease, bounded.ttl, bounded.grace, bounded.max_grace)),
+        Err(LeaseError::Lost)
+    ));
+
+    // Releasing with a handle that no longer owns the row is a no-op:
+    // the previous holder's expired handle must not free the new
+    // holder's lease. The first holder takes the short-lived policy so
+    // it expires; the new one takes the default, so it is still held at
+    // the final check — `Taken` there can only mean the stale release
+    // left the row alone.
+    let store = make_store();
+    let stale =
+        block_on(store.acquire("stale", zero.ttl, zero.grace, zero.max_grace)).expect("acquire");
+    std::thread::sleep(Duration::from_millis(10)); // past ttl * grace
+    let current = block_on(store.acquire("stale", policy.ttl, policy.grace, policy.max_grace))
+        .expect("the expired name is claimable");
+    block_on(store.release(stale)).expect("releasing a stale handle is Ok");
+    assert!(matches!(
+        block_on(store.acquire("stale", policy.ttl, policy.grace, policy.max_grace)),
+        Err(LeaseError::Taken) // the new holder was not disturbed
+    ));
+    block_on(store.release(current)).expect("release");
 }

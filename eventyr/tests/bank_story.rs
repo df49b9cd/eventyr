@@ -165,6 +165,7 @@ fn decide(
 )]
 struct Account;
 
+#[derive(Clone)]
 struct Transfer {
     from: u64,
     to: u64,
@@ -174,32 +175,17 @@ impl Transfer {
     fn stream_of(&self, id: u64) -> StreamId {
         StreamId::for_aggregate::<Account>(&AccountId(id))
     }
+    /// `for_aggregates` derives the streams and the per-stream folds
+    /// from the boundary the decider itself names — the same shape the
+    /// example ships.
     fn machine(&self, metadata: Metadata) -> BatchMachine<AccountEvent, AccountError, Transfer> {
-        BatchMachine::new(
-            vec![self.stream_of(self.from), self.stream_of(self.to)],
-            [self.from, self.to]
-                .iter()
-                .map(|&id| {
-                    (
-                        self.stream_of(id),
-                        Box::new(AggregateFold::<Account>(AccountId(id)))
-                            as Box<dyn Fold<AccountEvent>>,
-                    )
-                })
-                .collect(),
-            Transfer {
-                from: self.from,
-                to: self.to,
-                amount: self.amount,
-            },
-            Transfer {
-                from: self.from,
-                to: self.to,
-                amount: self.amount,
-            },
-            RetryPolicy::default(),
-        )
-        .with_metadata(metadata)
+        BatchMachine::for_aggregates(self, RetryPolicy::default()).with_metadata(metadata)
+    }
+}
+
+impl AggregateBoundary<Account> for Transfer {
+    fn boundary(&self) -> Vec<AccountId> {
+        vec![AccountId(self.from), AccountId(self.to)]
     }
 }
 impl Decide<AccountEvent, AccountError> for Transfer {
@@ -404,7 +390,13 @@ async fn run_story() -> (Rig, BTreeMap<u64, u64>) {
         to: 2,
         amount: 30,
     };
-    let transfer_metadata = || Metadata::default().with_idempotency_key("transfer-1");
+    let transfer_metadata = || {
+        Metadata {
+            causation_id: Some("transfer-1".into()),
+            ..Default::default()
+        }
+        .with_idempotency_key("transfer-1")
+    };
     let committed = drive_write_batch(&mut transfer.machine(transfer_metadata()), &**store).await;
     assert!(matches!(committed, BatchOutcome::Committed { .. }));
     for _ in 0..3 {

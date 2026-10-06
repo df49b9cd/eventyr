@@ -23,9 +23,11 @@ fn the_in_memory_lease_store_passes_the_contract() {
     lease_store_contract(InMemoryLeaseStore::new);
 }
 
-/// Holding the name blocks a second acquirer.
+/// A completed run releases the lease, so the next driver of the same
+/// name acquires it. (Exclusivity while held is the contract's and
+/// `a_failed_acquire_never_touches_the_checkpoint`'s to prove.)
 #[tokio::test]
-async fn one_projector_holds_the_checkpoint_at_a_time() {
+async fn a_completed_run_releases_the_lease() {
     let store = Arc::new(InMemoryStore::new());
     populate(&store, 5).await;
     let leases = Arc::new(InMemoryLeaseStore::new());
@@ -45,8 +47,8 @@ async fn one_projector_holds_the_checkpoint_at_a_time() {
     .await
     .expect("the first run leases and finishes");
 
-    // A second driver of the same name is refused before it touches
-    // anything.
+    // A second driver of the same name: the first run released on
+    // completion, so it acquires fine.
     let second = Projector::new(
         "balance",
         StoreSubscription::new(Arc::clone(&store)),
@@ -55,7 +57,6 @@ async fn one_projector_holds_the_checkpoint_at_a_time() {
     )
     .with_policy(policy())
     .lease_with(Arc::clone(&leases));
-    // The first run released on completion, so the second acquires fine.
     let outcome = second
         .run_leased(|_| future::ready(()))
         .await
@@ -88,7 +89,9 @@ async fn a_lease_never_renewed_expires() {
 }
 
 /// A lease renewed on schedule stays held past `grace` but dies at
-/// `max_grace`.
+/// `max_grace` — driven through the store's test seam, not a sleep:
+/// backdating only `acquired_at` leaves the grace clause holding, so
+/// the acquired-at bound is the one that fails.
 #[tokio::test]
 async fn a_renewed_lease_stays_held_then_dies_at_max_grace() {
     let leases = InMemoryLeaseStore::new();
@@ -112,7 +115,7 @@ async fn a_renewed_lease_stays_held_then_dies_at_max_grace() {
         Err(LeaseError::Taken) // a renewed lease is still held
     ));
     // max_grace reached: the next renewal is lost.
-    std::thread::sleep(policy.ttl * policy.max_grace + Duration::from_millis(5));
+    leases.expire_at_max_grace("ledger");
     assert!(matches!(
         leases
             .renew(&mut lease, policy.ttl, policy.grace, policy.max_grace)

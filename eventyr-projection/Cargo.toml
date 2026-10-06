@@ -15,15 +15,20 @@ default = []
 # Inline views (0.7.3): the store-agnostic fold the durable stores run
 # inside their append transactions. JSON is the erasure boundary.
 inline = ["dep:serde", "dep:serde_json"]
+# The `ViewStore` contract, for view-store implementations' tests. Not
+# for production builds.
+testing = ["dep:futures"]
 
 [dependencies]
 eventyr-core.workspace = true
 eventyr-subscription = { workspace = true }
+futures = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 eventyr-store = { workspace = true }
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "time"] }

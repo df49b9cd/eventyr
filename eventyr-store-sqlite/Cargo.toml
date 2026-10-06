@@ -40,7 +40,9 @@ futures.workspace = true
 # the feature (a crate's own --features don't reach `tests/`).
 [dev-dependencies]
 eventyr-store-sqlite = { path = ".", features = ["snapshots", "views", "shred", "parked", "checkpoints"] }
+eventyr-projection = { workspace = true, features = ["inline", "testing"] }
 eventyr-shred = { workspace = true, features = ["testing"] }
 eventyr-shred-chacha = { workspace = true }
 eventyr-store-testing = { workspace = true, features = ["serde"] }
 eventyr-subscription = { workspace = true, features = ["testing"] }
+tempfile.workspace = true

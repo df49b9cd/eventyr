@@ -117,7 +117,7 @@ where
         sequence,
         stream_id,
         version,
-        event: shredder.seal(&event).await?,
+        event: shredder.seal(event).await?,
         metadata,
     })
 }

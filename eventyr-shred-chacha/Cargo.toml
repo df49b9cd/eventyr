@@ -11,5 +11,8 @@ keywords = ["event-sourcing", "gdpr", "crypto-shredding", "chacha20poly1305"]
 workspace = true
 
 [dependencies]
-eventyr-shred = { workspace = true, features = ["aead", "testing"] }
+eventyr-shred = { workspace = true, features = ["aead"] }
 chacha20poly1305 = { workspace = true, features = ["alloc", "getrandom"] }
+
+[dev-dependencies]
+eventyr-shred = { workspace = true, features = ["testing"] }

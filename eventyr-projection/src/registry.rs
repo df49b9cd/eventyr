@@ -1,9 +1,8 @@
 //! The upcaster registry: a validated, lookup-ready set of rungs keyed
 //! by `(event_type, from_version)` — the 0.5.1 read-side, store-side per
 //! §3's placement rule (read-side glue does not belong in the pure
-//! core). The vocabulary it walks ([`EventSchemaVersion`],
-//! [`VersionedRaw`]) stays in `eventyr-core::version_registry` because
-//! [`RawEvent`](eventyr_core::upcast::RawEvent) carries it.
+//! core). The vocabulary it walks ([`EventSchemaVersion`]) stays in
+//! `eventyr-core::version_registry` because [`RawEvent`] carries it.
 //!
 //! A **registry** is the set of upcasters a store or projection knows.
 //! Each rung lifts *one* event type *one* schema version; a payload
@@ -16,7 +15,8 @@ use std::string::{String, ToString};
 use std::vec::Vec;
 
 use eventyr_core::error::UpcastError;
-use eventyr_core::version_registry::{EventSchemaVersion, VersionedRaw};
+use eventyr_core::upcast::RawEvent;
+use eventyr_core::version_registry::EventSchemaVersion;
 
 /// One rung: lifts a `from_version` payload of an event type to the next
 /// version's bytes.
@@ -239,9 +239,10 @@ impl UpcasterRegistry {
         Ok(())
     }
 
-    /// Upcast `raw` to raw bytes of the current version, following the
-    /// type's ladder from `raw.version` to the highest registered
-    /// version. The caller decodes the result into the current `E`.
+    /// Upcast `raw` to the current version, following the type's ladder
+    /// from `raw.schema_version` to the highest registered version. The
+    /// returned [`RawEvent`] carries the current version; the caller
+    /// decodes its payload into the current `E`.
     ///
     /// A payload already at (or one past) the highest rung passes
     /// through unchanged. A version above every registered rung is an
@@ -250,7 +251,7 @@ impl UpcasterRegistry {
     /// ([`UnknownType`](RegistryError::UnknownType)) — a stored fact the
     /// code has never heard of is not conflated with one at the current
     /// version.
-    pub fn upcast(&self, raw: VersionedRaw) -> Result<Vec<u8>, UpcastError> {
+    pub fn upcast(&self, raw: RawEvent) -> Result<RawEvent, UpcastError> {
         // A type with an empty ladder cannot arise through `with`, but
         // it reads the same as no ladder at all.
         let Some((rungs, latest)) = self.by_type.get(&raw.event_type).and_then(|rungs| {
@@ -261,7 +262,7 @@ impl UpcasterRegistry {
                 event_type: raw.event_type.clone(),
                 message: RegistryError::UnknownType {
                     event_type: raw.event_type,
-                    found: raw.version,
+                    found: raw.schema_version,
                 }
                 .to_string(),
             });
@@ -270,19 +271,19 @@ impl UpcasterRegistry {
         // through unchanged. Anything higher is a stored shape newer
         // than the code knows.
         let current = EventSchemaVersion::new(latest.as_u32() + 1);
-        if raw.version > current {
+        if raw.schema_version > current {
             return Err(UpcastError {
                 event_type: raw.event_type.clone(),
                 message: RegistryError::UnknownVersion {
                     event_type: raw.event_type,
-                    found: raw.version,
+                    found: raw.schema_version,
                     latest,
                 }
                 .to_string(),
             });
         }
 
-        let mut version = raw.version;
+        let mut version = raw.schema_version;
         let mut payload = raw.payload;
         // The ladder climbs one version per rung until the payload
         // reaches the current (one-past-the-highest-rung) version.
@@ -298,7 +299,11 @@ impl UpcasterRegistry {
             payload = rung.upcast(payload)?;
             version = EventSchemaVersion::new(version.as_u32() + 1);
         }
-        Ok(payload)
+        Ok(RawEvent {
+            event_type: raw.event_type,
+            schema_version: current,
+            payload,
+        })
     }
 }
 
@@ -323,10 +328,10 @@ mod tests {
         Ok((value + 1).to_string().into_bytes())
     }
 
-    fn raw(event_type: &str, version: u32, payload: &str) -> VersionedRaw {
-        VersionedRaw {
+    fn raw(event_type: &str, version: u32, payload: &str) -> RawEvent {
+        RawEvent {
             event_type: event_type.to_string(),
-            version: EventSchemaVersion::new(version),
+            schema_version: EventSchemaVersion::new(version),
             payload: payload.as_bytes().to_vec(),
         }
     }
@@ -349,10 +354,9 @@ mod tests {
     #[test]
     fn a_single_rung_lifts_v1_to_the_current_version() {
         let registry = registry_with("Amount", &[(1, bump)]);
-        assert_eq!(
-            registry.upcast(raw("Amount", 1, "41")).expect("upcast"),
-            b"42"
-        );
+        let upcast = registry.upcast(raw("Amount", 1, "41")).expect("upcast");
+        assert_eq!(upcast.payload, b"42");
+        assert_eq!(upcast.schema_version, EventSchemaVersion::new(2));
     }
 
     #[test]
@@ -360,12 +364,18 @@ mod tests {
         let registry = registry_with("Amount", &[(1, bump), (2, bump)]);
         // V1=41 → V2=42 → V3=43 (current).
         assert_eq!(
-            registry.upcast(raw("Amount", 1, "41")).expect("upcast"),
+            registry
+                .upcast(raw("Amount", 1, "41"))
+                .expect("upcast")
+                .payload,
             b"43"
         );
         // Already at V2 climbs one rung.
         assert_eq!(
-            registry.upcast(raw("Amount", 2, "9")).expect("upcast"),
+            registry
+                .upcast(raw("Amount", 2, "9"))
+                .expect("upcast")
+                .payload,
             b"10"
         );
     }
@@ -375,10 +385,9 @@ mod tests {
         // With rungs V1→V2 and V2→V3, V3 is the current shape: a
         // payload already there passes through unchanged.
         let registry = registry_with("Amount", &[(1, bump), (2, bump)]);
-        assert_eq!(
-            registry.upcast(raw("Amount", 3, "tick")).expect("current"),
-            b"tick"
-        );
+        let upcast = registry.upcast(raw("Amount", 3, "tick")).expect("current");
+        assert_eq!(upcast.payload, b"tick");
+        assert_eq!(upcast.schema_version, EventSchemaVersion::new(3));
     }
 
     #[test]

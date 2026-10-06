@@ -234,8 +234,7 @@ impl SubscriptionSource for &FailAfter {
         if rest.len() > self.fail_after {
             return Err(StoreError::other("stream broke mid-batch"));
         }
-        let upper = rest.last().map(|e| Checkpoint::new(e.sequence));
-        Ok(Batch::new(rest, upper))
+        Ok(Batch::of(rest))
     }
 }
 
@@ -832,9 +831,17 @@ async fn without_parking_a_poison_event_stalls_the_projector() {
     run.abort();
 }
 
-/// Counts every counter it is given, by name.
-#[derive(Default)]
-struct Counters(Mutex<std::collections::BTreeMap<&'static str, u64>>);
+/// Counts every counter it is given, by name — shared between the
+/// projector (which reports) and the test (which asserts), so a clone
+/// is the same map.
+#[derive(Clone)]
+struct Counters(Arc<Mutex<std::collections::BTreeMap<&'static str, u64>>>);
+
+impl Default for Counters {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(std::collections::BTreeMap::new())))
+    }
+}
 
 impl Counters {
     fn get(&self, name: &str) -> u64 {
@@ -850,14 +857,6 @@ impl Counters {
 impl eventyr_store::metrics::Metrics for Counters {
     fn counter(&self, name: &'static str, by: u64) {
         *self.0.lock().expect("poisoned").entry(name).or_default() += by;
-    }
-    fn gauge(&self, _: &'static str, _: u64) {}
-    fn histogram(&self, _: &'static str, _: std::time::Duration) {}
-}
-
-impl eventyr_store::metrics::Metrics for &'static Counters {
-    fn counter(&self, name: &'static str, by: u64) {
-        (**self).counter(name, by);
     }
     fn gauge(&self, _: &'static str, _: u64) {}
     fn histogram(&self, _: &'static str, _: std::time::Duration) {}
@@ -881,7 +880,7 @@ async fn a_projector_reports_parks_through_its_metrics() {
 
     let store = Arc::new(InMemoryStore::new());
     populate(&store, &[11, 13, 15]).await;
-    let counters: &'static Counters = Box::leak(Box::default());
+    let counters = Counters::default();
     let outcome = Projector::new(
         "counted",
         StoreSubscription::new(Arc::clone(&store)),
@@ -896,7 +895,7 @@ async fn a_projector_reports_parks_through_its_metrics() {
         InMemoryParkedStore::new(),
         FailurePolicy::Park { retries: 0 },
     )
-    .with_metrics(counters)
+    .with_metrics(counters.clone())
     .run(|_| future::ready(()))
     .await
     .expect("run");
@@ -941,7 +940,7 @@ async fn a_refused_park_is_counted() {
 
     let store = Arc::new(InMemoryStore::new());
     populate(&store, &[11, 13]).await;
-    let counters: &'static Counters = Box::leak(Box::default());
+    let counters = Counters::default();
     let mut machine = SubscriptionMachine::new(
         SubscriptionPolicy::new(
             64,
@@ -960,7 +959,7 @@ async fn a_refused_park_is_counted() {
         &checkpoints,
         NoThirteen,
         tokio::time::sleep,
-        DriverPorts::new().with_metrics(counters),
+        DriverPorts::new().with_metrics(&counters),
     );
     // Three backoffs' worth of virtual time, then give up on the run.
     let timed_out = tokio::time::timeout(std::time::Duration::from_millis(3_500), run).await;
@@ -994,7 +993,7 @@ async fn a_failed_ack_is_counted() {
 
     let store = Arc::new(InMemoryStore::new());
     populate(&store, &[10]).await;
-    let counters: &'static Counters = Box::leak(Box::default());
+    let counters = Counters::default();
     let outcome = Projector::new(
         "flaky",
         StoreSubscription::new(Arc::clone(&store)),
@@ -1008,7 +1007,7 @@ async fn a_failed_ack_is_counted() {
         SubscriptionPolicy::new(64, std::time::Duration::ZERO, std::time::Duration::ZERO)
             .stop_at_catch_up(),
     )
-    .with_metrics(counters)
+    .with_metrics(counters.clone())
     .run(|_| future::ready(()))
     .await
     .expect("run");

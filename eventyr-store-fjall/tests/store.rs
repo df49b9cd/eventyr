@@ -15,7 +15,7 @@ use eventyr_store::store::{
     EventFilter, EventStore, FilteredRead, QueryAppend, StreamLifecycle, StreamsAll,
 };
 use eventyr_store_fjall::FjallStore;
-use eventyr_store_testing::{ParityEvent, PayloadEvent};
+use eventyr_store_testing::{Counted, ParityEvent, PayloadEvent};
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
@@ -316,25 +316,6 @@ fn fjall_snapshot_store_passes_the_snapshot_contract() {
     });
 }
 
-/// An event that counts how often it is decoded.
-#[derive(Clone, PartialEq, Debug, Serialize)]
-struct Counted(u64);
-
-static DECODED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-impl<'de> Deserialize<'de> for Counted {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        DECODED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        u64::deserialize(deserializer).map(Self)
-    }
-}
-
-impl EventName for Counted {
-    fn event_name(&self) -> &'static str {
-        "Counted"
-    }
-}
-
 /// Reading a few events from the global stream must not walk the rest
 /// of the log: a subscriber polls `stream_all(checkpoint).take(batch)`
 /// every round, so a read that decoded the whole tail would make
@@ -343,7 +324,6 @@ impl EventName for Counted {
 fn a_short_global_read_decodes_only_what_it_takes() {
     use futures::StreamExt;
     use futures::executor::block_on;
-    use std::sync::atomic::Ordering;
 
     const EVENTS: u64 = 600;
     let dir = tempfile::tempdir().expect("tempdir");
@@ -359,11 +339,11 @@ fn a_short_global_read_decodes_only_what_it_takes() {
     )
     .expect("append");
 
-    DECODED.store(0, Ordering::SeqCst);
+    Counted::reset_decodes();
     let first: Vec<_> = block_on(store.stream_all(Sequence::START).take(3).collect());
     assert_eq!(first.len(), 3);
     assert_eq!(
-        DECODED.load(Ordering::SeqCst),
+        Counted::decodes(),
         3,
         "a read of three events decodes three rows"
     );

@@ -136,6 +136,11 @@ pub mod prelude {
     //! view store for per-id read models.
 
     pub use crate::chain::{ClosureUpcaster, UpcasterChain};
+    #[cfg(feature = "inline")]
+    pub use crate::inline::{
+        Inline, InlineView, InlineViewError, InlineViews, RowKey, StoredRow, fold_inline,
+        rows_touched,
+    };
     pub use crate::rebuild::{RebuildPlan, SchemaCheckpointStore, SchemaVersion, checkpoint_key};
     pub use crate::registry::{RegistryError, UpcasterRegistry, VersionRung, VersionUpcaster};
     pub use crate::source::{UpcastingSource, VersionedSource};

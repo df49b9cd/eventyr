@@ -22,5 +22,4 @@ eventyr-store = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
 serde = { workspace = true, optional = true }
 
-[dev-dependencies]
 

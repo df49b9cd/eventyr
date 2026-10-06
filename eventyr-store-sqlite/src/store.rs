@@ -12,7 +12,7 @@ use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 use eventyr_store::notify::{CommitSignal, LocalCommitListener, LocalCommitSignal};
 use eventyr_store::store::{
     EventFilter, EventStore, FilteredRead, QueryAppend, StreamLifecycle, StreamsAll, TruncatePlan,
-    plan_truncate, read_starts_before_cut, sql_position, validate_batch,
+    all_events, plan_truncate, read_starts_before_cut, selected, sql_position, validate_batch,
 };
 use futures::Stream;
 use futures::stream::iter;
@@ -421,21 +421,6 @@ impl<E: serde::de::DeserializeOwned> Iterator for GlobalPages<E> {
     }
 }
 
-/// Keep what `query` selects (and every error, so a corrupt row is never
-/// silently skipped). Tags are a pure function of the payload, so a tag
-/// column written at append time would be wrong for every event stored
-/// before it existed; matching the decoded event is correct on any
-/// history.
-fn selected<E: EventName + Tagged>(
-    query: &Query,
-    result: &Result<EventEnvelope<E>, StoreError>,
-) -> bool {
-    match result {
-        Ok(envelope) => query.selects(&envelope.event),
-        Err(_) => true,
-    }
-}
-
 /// The highest sequence after `after` that `query` selects, read inside
 /// the conditional append's transaction. Rows are decoded one at a time
 /// and only the answer is kept.
@@ -467,14 +452,6 @@ where
         }
     }
     Ok(latest)
-}
-
-/// The events of every append, in commit order, for the inline views.
-fn all_events<E: Clone>(committed: &[CommittedStream<E>]) -> Vec<EventEnvelope<E>> {
-    committed
-        .iter()
-        .flat_map(|stream| stream.events.iter().cloned())
-        .collect()
 }
 
 impl<E> EventStore for SqliteStore<E>
