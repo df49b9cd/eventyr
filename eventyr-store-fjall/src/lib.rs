@@ -6,25 +6,23 @@
 //! to drive it (fjall is synchronous; this store's futures resolve
 //! immediately, so [`drive_write_blocking`] parks nothing).
 //!
-//! One database, three keyspaces (fjall 3's name for fjall 2's
+//! One database, five keyspaces (fjall 3's name for fjall 2's
 //! "partitions"):
 //!
 //! - **`streams`** — `"{stream_id}\0{version:016}"` → the serialized
-//!   event row; the zero separator keeps stream ids prefix-safe.
-//!   The `016` zero-padding keeps keys in stream-version order, so a
-//!   `stream` read is a range scan.
+//!   event row; the zero separator keeps stream ids prefix-safe, and
+//!   the zero-padded version keeps one stream's keys in version order,
+//!   so a `stream` read is a range scan.
 //! - **`heads`** — `stream_id` → `"{version:016}"`: the current stream
 //!   version, checked inside the append transaction to enforce
 //!   [`ExpectedVersion`] ([`Any`] never reads it, [`Empty`] requires
 //!   its absence, [`Exact`] requires equality).
-//! - **`global`** — a single `"next"` counter, incremented inside the
-//!   same transaction; each appended event's key stores its global
-//!   sequence in the value, and a `from`-range is impossible without a
-//!   sequence→key index — so stream iteration carries the global order
-//!   per keyspace, and the `global` keyspace also keeps
-//!   `stream_id\0version` keys of every event under `"{seq:016}\0"`
-//!   prefixes so a `stream_all` read is one range scan in sequence
-//!   order.
+//! - **`global`** — `"{sequence:016}"` → `"{stream_id}\0{version:016}"`:
+//!   the pointer resolving `stream_all`'s sequence scan.
+//! - **`meta`** — `"next"` → the global sequence counter, incremented
+//!   inside the same transaction.
+//! - **`lifecycle`** — `stream_id` → the close/truncate markers
+//!   (0.7.6), only for streams that were closed or truncated.
 //!
 //! All of it is transaction-atomic: one `WriteTransaction` checks the
 //! head, writes every event into both keyspaces, advances the head,

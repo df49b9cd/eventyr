@@ -161,7 +161,7 @@ where
             Some(key) => key,
             None => return Ok(()),
         };
-        let mut row = self
+        let (version, mut value) = self
             .store
             .load(&self.name, &key)
             .await?
@@ -170,17 +170,17 @@ where
         // Newest-wins locally too: a re-delivered event at or below the
         // row's version folds nothing. The store repeats the guard for
         // concurrent writers.
-        if event.sequence <= row.0 {
+        if event.sequence <= version {
             return Ok(());
         }
-        row.1.apply(event);
+        value.apply(event);
         self.store
             .save(
                 &self.name,
                 &key,
                 ViewRow {
                     version: event.sequence,
-                    value: row.1,
+                    value,
                 },
             )
             .await
@@ -216,7 +216,7 @@ impl<V: Clone + Send + Sync> ViewStore<V> for InMemoryViewStore<V> {
         let guard = self
             .inner
             .lock()
-            .map_err(|e| StoreError::other(format!("view store lock poisoned: {e}")))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(guard
             .get(&(view_name.to_owned(), view_id.to_owned()))
             .cloned())
@@ -231,7 +231,7 @@ impl<V: Clone + Send + Sync> ViewStore<V> for InMemoryViewStore<V> {
         let mut guard = self
             .inner
             .lock()
-            .map_err(|e| StoreError::other(format!("view store lock poisoned: {e}")))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = (view_name.to_owned(), view_id.to_owned());
         // Newest wins: a redelivered event folds to a row at an older
         // sequence and is dropped — never written over the newer value.
@@ -363,3 +363,100 @@ mod tests {
         }
     }
 }
+
+/// Run the [`ViewStore`] contract against `make_store`'s stores. Every
+/// implementation runs it, behind this crate's `testing` feature.
+///
+/// The contract is the port's: an unknown row loads `None`, a saved row
+/// loads back, a newer save replaces, and a stale save is dropped —
+/// the newest-wins guard a redelivered event relies on. A same-version
+/// save is stale too: it is the same event re-folded. `value_of` maps a
+/// version to the row value the assertions expect back — one value per
+/// version, so they can tell them apart.
+#[cfg(any(test, feature = "testing"))]
+pub fn view_store_contract<V, S>(make_store: impl Fn() -> S, value_of: impl Fn(u64) -> V)
+where
+    V: Clone + PartialEq + core::fmt::Debug,
+    S: ViewStore<V>,
+{
+    use futures::executor::block_on;
+
+    let row = |version: u64| ViewRow {
+        version: Sequence::new(version),
+        value: value_of(version),
+    };
+
+    let store = make_store();
+    // Unknown row: None, not an error.
+    assert!(
+        block_on(store.load("balance", "a"))
+            .expect("load")
+            .is_none(),
+        "an unknown row loads None"
+    );
+
+    // Save and read back.
+    block_on(store.save("balance", "a", row(3))).expect("save");
+    let loaded = block_on(store.load("balance", "a"))
+        .expect("load")
+        .expect("saved");
+    assert_eq!(loaded.version, Sequence::new(3));
+    assert_eq!(loaded.value, value_of(3));
+
+    // A newer save replaces; an older one is dropped (replay guard).
+    block_on(store.save("balance", "a", row(7))).expect("save newer");
+    block_on(store.save("balance", "a", row(4))).expect("a stale save is absorbed");
+    let loaded = block_on(store.load("balance", "a"))
+        .expect("load")
+        .expect("saved");
+    assert_eq!(loaded.version, Sequence::new(7), "never regresses");
+    assert_eq!(loaded.value, value_of(7));
+
+    // A same-version save is stale too: the same event, re-folded.
+    block_on(store.save("balance", "a", row(7))).expect("a same-version save is absorbed");
+    let loaded = block_on(store.load("balance", "a"))
+        .expect("load")
+        .expect("saved");
+    assert_eq!(
+        loaded.value,
+        value_of(7),
+        "the same version does not count as newer"
+    );
+
+    // Rows are scoped by (view, id): another id is untouched.
+    assert!(
+        block_on(store.load("balance", "b"))
+            .expect("load")
+            .is_none(),
+        "another id is untouched"
+    );
+}
+
+// Blanket impls so references and `Arc` work wherever a store does.
+
+macro_rules! impl_view_delegation {
+    ($pointer:ty) => {
+        impl<V, S: ViewStore<V> + ?Sized> ViewStore<V> for $pointer {
+            fn load(
+                &self,
+                view_name: &str,
+                view_id: &str,
+            ) -> impl core::future::Future<Output = Result<Option<ViewRow<V>>, StoreError>> + Send
+            {
+                (**self).load(view_name, view_id)
+            }
+
+            fn save(
+                &self,
+                view_name: &str,
+                view_id: &str,
+                row: ViewRow<V>,
+            ) -> impl core::future::Future<Output = Result<(), StoreError>> + Send {
+                (**self).save(view_name, view_id, row)
+            }
+        }
+    };
+}
+
+impl_view_delegation!(&S);
+impl_view_delegation!(std::sync::Arc<S>);

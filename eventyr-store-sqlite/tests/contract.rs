@@ -3,7 +3,7 @@
 //! calling the suite, not by shipping its own tests of the same rules.
 
 use eventyr_store_sqlite::SqliteStore;
-use eventyr_store_testing::{ParityEvent, PayloadEvent as ContractEvent};
+use eventyr_store_testing::{Counted, ParityEvent, PayloadEvent as ContractEvent};
 
 // In memory: one connection, one store, no setup cost per check.
 #[test]
@@ -68,8 +68,8 @@ fn a_pre_0_7_5_database_gains_the_key_column_on_open() {
     use futures::TryStreamExt;
     use futures::executor::block_on;
 
-    let dir = tempfile_dir();
-    let path = dir.join("old.db");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("old.db");
     {
         let conn = rusqlite::Connection::open(&path).expect("open");
         conn.execute_batch(
@@ -112,20 +112,6 @@ fn a_pre_0_7_5_database_gains_the_key_column_on_open() {
     // Opening again is a no-op.
     drop(store);
     SqliteStore::<ContractEvent>::open(&path).expect("idempotent open");
-    std::fs::remove_dir_all(dir).ok();
-}
-
-fn tempfile_dir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "eventyr-sqlite-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    dir
 }
 
 #[test]
@@ -173,8 +159,8 @@ fn a_checkpoint_survives_reopening_the_database() {
     use eventyr_subscription::checkpoint::CheckpointStore;
     use futures::executor::block_on;
 
-    let dir = tempfile_dir();
-    let path = dir.join("checkpoints.db");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("checkpoints.db");
     {
         let store = SqliteCheckpointStore::from_connection(
             rusqlite::Connection::open(&path).expect("open"),
@@ -189,26 +175,6 @@ fn a_checkpoint_survives_reopening_the_database() {
         block_on(reopened.load("balance")).expect("load"),
         Checkpoint::new(Sequence::new(42))
     );
-    std::fs::remove_dir_all(dir).ok();
-}
-
-/// An event that counts how often it is decoded.
-#[derive(Clone, PartialEq, Debug, serde::Serialize)]
-struct Counted(u64);
-
-static DECODED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-impl<'de> serde::Deserialize<'de> for Counted {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        DECODED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        <u64 as serde::Deserialize>::deserialize(deserializer).map(Self)
-    }
-}
-
-impl eventyr_core::event_name::EventName for Counted {
-    fn event_name(&self) -> &'static str {
-        "Counted"
-    }
 }
 
 /// Reading a few events from the global stream reads one page, not the
@@ -222,7 +188,6 @@ fn a_short_global_read_stops_at_its_page() {
     use eventyr_store::store::{EventStore, StreamsAll};
     use futures::StreamExt;
     use futures::executor::block_on;
-    use std::sync::atomic::Ordering;
 
     const EVENTS: u64 = 2000;
     let store = SqliteStore::<Counted>::open_in_memory().expect("open");
@@ -233,10 +198,10 @@ fn a_short_global_read_stops_at_its_page() {
     ))
     .expect("append");
 
-    DECODED.store(0, Ordering::SeqCst);
+    Counted::reset_decodes();
     let first: Vec<_> = block_on(store.stream_all(Sequence::START).take(3).collect());
     assert_eq!(first.len(), 3);
-    let decoded = DECODED.load(Ordering::SeqCst);
+    let decoded = Counted::decodes();
     assert!(
         decoded < EVENTS as usize / 2,
         "a read of three events decoded {decoded} rows"

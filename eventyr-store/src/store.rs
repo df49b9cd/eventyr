@@ -411,6 +411,30 @@ pub fn sql_position(position: u64) -> i64 {
     i64::try_from(position).unwrap_or(i64::MAX)
 }
 
+/// Keep what `query` selects (and every error, so a corrupt row is never
+/// silently skipped). Tags are a pure function of the payload, so a tag
+/// column written at append time would be wrong for every event stored
+/// before it existed; matching the decoded event is correct on any
+/// history. The stores that prefilter by event type call this on the
+/// rows the prefilter let through.
+pub fn selected<E: EventName + Tagged>(
+    query: &Query,
+    result: &Result<EventEnvelope<E>, StoreError>,
+) -> bool {
+    match result {
+        Ok(envelope) => query.selects(&envelope.event),
+        Err(_) => true,
+    }
+}
+
+/// The events of every append, in commit order, for the inline views.
+pub fn all_events<E: Clone>(committed: &[CommittedStream<E>]) -> Vec<EventEnvelope<E>> {
+    committed
+        .iter()
+        .flat_map(|stream| stream.events.iter().cloned())
+        .collect()
+}
+
 /// The fallback [`EventStore::append_batch`] for stores that cannot
 /// commit atomically across streams: an empty batch commits nothing, a
 /// single-stream batch delegates to [`append`](EventStore::append), and

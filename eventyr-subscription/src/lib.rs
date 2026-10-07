@@ -14,9 +14,10 @@
 //! [`runner::drive_projector`], or [`runner::drive_projector_leased`])
 //! it runs against. The `bus` feature carries the §6 [`bus::Subscription`] shape and the §2
 //! [`bus::EventBus`] trait — the 0.3 live-push seam — off by default.
-//! The `testing` feature exports
-//! [`parked::parked_store_contract`] for parked-store implementations
-//! to run in their tests.
+//! The `testing` feature exports the port contracts
+//! ([`checkpoint::checkpoint_store_contract`],
+//! [`parked::parked_store_contract`], [`lease::lease_store_contract`])
+//! for store implementations to run in their tests.
 //!
 //! ## A taste
 //!
@@ -95,7 +96,7 @@ pub mod prelude {
     #[cfg(feature = "bus")]
     pub use crate::bus::{EventBus, Subscription};
     pub use crate::checkpoint::{CheckpointStore, InMemoryCheckpointStore};
-    pub use crate::lease::{InMemoryLeaseStore, LeaseError, LeasePolicy, NoLease, ProjectorLease};
+    pub use crate::lease::{InMemoryLeaseStore, LeaseError, LeasePolicy, ProjectorLease};
     pub use crate::parked::{InMemoryParkedStore, NoParking, ParkedEvent, ParkedStore};
     pub use crate::projection_scenario::{ProjectionOutcome, ProjectionScenario};
     pub use crate::runner::{
@@ -114,6 +115,8 @@ pub mod prelude {
     pub use eventyr_store::notify::{CommitListener, CommitSignal, LocalCommitSignal, NoSignal};
     pub use eventyr_store::store::EventFilter;
 
+    #[cfg(feature = "testing")]
+    pub use crate::checkpoint::checkpoint_store_contract;
     #[cfg(feature = "testing")]
     pub use crate::lease::lease_store_contract;
     #[cfg(feature = "testing")]

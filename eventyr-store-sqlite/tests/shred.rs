@@ -38,10 +38,9 @@ impl EventName for Event {
 
 #[test]
 fn an_erased_subjects_data_is_gone_from_the_database_file() {
-    let dir = std::env::temp_dir().join(format!("eventyr-shred-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("dir");
-    let events_path = dir.join("events.db");
-    let keys_path = dir.join("keys.db");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let events_path = dir.path().join("events.db");
+    let keys_path = dir.path().join("keys.db");
 
     let events = SqliteStore::<Event>::open(&events_path).expect("events");
     let keys = SqliteKeyStore::open(&keys_path).expect("keys");
@@ -83,5 +82,4 @@ fn an_erased_subjects_data_is_gone_from_the_database_file() {
         )
         .expect("row");
     assert_eq!(key, None);
-    std::fs::remove_dir_all(dir).ok();
 }

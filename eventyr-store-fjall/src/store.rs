@@ -16,7 +16,7 @@ use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 use eventyr_store::notify::{CommitSignal, LocalCommitListener, LocalCommitSignal};
 use eventyr_store::store::{
     EventStore, QueryAppend, StreamLifecycle, StreamsAll, TruncatePlan, plan_truncate,
-    read_starts_before_cut, validate_batch,
+    read_starts_before_cut, selected, validate_batch,
 };
 
 use crate::FjallStoreError;
@@ -418,21 +418,6 @@ where
         let range = snapshot.range(&self.global, Self::global_range(from));
         let this = self.clone();
         range.map(move |guard| this.resolve(&snapshot, guard))
-    }
-}
-
-/// Keep what `query` selects (and every error, so a corrupt row is never
-/// silently skipped). No tag index: tags are a pure function of the
-/// payload, so an index built at append time would miss every event
-/// written before it existed; matching the decoded event is correct on
-/// any history.
-fn selected<E: EventName + Tagged>(
-    query: &Query,
-    result: &Result<EventEnvelope<E>, StoreError>,
-) -> bool {
-    match result {
-        Ok(envelope) => query.selects(&envelope.event),
-        Err(_) => true,
     }
 }
 

@@ -457,8 +457,9 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
 }
 
 /// The aggregate instances a batch decider's command touches: how a
-/// symmetric decider its own command ([`Decide::Command = Self`]) names
-/// the whole [`BatchMachine`] boundary once.
+/// symmetric decider — one that is its own command
+/// ([`Decide::Command = Self`]) — names the whole [`BatchMachine`]
+/// boundary once.
 ///
 /// Implement on a `Decide` type whose streams are all folds of the one
 /// aggregate `A`; [`BatchMachine::for_aggregates`] then derives the
@@ -596,6 +597,10 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
         let from = streams
             .iter()
             .map(|stream| {
+                debug_assert!(
+                    self.versions.contains_key(stream),
+                    "every boundary stream has a versions entry"
+                );
                 (
                     stream.clone(),
                     self.versions.get(stream).copied().unwrap_or_default(),
@@ -622,13 +627,19 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
         }
         // Validate while folding: events must belong to this stream and
         // continue its sequence contiguously from the folded version —
-        // the same guard the write machine states.
+        // the same guard the write machine states. Every boundary
+        // stream has a `versions` and a `folded` entry (established in
+        // `new`); §7 rule 4's debug_assert is the guard, the index is
+        // the read.
+        debug_assert!(
+            self.versions.contains_key(&stream_id) && self.folded.contains_key(&stream_id),
+            "every boundary stream has a versions and a fold state"
+        );
         let mut expected = self
             .versions
             .get(&stream_id)
-            .copied()
+            .map(|version| version.as_u64())
             .unwrap_or_default()
-            .as_u64()
             .saturating_add(1);
         let fold = self.folds.get(&stream_id);
         let state = self
@@ -898,24 +909,6 @@ mod tests {
 
     fn is_protocol_violation<E, Err>(action: &BatchAction<E, Err>) -> bool {
         matches!(action, BatchAction::Done(BatchOutcome::Failed(error)) if error.is_protocol_violation())
-    }
-
-    /// Assert `action` is the protocol-violation outcome, naming the
-    /// scenario step on failure.
-    macro_rules! assert_protocol_violation {
-        ($action:expr) => {
-            assert!(
-                is_protocol_violation(&$action),
-                "expected a protocol-violation outcome"
-            );
-        };
-        ($action:expr, $step:expr) => {
-            assert!(
-                is_protocol_violation(&$action),
-                "[{}] expected a protocol-violation outcome",
-                $step
-            );
-        };
     }
 
     /// Drive the load phase with empty streams for the whole boundary,
@@ -1315,7 +1308,7 @@ mod tests {
             stream: None,
             current: Version::new(2),
         });
-        assert_protocol_violation!(action);
+        assert!(is_protocol_violation(&action));
     }
 
     #[test]
@@ -1356,7 +1349,9 @@ mod tests {
         let mut m = transfer_machine(1, 2, 5, &[1, 2]);
         load_all_empty(&mut m); // → Appending
         m.handle(BatchInput::Appended { committed: vec![] }); // Done
-        assert_protocol_violation!(m.handle(BatchInput::Appended { committed: vec![] }));
+        assert!(is_protocol_violation(
+            &m.handle(BatchInput::Appended { committed: vec![] })
+        ));
     }
 
     #[test]
@@ -1364,7 +1359,7 @@ mod tests {
         let mut m = transfer_machine(1, 2, 5, &[1, 2]);
         load_all_empty(&mut m); // → Appending
         m.handle(BatchInput::Appended { committed: vec![] }); // Done
-        assert_protocol_violation!(m.start());
+        assert!(is_protocol_violation(&m.start()));
     }
 
     #[test]

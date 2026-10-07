@@ -18,7 +18,7 @@
 //! rebuilds) as `projection`. The workspace ships
 //! `eventyr-store-postgres` (the durable `EventStore`/`StreamsAll` over
 //! Postgres) as a standalone crate; the umbrella pulls it in as its own
-//! feature over time — see the design document for the roadmap.
+//! `postgres` feature.
 //!
 //! ## A taste
 //!

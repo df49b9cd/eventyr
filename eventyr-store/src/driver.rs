@@ -27,6 +27,56 @@ use crate::metrics::{Metrics, names};
 use crate::snapshot_store::SnapshotStore;
 use crate::store::{EventStore, QueryAppend};
 
+/// One `LoadStream`: read the stream from the requested bound, collect
+/// the envelopes, and report the answer.
+async fn load_stream<A, S, St>(
+    machine: &mut WriteMachine<A, St>,
+    store: &S,
+    stream_id: eventyr_core::vocabulary::StreamId,
+    from: eventyr_core::vocabulary::Version,
+) -> WriteAction<A::Event, A::Error, St>
+where
+    A: Aggregate,
+    S: EventStore<Event = A::Event>,
+{
+    let loaded: Result<Vec<EventEnvelope<A::Event>>, StoreError> =
+        store.stream(&stream_id, from).try_collect().await;
+    match loaded {
+        Ok(events) => machine.handle(WriteInput::Loaded { events }),
+        Err(error) => machine.handle(WriteInput::Failed(error)),
+    }
+}
+
+/// One `Append`: time it, count the committed events (and a conflict,
+/// when one comes back), and report the answer.
+async fn append_and_report<A, S, St>(
+    machine: &mut WriteMachine<A, St>,
+    store: &S,
+    metrics: &(dyn Metrics + Send + Sync),
+    stream_id: eventyr_core::vocabulary::StreamId,
+    expected: eventyr_core::vocabulary::ExpectedVersion,
+    events: std::vec::Vec<eventyr_core::envelope::NewEvent<A::Event>>,
+) -> WriteAction<A::Event, A::Error, St>
+where
+    A: Aggregate,
+    S: EventStore<Event = A::Event>,
+{
+    let start = std::time::Instant::now();
+    match store.append(&stream_id, expected, events).await {
+        Ok(committed) => {
+            metrics.histogram(names::APPEND_LATENCY, start.elapsed());
+            metrics.counter(names::APPENDS, committed.len() as u64);
+            machine.handle(WriteInput::Appended { committed })
+        }
+        Err(error) => {
+            if matches!(error, StoreError::Conflict { .. }) {
+                metrics.counter(names::CONFLICTS, 1);
+            }
+            machine.handle(error.into())
+        }
+    }
+}
+
 /// Drives `machine` against `store` until it finishes, returning its
 /// terminal outcome.
 ///
@@ -78,12 +128,7 @@ where
     loop {
         action = match action {
             WriteAction::LoadStream { stream_id, from } => {
-                let loaded: Result<Vec<EventEnvelope<A::Event>>, StoreError> =
-                    store.stream(&stream_id, from).try_collect().await;
-                match loaded {
-                    Ok(events) => machine.handle(WriteInput::Loaded { events }),
-                    Err(error) => machine.handle(WriteInput::Failed(error)),
-                }
+                load_stream(machine, store, stream_id, from).await
             }
             WriteAction::LoadSnapshot { .. } => {
                 machine.handle(WriteInput::SnapshotLoaded { snapshot: None })
@@ -92,22 +137,7 @@ where
                 stream_id,
                 expected,
                 events,
-            } => {
-                let start = std::time::Instant::now();
-                match store.append(&stream_id, expected, events).await {
-                    Ok(committed) => {
-                        metrics.histogram(names::APPEND_LATENCY, start.elapsed());
-                        metrics.counter(names::APPENDS, committed.len() as u64);
-                        machine.handle(WriteInput::Appended { committed })
-                    }
-                    Err(error) => {
-                        if matches!(error, StoreError::Conflict { .. }) {
-                            metrics.counter(names::CONFLICTS, 1);
-                        }
-                        machine.handle(error.into())
-                    }
-                }
-            }
+            } => append_and_report(machine, store, metrics, stream_id, expected, events).await,
             WriteAction::Done(outcome) => return outcome,
         };
     }
@@ -143,7 +173,9 @@ where
 }
 
 /// [`drive_write_with_snapshots`] with metrics (0.5.3): appends,
-/// conflicts, and the snapshot save all report through `metrics`.
+/// conflicts, and snapshot loads all report through `metrics`. The
+/// post-commit snapshot *save* does not — it is fire-and-forget by
+/// design, and its result is the driver's to drop.
 pub async fn drive_write_with_snapshots_and_metrics<A, S, SS>(
     machine: &mut WriteMachine<A, A::State>,
     store: &S,
@@ -160,12 +192,7 @@ where
     loop {
         action = match action {
             WriteAction::LoadStream { stream_id, from } => {
-                let loaded: Result<Vec<EventEnvelope<A::Event>>, StoreError> =
-                    store.stream(&stream_id, from).try_collect().await;
-                match loaded {
-                    Ok(events) => machine.handle(WriteInput::Loaded { events }),
-                    Err(error) => machine.handle(WriteInput::Failed(error)),
-                }
+                load_stream(machine, store, stream_id, from).await
             }
             WriteAction::LoadSnapshot { stream_id } => match snapshots.load(&stream_id).await {
                 Ok(snapshot) => {
@@ -178,22 +205,7 @@ where
                 stream_id,
                 expected,
                 events,
-            } => {
-                let start = std::time::Instant::now();
-                match store.append(&stream_id, expected, events).await {
-                    Ok(committed) => {
-                        metrics.histogram(names::APPEND_LATENCY, start.elapsed());
-                        metrics.counter(names::APPENDS, committed.len() as u64);
-                        machine.handle(WriteInput::Appended { committed })
-                    }
-                    Err(error) => {
-                        if matches!(error, StoreError::Conflict { .. }) {
-                            metrics.counter(names::CONFLICTS, 1);
-                        }
-                        machine.handle(error.into())
-                    }
-                }
-            }
+            } => append_and_report(machine, store, metrics, stream_id, expected, events).await,
             WriteAction::Done(outcome) => {
                 // Fire-and-forget: persist the offer if the policy fired;
                 // the caller's outcome is already fixed either way.

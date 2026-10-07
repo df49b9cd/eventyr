@@ -426,16 +426,6 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
         }
     }
 
-    /// The stream this machine writes to.
-    pub fn stream_id(&self) -> &StreamId {
-        &self.stream_id
-    }
-
-    /// The metadata this machine stamps onto every event it emits.
-    pub fn metadata(&self) -> &Metadata {
-        &self.metadata
-    }
-
     /// Builder-style: set the metadata stamped on every emitted event
     /// (0.5.2). Construct with [`new`](Self::new) /
     /// [`with_snapshots`](Self::with_snapshots), then call this before
@@ -447,7 +437,9 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
     }
 
     /// The version folded so far (the loaded snapshot's version, plus
-    /// the events folded on top of it).
+    /// the events folded on top of it). A caller convenience, used by
+    /// this crate's tests — the drivers match on actions, not on
+    /// accessors.
     pub fn version(&self) -> Version {
         self.version
     }
@@ -731,24 +723,6 @@ mod tests {
         )
     }
 
-    /// Assert `action` is the protocol-violation outcome, naming the
-    /// scenario step on failure.
-    macro_rules! assert_protocol_violation {
-        ($action:expr) => {
-            assert!(
-                is_protocol_violation(&$action),
-                "expected a protocol-violation outcome"
-            );
-        };
-        ($action:expr, $step:expr) => {
-            assert!(
-                is_protocol_violation(&$action),
-                "[{}] expected a protocol-violation outcome",
-                $step
-            );
-        };
-    }
-
     // -- transitions (snapshots off: the pre-snapshot protocol) ----------
 
     #[test]
@@ -982,7 +956,9 @@ mod tests {
         let mut m = machine(AccountCommand::CheckBalance);
         m.start();
         m.handle(WriteInput::Loaded { events: vec![] }); // Done(Noop)
-        assert_protocol_violation!(m.handle(WriteInput::Appended { committed: vec![] }));
+        assert!(is_protocol_violation(
+            &m.handle(WriteInput::Appended { committed: vec![] })
+        ));
     }
 
     #[test]
@@ -990,7 +966,7 @@ mod tests {
         let mut m = machine(AccountCommand::CheckBalance);
         m.start();
         m.handle(WriteInput::Loaded { events: vec![] }); // Done(Noop)
-        assert_protocol_violation!(m.start());
+        assert!(is_protocol_violation(&m.start()));
     }
 
     #[test]

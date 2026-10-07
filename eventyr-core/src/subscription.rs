@@ -145,6 +145,14 @@ impl<E> Batch<E> {
         }
     }
 
+    /// Wrap deliveries, deriving `upper` from the last event — the
+    /// common case for unfiltered sources, where the scan ends at
+    /// `upper`. An empty batch is caught up.
+    pub fn of(events: Vec<EventEnvelope<E>>) -> Self {
+        let upper = events.last().map(|event| Checkpoint::new(event.sequence));
+        Self::new(events, upper)
+    }
+
     /// Builder-style: the source scanned through `scanned` (see
     /// [`scanned`](Self::scanned)).
     pub fn scanned_to(mut self, scanned: Checkpoint) -> Self {
@@ -882,24 +890,6 @@ mod tests {
         }
     }
 
-    /// Assert `action` is the protocol-violation outcome, naming the
-    /// scenario step on failure.
-    macro_rules! assert_protocol_violation {
-        ($action:expr) => {
-            assert!(
-                is_protocol_violation(&$action),
-                "expected a protocol-violation outcome"
-            );
-        };
-        ($action:expr, $step:expr) => {
-            assert!(
-                is_protocol_violation(&$action),
-                "[{}] expected a protocol-violation outcome",
-                $step
-            );
-        };
-    }
-
     // -- transitions -----------------------------------------------------
 
     #[test]
@@ -1299,7 +1289,7 @@ mod tests {
         let mut m = machine();
         m.start();
         m.handle(SubscriptionInput::Failed(StoreError::Unavailable)); // Done
-        assert_protocol_violation!(m.handle(SubscriptionInput::Applied));
+        assert!(is_protocol_violation(&m.handle(SubscriptionInput::Applied)));
     }
 
     #[test]
@@ -1307,7 +1297,7 @@ mod tests {
         let mut m = machine();
         m.start();
         m.handle(SubscriptionInput::Failed(StoreError::Unavailable)); // Done
-        assert_protocol_violation!(m.start());
+        assert!(is_protocol_violation(&m.start()));
     }
 
     #[test]

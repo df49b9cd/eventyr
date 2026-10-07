@@ -5,134 +5,20 @@
 //! `cargo test -p eventyr-store-postgres -- --ignored` and
 //! `EVENTYR_TEST_PG_URL` pointing at a real Postgres.
 
+mod common;
+
 use eventyr_core::vocabulary::StreamId;
 use eventyr_store_postgres::PgStore;
 use eventyr_store_testing::{ParityEvent, PayloadEvent};
 
-/// A created schema, kept around until [`cleanup_schemas`] drops it at
-/// the test's end, so a dev database does not fill with contract
-/// schemas.
-struct Schema {
-    /// The pool bound to the schema (the store's).
-    pool: sqlx::PgPool,
-    /// A second pool on the default schema, for the `DROP SCHEMA`.
-    admin: sqlx::PgPool,
-    name: String,
-}
-
-static SCHEMAS: std::sync::Mutex<Vec<Schema>> = std::sync::Mutex::new(Vec::new());
-
-async fn make_schema(url: &str, connections: u32) -> Schema {
-    let name = format!("contract_{}", uuid::Uuid::new_v4().simple());
-    // One connection, closed promptly when idle: a contract run holds
-    // one of these per check until its test's cleanup, and the default
-    // 100-connection server must serve every concurrently running test.
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .idle_timeout(std::time::Duration::from_secs(5))
-        .connect(url)
-        .await
-        .expect("connect");
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {name}")))
-        .execute(&admin)
-        .await
-        .expect("create schema");
-    let options: sqlx::postgres::PgConnectOptions = url.parse().expect("url");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(connections)
-        // Bounded waits and prompt idle closes: a failing drop must say
-        // so quickly instead of hanging the suite, and the schemas all
-        // stay open until their test's cleanup — the server's 100
-        // connections serve every concurrently running test.
-        .acquire_timeout(std::time::Duration::from_secs(30))
-        .idle_timeout(std::time::Duration::from_secs(5))
-        .connect_with(options.options([("search_path", name.as_str())]))
-        .await
-        .expect("connect to schema");
-    eventyr_store_postgres::store::migrate(&pool)
-        .await
-        .expect("migrate");
-    Schema { pool, admin, name }
-}
-
-/// A store over a fresh, empty schema.
-///
-/// The suite calls `make_store()` once per check and expects an empty
-/// store each time — `stream_all` reads the whole log, so a shared
-/// database would hand later checks every earlier check's events. Each
-/// call creates its own schema, registered for cleanup, pins a pool's
-/// `search_path` to it, and migrates into it.
-///
-/// `futures::executor::block_on`, not `Runtime::block_on`: the caller
-/// holds the runtime's enter guard, and an entered runtime refuses to
-/// be block_on'd again from the same thread. The executor parks the
-/// thread; the guard's reactor drives the sqlx futures' I/O. The runtime
-/// parameter names which reactor that is.
-fn fresh_store<E>(_runtime: &tokio::runtime::Runtime, url: &str) -> PgStore<E> {
-    let schema = futures::executor::block_on(make_schema(url, 1));
-    let store = PgStore::new(schema.pool.clone());
-    SCHEMAS.lock().expect("registry").push(schema);
-    store
-}
-
-/// [`fresh_store`] for callers already inside a runtime, with a pool
-/// wide enough for real concurrency.
-async fn fresh_store_async<E>(url: &str, connections: u32) -> PgStore<E> {
-    let schema = make_schema(url, connections).await;
-    let store = PgStore::new(schema.pool.clone());
-    SCHEMAS.lock().expect("registry").push(schema);
-    store
-}
-
-/// Drop every schema a test created; call at the test's end.
-async fn cleanup_schemas() {
-    let schemas: Vec<Schema> = std::mem::take(&mut *SCHEMAS.lock().expect("registry"));
-    for schema in schemas {
-        schema.pool.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {} CASCADE",
-            schema.name
-        )))
-        .execute(&schema.admin)
-        .await
-        .expect("drop schema");
-        schema.admin.close().await;
-    }
-}
-
-/// The sync-driven suites run under this runtime, entered for the
-/// caller: the suite drives each future with
-/// `futures::executor::block_on`, which parks this thread, so the I/O
-/// reactor has to run on the runtime's own worker threads. A
-/// current-thread runtime only drives its reactor inside its own
-/// `block_on`, and sqlx's first socket wait would never wake. Two
-/// workers, not one: a worker is parked for the whole suite's
-/// `block_on`, and the notification I/O a commit wakes still needs one
-/// spare.
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("runtime")
-}
-
-fn url() -> String {
-    std::env::var("EVENTYR_TEST_PG_URL").expect("EVENTYR_TEST_PG_URL must point at a real Postgres")
-}
-
-/// The heavy tests (many pooled connections, or a spawned writer plus a
-/// raw held-open transaction) run one at a time: between them they
-/// could otherwise starve a 100-connection server the other test
-/// binaries share.
 static HEAVY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[test]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 fn pg_store_passes_the_contract() {
-    let url = url();
-    let runtime = runtime();
-    let make_store = || fresh_store(&runtime, &url);
+    let url = common::url();
+    let runtime = common::runtime();
+    let make_store = || common::fresh_store(&runtime, &url, "contract");
     // Entered for the sync suite so the sqlx futures it polls find this
     // runtime's reactor; dropped before `block_on`, which an entered
     // runtime refuses.
@@ -142,78 +28,82 @@ fn pg_store_passes_the_contract() {
         eventyr_store_testing::streams_all_contract::<PayloadEvent, _>(make_store);
         eventyr_store_testing::event_store_batch_contract::<PayloadEvent, _>(make_store);
     }
-    runtime.block_on(cleanup_schemas());
+    runtime.block_on(common::cleanup_schemas());
 }
 
 #[test]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 fn pg_store_passes_the_query_append_contract() {
-    let url = url();
-    let runtime = runtime();
+    let url = common::url();
+    let runtime = common::runtime();
     {
         let _guard = runtime.enter();
-        eventyr_store_testing::query_append_contract(|| fresh_store(&runtime, &url));
+        eventyr_store_testing::query_append_contract(|| {
+            common::fresh_store(&runtime, &url, "contract")
+        });
     }
-    runtime.block_on(cleanup_schemas());
+    runtime.block_on(common::cleanup_schemas());
 }
 
 #[test]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 fn pg_store_passes_the_lifecycle_contracts() {
-    let url = url();
-    let runtime = runtime();
+    let url = common::url();
+    let runtime = common::runtime();
     {
         let _guard = runtime.enter();
         eventyr_store_testing::lifecycle_contract::<PayloadEvent, _>(|| {
-            fresh_store(&runtime, &url)
+            common::fresh_store(&runtime, &url, "contract")
         });
-        eventyr_store_testing::lifecycle_query_append_contract(|| fresh_store(&runtime, &url));
+        eventyr_store_testing::lifecycle_query_append_contract(|| {
+            common::fresh_store(&runtime, &url, "contract")
+        });
     }
-    runtime.block_on(cleanup_schemas());
+    runtime.block_on(common::cleanup_schemas());
 }
 
 #[test]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 fn pg_store_passes_the_filtered_read_contract() {
-    let url = url();
-    let runtime = runtime();
+    let url = common::url();
+    let runtime = common::runtime();
     {
         let _guard = runtime.enter();
         eventyr_store_testing::filtered_read_contract::<ParityEvent, _>(|| {
-            fresh_store(&runtime, &url)
+            common::fresh_store(&runtime, &url, "contract")
         });
     }
-    runtime.block_on(cleanup_schemas());
+    runtime.block_on(common::cleanup_schemas());
 }
 
 #[test]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 fn pg_snapshot_store_passes_the_snapshot_contract() {
-    let url = url();
-    let runtime = runtime();
+    let url = common::url();
+    let runtime = common::runtime();
     {
         let _guard = runtime.enter();
         eventyr_store_testing::snapshot_contract::<u64, _>(|| {
-            let store: PgStore<PayloadEvent> = fresh_store(&runtime, &url);
+            let store: PgStore<PayloadEvent> = common::fresh_store(&runtime, &url, "contract");
             eventyr_store_postgres::snapshots::PgSnapshotStore::new(&store)
         });
     }
-    runtime.block_on(cleanup_schemas());
+    runtime.block_on(common::cleanup_schemas());
 }
 
 #[test]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 fn pg_checkpoint_store_passes_the_checkpoint_store_contract() {
-    let url = url();
-    let runtime = runtime();
+    let url = common::url();
+    let runtime = common::runtime();
     {
         let _guard = runtime.enter();
         eventyr_subscription::checkpoint::checkpoint_store_contract(|| {
-            let store: PgStore<PayloadEvent> = fresh_store(&runtime, &url);
+            let store: PgStore<PayloadEvent> = common::fresh_store(&runtime, &url, "contract");
             eventyr_store_postgres::PgCheckpointStore::new(&store)
         });
     }
-    runtime.block_on(cleanup_schemas());
+    runtime.block_on(common::cleanup_schemas());
 }
 
 /// A smoke test under real concurrency: many boundary decisions race
@@ -239,7 +129,7 @@ fn pg_store_serializes_racing_boundary_decisions() {
     const SEATS: u32 = 3;
     const RIVALS: usize = 12;
 
-    let url = url();
+    let url = common::url();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -251,7 +141,8 @@ fn pg_store_serializes_racing_boundary_decisions() {
         // taking 4-connection pools and a listener connection apiece
         // could otherwise starve this many-writer roster.
         let _heavy = HEAVY.lock().await;
-        let one: PgStore<EnrollmentEvent> = fresh_store_async(&url, RIVALS as u32).await;
+        let one: PgStore<EnrollmentEvent> =
+            common::fresh_store_async(&url, "contract", RIVALS as u32).await;
         one.append(
             &StreamId::from("course-c1"),
             ExpectedVersion::Empty,
@@ -297,7 +188,7 @@ fn pg_store_serializes_racing_boundary_decisions() {
             .filter(|e| matches!(e.event, EnrollmentEvent::Enrolled { .. }))
             .count();
         assert_eq!(enrolled, SEATS as usize, "no seat was oversold");
-        cleanup_schemas().await;
+        common::cleanup_schemas().await;
     });
 }
 
@@ -390,7 +281,7 @@ fn a_conditional_append_waits_out_an_in_flight_writer() {
     use eventyr_core::vocabulary::{ExpectedVersion, Sequence};
     use eventyr_store::store::{EventStore, QueryAppend};
 
-    let url = url();
+    let url = common::url();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -398,7 +289,7 @@ fn a_conditional_append_waits_out_an_in_flight_writer() {
         .expect("runtime");
     runtime.block_on(async {
         let _heavy = HEAVY.lock().await;
-        let store: PgStore<EnrollmentEvent> = fresh_store_async(&url, 4).await;
+        let store: PgStore<EnrollmentEvent> = common::fresh_store_async(&url, "contract", 4).await;
         let defined = store
             .append(
                 &StreamId::from("course-c1"),
@@ -461,7 +352,7 @@ fn a_conditional_append_waits_out_an_in_flight_writer() {
             Err(StoreError::QueryConflict { sequence }) => assert!(sequence > read_position),
             other => panic!("expected a query conflict after the rival commits, got {other:?}"),
         }
-        cleanup_schemas().await;
+        common::cleanup_schemas().await;
     });
 }
 
@@ -482,7 +373,7 @@ fn a_later_sequence_never_commits_before_an_earlier_one() {
     use eventyr_store::store::{EventStore, StreamsAll};
     use futures::TryStreamExt;
 
-    let url = url();
+    let url = common::url();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -490,7 +381,7 @@ fn a_later_sequence_never_commits_before_an_earlier_one() {
         .expect("runtime");
     runtime.block_on(async {
         let _heavy = HEAVY.lock().await;
-        let store: PgStore<PayloadEvent> = fresh_store_async(&url, 4).await;
+        let store: PgStore<PayloadEvent> = common::fresh_store_async(&url, "contract", 4).await;
 
         let mut first = store.pool().begin().await.expect("begin");
         sqlx::query(
@@ -547,6 +438,6 @@ fn a_later_sequence_never_commits_before_an_earlier_one() {
         assert_eq!(sequences[0].0, "stream-a");
         assert_eq!(sequences[1].0, "stream-b");
         assert!(sequences[0].1 < sequences[1].1);
-        cleanup_schemas().await;
+        common::cleanup_schemas().await;
     });
 }

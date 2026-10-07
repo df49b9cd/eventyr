@@ -85,8 +85,7 @@ where
             .take(max)
             .try_collect()
             .await?;
-        let upper = events.last().map(|e| Checkpoint::new(e.sequence));
-        Ok(Batch::new(events, upper))
+        Ok(Batch::of(events))
     }
 }
 
@@ -144,8 +143,7 @@ where
             .store
             .stream_all_filtered(from.as_sequence(), &self.filter, max, self.scan_limit)
             .await?;
-        let upper = read.events.last().map(|e| Checkpoint::new(e.sequence));
-        Ok(Batch::new(read.events, upper).scanned_to(Checkpoint::new(read.scanned)))
+        Ok(Batch::of(read.events).scanned_to(Checkpoint::new(read.scanned)))
     }
 }
 

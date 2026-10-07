@@ -64,25 +64,11 @@ fn row(views: &SqliteViewStore<Balance>, name: &str, id: &str) -> Option<(u64, S
 }
 
 #[test]
-fn the_view_store_saves_loads_and_keeps_the_newest() {
-    let store = SqliteStore::<Event>::open_in_memory().expect("open");
-    let views = SqliteViewStore::<Balance>::new(&store);
-    assert!(row(&views, "balance", "a").is_none());
-    let save = |version, value| {
-        block_on(views.save(
-            "balance",
-            "a",
-            ViewRow {
-                version: Sequence::new(version),
-                value: Balance(value),
-            },
-        ))
-        .expect("save");
-    };
-    save(3, 30);
-    save(7, 70);
-    save(5, 50); // behind: dropped
-    assert_eq!(row(&views, "balance", "a"), Some((70, Sequence::new(7))));
+fn the_view_store_passes_the_contract() {
+    eventyr_projection::view::view_store_contract(
+        || SqliteViewStore::<Balance>::new(&SqliteStore::<Event>::open_in_memory().expect("open")),
+        |version| Balance(version * 10),
+    );
 }
 
 #[test]

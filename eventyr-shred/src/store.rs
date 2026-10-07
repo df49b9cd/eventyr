@@ -11,7 +11,9 @@ use eventyr_core::envelope::{EventEnvelope, NewEvent};
 use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
-use eventyr_store::store::{EventStore, QueryAppend, StreamLifecycle, StreamsAll};
+use eventyr_store::store::{
+    EventFilter, EventStore, FilteredRead, QueryAppend, StreamLifecycle, StreamsAll,
+};
 
 use crate::cipher::Cipher;
 use crate::keys::KeyStore;
@@ -73,7 +75,7 @@ where
     let mut sealed = Vec::with_capacity(events.len());
     for event in events {
         sealed.push(NewEvent {
-            event: shredder.seal(&event.event).await?,
+            event: shredder.seal(event.event).await?,
             metadata: event.metadata,
         });
     }
@@ -210,6 +212,41 @@ where
             let shredder = Arc::clone(&shredder);
             async move { open_envelope(&shredder, read?).await }
         })
+    }
+
+    /// Filter *before* opening (0.7.4): the stream id and the stored
+    /// event name are non-sensitive by this crate's rule — neither
+    /// `EventName` nor the tags may depend on a `Sensitive` field — so
+    /// the filter runs on sealed envelopes and only the selected ones
+    /// pay the decrypt. Without this override the default filter would
+    /// open every scanned event (up to `scan_limit` per poll) to
+    /// discard most of them.
+    fn stream_all_filtered(
+        &self,
+        from: Sequence,
+        filter: &EventFilter,
+        max: usize,
+        scan_limit: usize,
+    ) -> impl Future<Output = Result<FilteredRead<Self::Event>, StoreError>> + Send
+    where
+        Self::Event: EventName,
+    {
+        let shredder = Arc::clone(&self.shredder);
+        let filter = filter.clone();
+        async move {
+            let sealed = self
+                .inner
+                .stream_all_filtered(from, &filter, max, scan_limit)
+                .await?;
+            let mut events = Vec::with_capacity(sealed.events.len());
+            for envelope in sealed.events {
+                events.push(open_envelope(&shredder, envelope).await?);
+            }
+            Ok(FilteredRead {
+                events,
+                scanned: sealed.scanned,
+            })
+        }
     }
 }
 

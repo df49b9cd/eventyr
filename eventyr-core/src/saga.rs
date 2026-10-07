@@ -186,7 +186,7 @@ impl<S: Saga> SagaMachine<S> {
         if self.phase != Phase::Ready {
             return self.violation("start() on a machine that already progressed");
         }
-        let metadata = Metadata::overlay(&self.metadata, &event.metadata, &Metadata::default());
+        let metadata = Metadata::overlay(&self.metadata, &event.metadata);
         let name = self.saga.name();
         self.pending = self
             .saga

@@ -11,5 +11,8 @@ keywords = ["event-sourcing", "gdpr", "crypto-shredding", "aes-gcm"]
 workspace = true
 
 [dependencies]
-eventyr-shred = { workspace = true, features = ["aead", "testing"] }
+eventyr-shred = { workspace = true, features = ["aead"] }
 aes-gcm = { workspace = true, features = ["aes", "alloc", "getrandom"] }
+
+[dev-dependencies]
+eventyr-shred = { workspace = true, features = ["testing"] }

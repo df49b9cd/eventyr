@@ -128,14 +128,18 @@ impl<C: Cipher, K: KeyStore> Shredder<C, K> {
     }
 
     /// Encrypt every `Plain` field of `event`, creating a subject's key
-    /// on first use. Already-sealed fields pass through.
-    pub async fn seal<E>(&self, event: &E) -> Result<E, ShredError>
+    /// on first use. Already-sealed fields pass through. An event with
+    /// no sensitive fields passes through untouched — no round trip.
+    pub async fn seal<E>(&self, event: E) -> Result<E, ShredError>
     where
         E: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let mut value = redacted(serde_json::to_value(event))?;
+        let mut value = redacted(serde_json::to_value(&event))?;
         let mut fields = Vec::new();
         collect(&mut value, &mut fields);
+        if fields.is_empty() {
+            return Ok(event);
+        }
         let mut keys: HashMap<String, SubjectKey> = HashMap::new();
         for field in fields {
             let Some(Value::String(state)) = field.get(TAG).cloned() else {

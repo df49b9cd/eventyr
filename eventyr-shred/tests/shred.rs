@@ -129,7 +129,7 @@ fn shredder() -> Arc<Shredder<Toy, InMemoryKeyStore>> {
 fn sealing_hides_the_value_and_opening_restores_it() {
     let shredder = shredder();
     let event = registered("c-1", "ada@example.com");
-    let sealed = block_on(shredder.seal(&event)).expect("seal");
+    let sealed = block_on(shredder.seal(event.clone())).expect("seal");
     let stored = serde_json::to_string(&sealed).expect("json");
     assert!(!stored.contains("ada@example.com"), "{stored}");
     assert!(stored.contains("\"$sensitive\":\"sealed\""), "{stored}");
@@ -145,7 +145,7 @@ fn erasing_a_subject_shreds_its_fields_and_only_its_fields() {
         a_name: Sensitive::new("c-1", "Ada".to_owned()),
         b_name: Sensitive::new("c-2", "Bob".to_owned()),
     };
-    let sealed = block_on(shredder.seal(&married)).expect("seal");
+    let sealed = block_on(shredder.seal(married)).expect("seal");
     block_on(shredder.erase("c-1")).expect("erase");
     let CustomerEvent::Married { a_name, b_name, .. } =
         block_on(shredder.open(sealed)).expect("an erased field is not an error")
@@ -160,10 +160,10 @@ fn erasing_a_subject_shreds_its_fields_and_only_its_fields() {
 #[test]
 fn an_erased_subject_cannot_be_sealed_again() {
     let shredder = shredder();
-    block_on(shredder.seal(&registered("c-1", "a@x"))).expect("seal");
+    block_on(shredder.seal(registered("c-1", "a@x"))).expect("seal");
     block_on(shredder.erase("c-1")).expect("erase");
     assert!(matches!(
-        block_on(shredder.seal(&registered("c-1", "b@x"))),
+        block_on(shredder.seal(registered("c-1", "b@x"))),
         Err(ShredError::SubjectErased(subject)) if subject == "c-1"
     ));
 }
@@ -173,8 +173,8 @@ fn a_field_moved_to_another_subject_fails_to_open() {
     // The subject is authenticated (aad): rewriting the stored subject
     // to one whose key would decrypt is caught, not silently accepted.
     let shredder = shredder();
-    block_on(shredder.seal(&registered("c-2", "bob@x"))).expect("give c-2 a key");
-    let sealed = block_on(shredder.seal(&registered("c-1", "ada@x"))).expect("seal");
+    block_on(shredder.seal(registered("c-2", "bob@x"))).expect("give c-2 a key");
+    let sealed = block_on(shredder.seal(registered("c-1", "ada@x"))).expect("seal");
     let tampered = serde_json::to_string(&sealed)
         .expect("json")
         .replace("\"subject\":\"c-1\"", "\"subject\":\"c-2\"");
@@ -223,7 +223,7 @@ fn events_without_sensitive_fields_pass_through() {
         customer: "c-1".into(),
         total: 5,
     };
-    let sealed = block_on(shredder.seal(&order)).expect("seal");
+    let sealed = block_on(shredder.seal(order.clone())).expect("seal");
     assert_eq!(sealed, order);
     assert_eq!(block_on(shredder.open(sealed)).expect("open"), order);
 }

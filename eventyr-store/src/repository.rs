@@ -175,8 +175,7 @@ where
                 version: Version::EMPTY,
             });
         }
-        self.fold_while(&id, None, |envelope| Ok(envelope.version <= version))
-            .await
+        self.fold_at_most(&id, None, version).await
     }
 }
 
@@ -261,6 +260,20 @@ where
             WriteOutcome::Rejected(error) => Err(ExecutionError::Domain(error)),
             WriteOutcome::Failed(error) => Err(ExecutionError::Store(error)),
         }
+    }
+
+    /// [`fold_while`](Self::fold_while) with the one `keep` both
+    /// `load_at` paths use: fold through `version`, inclusive. The
+    /// `Version::EMPTY` early return is each public method's — the
+    /// seed read is snapshots' to skip.
+    async fn fold_at_most(
+        &self,
+        id: &A::Id,
+        seed: Option<Snapshot<A::State>>,
+        version: Version,
+    ) -> Result<Loaded<A::State>, StoreError> {
+        self.fold_while(id, seed, |envelope| Ok(envelope.version <= version))
+            .await
     }
 
     /// The shared read fold behind `load` / `load_at` /
@@ -417,9 +430,11 @@ where
     /// The snapshot is a seed, never the whole answer: a failed snapshot
     /// read fails the load (the write path's rule — a seed is not a
     /// cache to fall back past). Ignoring the cadence, a load does not
-    /// offer a snapshot. [`load`](AggregateRepository::load) on a
-    /// snapshots-on repository is the same fold without the seed (full
-    /// replay); both names exist so no call silently pays the wrong one.
+    /// offer a snapshot. The unseeded fold is
+    /// [`load`](AggregateRepository::load), which exists only on a
+    /// snapshots-off repository; a full replay of a snapshots-on one goes
+    /// through a plain repository over the same store. The distinct names
+    /// mean no call silently pays for the wrong fold.
     pub async fn load_with_snapshots(&self, id: A::Id) -> Result<Loaded<A::State>, StoreError> {
         let stream_id = StreamId::for_aggregate::<A>(&id);
         let seed = self.snapshots.load(&stream_id).await?;
@@ -450,8 +465,7 @@ where
             .load(&stream_id)
             .await?
             .filter(|snapshot| snapshot.version <= version);
-        self.fold_while(&id, seed, |envelope| Ok(envelope.version <= version))
-            .await
+        self.fold_at_most(&id, seed, version).await
     }
     /// [`execute_with_snapshots`](Self::execute_with_snapshots) with the
     /// interaction's metadata stamped on every emitted event (0.5.2).

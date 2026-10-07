@@ -25,7 +25,7 @@ views = ["dep:eventyr-projection"]
 checkpoints = ["dep:eventyr-subscription"]
 # Projector leases: one driver per checkpoint name (0.7.9), over the
 # `projector_leases` table (migration 0012).
-leases = ["dep:eventyr-subscription"]
+leases = ["dep:eventyr-subscription", "dep:uuid"]
 
 [dependencies]
 eventyr-core = { workspace = true, features = ["serde"] }
@@ -47,14 +47,14 @@ thiserror.workspace = true
 async-stream.workspace = true
 futures = { workspace = true, features = ["std"] }
 time = { workspace = true, optional = true }
-uuid.workspace = true
+uuid = { workspace = true, optional = true }
 
 # dev-dependency on ourselves so the tests can turn on the features
 # they exercise (a crate's own --features don't reach `tests/`).
 [dev-dependencies]
 eventyr-store-postgres = { path = ".", features = ["snapshots", "views", "checkpoints", "leases"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
-eventyr-projection = { workspace = true, features = ["inline"] }
+eventyr-projection = { workspace = true, features = ["inline", "testing"] }
 eventyr-subscription = { workspace = true, features = ["testing"] }
-uuid = { workspace = true, features = ["v4"] }
+uuid.workspace = true
 eventyr-store-testing = { workspace = true, features = ["serde"] }

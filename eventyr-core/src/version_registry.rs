@@ -1,6 +1,5 @@
 //! The upcasting vocabulary: [`EventSchemaVersion`] (the storage-level
-//! schema version carried by [`RawEvent`](crate::upcast::RawEvent)) and
-//! [`VersionedRaw`] (a raw event tagged with it).
+//! schema version carried by [`RawEvent`](crate::upcast::RawEvent)).
 //!
 //! The ladder machinery — `VersionUpcaster`, `UpcasterRegistry`,
 //! `VersionRung`, and the `RegistryError` shape validation — lives in
@@ -8,9 +7,6 @@
 //! (DESIGN §3: read-side glue is store-side). The umbrella crate
 //! re-exports it under `eventyr::projection`, so the pre-0.5.1
 //! `eventyr::prelude` surface resolves there too.
-
-use alloc::string::String;
-use alloc::vec::Vec;
 
 /// The version of a stored event's schema: 1-based, where the current
 /// shape is one past the highest registered version.
@@ -44,13 +40,7 @@ impl core::fmt::Display for EventSchemaVersion {
     }
 }
 
-/// A raw event tagged with the schema version it was stored at.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct VersionedRaw {
-    /// The stored event type name.
-    pub event_type: String,
-    /// The schema version `payload` was stored at.
-    pub version: EventSchemaVersion,
-    /// The stored payload, as raw bytes.
-    pub payload: Vec<u8>,
-}
+/// A raw event tagged with the schema version it was stored at — the
+/// same shape [`RawEvent`](crate::upcast::RawEvent) already is. The
+/// alias keeps the pre-0.5.1 name for the registry's inputs.
+pub use crate::upcast::RawEvent as VersionedRaw;

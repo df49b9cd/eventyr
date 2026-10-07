@@ -59,12 +59,15 @@ impl InMemoryCheckpointStore {
 
 // `String` → `&str` lookup via `HashMap::get` avoids allocating on the
 // hot read; the lock itself is uncontended except at the ack boundary.
+// No user code runs under this lock beyond a `HashMap` get/insert, and
+// a panic there leaves the store consistent enough to continue — the
+// recover-on-poison policy the other in-memory stores share.
 impl CheckpointStore for InMemoryCheckpointStore {
     async fn load(&self, name: &str) -> Result<Checkpoint, StoreError> {
         let guard = self
             .inner
             .lock()
-            .map_err(|e| StoreError::other(format!("checkpoint store lock poisoned: {e}")))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(guard.get(name).copied().unwrap_or(Checkpoint::ORIGIN))
     }
 
@@ -72,19 +75,21 @@ impl CheckpointStore for InMemoryCheckpointStore {
         let mut guard = self
             .inner
             .lock()
-            .map_err(|e| StoreError::other(format!("checkpoint store lock poisoned: {e}")))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.insert(name.to_owned(), checkpoint);
         Ok(())
     }
 }
 
 /// Run the [`CheckpointStore`] contract against `make_store`'s fresh
-/// stores. Every implementation runs it.
+/// stores. Every implementation runs it, behind this crate's `testing`
+/// feature.
 ///
 /// The contract is the trait's: an unwritten name loads
 /// [`ORIGIN`](Checkpoint::ORIGIN), a stored checkpoint loads back,
 /// names are independent, and the last store wins — including one that
 /// moves a name back, which is how an operator rewinds a projection.
+#[cfg(any(test, feature = "testing"))]
 pub fn checkpoint_store_contract<C: CheckpointStore>(make_store: impl Fn() -> C) {
     use eventyr_core::vocabulary::Sequence;
     use futures::executor::block_on;
