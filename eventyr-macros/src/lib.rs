@@ -3,10 +3,12 @@
 //!
 //! Depend on `eventyr-core` (with its `macros` feature) or on the `eventyr`
 //! umbrella crate instead of this crate directly — both re-export the
-//! derives. Generated code targets `::eventyr_core` paths by default; when
-//! the derives come through the umbrella, point them back at it with
-//! `#[eventyr(crate = "eventyr")]` (the serde `crate = "..."` pattern).
+//! derives. Generated code targets whichever of the two your manifest
+//! depends on (the serde `crate = "..."` pattern, resolved from the
+//! caller's `Cargo.toml`); only a *renamed* dependency needs
+//! `#[eventyr(crate = "...")]`.
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 mod aggregate;
 mod attrs;
 mod event_name;
@@ -51,7 +53,7 @@ use proc_macro::TokenStream;
 ///   through the umbrella crate)
 /// - `event_derive(Serialize, ...)` — extra `#[derive(...)]` paths for
 ///   the generated event enum, and `event_attr("#[serde(...)]")` for
-///   any other attribute on it (0.7.6+: a stored or shredded event
+///   any other attribute on it (roadmap 0.7.6: a stored or shredded event
 ///   enum is a serde value)
 ///
 /// # The event enum

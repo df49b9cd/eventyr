@@ -47,9 +47,23 @@
 //! implementation ([`aead::AeadCipher`]); `testing` exports the
 //! contracts for adapter and key store tests.
 //!
+//! ## Cargo features
+//!
+//! - `zeroize` — zeroize key bytes on drop (`SubjectKey` and the
+//!   per-call caches); recipients (a key store on disk, a key
+//!   management service) may keep their own copies regardless.
+//! - `aead` — a generic AEAD `Cipher` over the `aead` traits: an
+//!   algorithm adapter crate (eventyr-shred-aes-gcm / -chacha) is one
+//!   newtype over it.
+//! - `parked` — `ShreddingParkedStore`: a `ParkedStore` wrapper that
+//!   seals an event's `Sensitive` fields before they are parked
+//!   (roadmap 0.7.7).
+//! - `testing` — exports `cipher_contract` and `key_store_contract`,
+//!   for adapter-crate and key store tests; not for production builds.
+//!
 //! Erasure covers the event log. Anything that copied personal data out
 //! of it — a snapshot of folded state, a view row, a *parked* event
-//! (0.7.7: the poison events a projection gave up on, envelope kept for
+//! (roadmap 0.7.7: the poison events a projection gave up on, envelope kept for
 //! replay), a log line — holds it in the clear and must be cleared too.
 //! Wrap the parked store in
 //! [`ShreddingParkedStore`] (the `parked`
@@ -60,6 +74,7 @@
 //! data. After [`Shredder::erase`], delete the subject's snapshots,
 //! rebuild or delete their view rows, and mind those rejection logs.
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #[cfg(feature = "aead")]
 pub mod aead;
 mod cipher;

@@ -24,6 +24,7 @@
 //! # Ok::<(), eventyr_shred::CipherError>(())
 //! ```
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 use chacha20poly1305::XChaCha20Poly1305;
 use eventyr_shred::aead::AeadCipher;
 use eventyr_shred::{Cipher, CipherError, SubjectKey};

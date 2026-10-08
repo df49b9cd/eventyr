@@ -6,7 +6,9 @@
 use eventyr_core::event_name::EventName;
 
 /// The suite's payload for [`ContractEvent`](crate::ContractEvent) stores: one
-/// variant carrying the `u64` the checks append. Its stored name is
+/// variant carrying the `u64` the checks append.
+///
+/// Its stored name is
 /// always `"Payload"`, and with the `serde` feature it serializes as
 /// `{"Payload":{"value":N}}` — the shape raw-SQL tests insert.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -58,7 +60,9 @@ impl From<u64> for ParityEvent {
 
 /// An event that counts how often it is decoded — the fixture for a
 /// store's page-bound read checks (a short global read must not decode
-/// the whole tail). The counter is global; call
+/// the whole tail).
+///
+/// The counter is global; call
 /// [`Counted::reset_decodes`] before the check that reads it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]

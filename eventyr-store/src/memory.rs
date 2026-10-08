@@ -39,9 +39,9 @@ struct Inner<E> {
     next_sequence: u64,
     /// Each stream's version — its last event's, kept across truncation.
     heads: HashMap<StreamId, u64>,
-    /// Streams closed to appends (0.7.6).
+    /// Streams closed to appends (roadmap 0.7.6).
     closed: std::collections::HashSet<StreamId>,
-    /// The first kept version of each truncated stream (0.7.6).
+    /// The first kept version of each truncated stream (roadmap 0.7.6).
     cuts: HashMap<StreamId, u64>,
 }
 
@@ -172,7 +172,7 @@ impl<E: EventName + Tagged> Inner<E> {
 /// never across an await (there are none).
 pub struct InMemoryStore<E> {
     inner: Mutex<Inner<E>>,
-    /// Raised after every commit (0.7.2).
+    /// Raised after every commit (roadmap 0.7.2).
     signal: LocalCommitSignal,
 }
 

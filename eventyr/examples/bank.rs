@@ -3,16 +3,16 @@
 //! One small, complete example covering the shipped surface in a single
 //! in-process run: accounts are opened, funded, debited, and wired
 //! between; the domain rules are pinned with the `Scenario` DSL; the
-//! repository runs snapshot-seeded (0.3); a cross-account transfer rides
+//! repository runs snapshot-seeded (roadmap 0.3); a cross-account transfer rides
 //! the 0.4 batch machine and is replayed under its idempotency key
-//! (0.7.5); a wire-fee saga reacts to deposits through a filtered
-//! subscription (0.6.1 + 0.7.4) with the saga's command keys making
+//! (roadmap 0.7.5); a wire-fee saga reacts to deposits through a filtered
+//! subscription (roadmap 0.6.1 + 0.7.4) with the saga's command keys making
 //! redelivery safe; the ledger read model rebuilds off the global
-//! stream, woken by commits (0.7.2); a poison event is parked and
-//! replayed (0.7.7); a renamed event is upcast end to end (0.3);
+//! stream, woken by commits (roadmap 0.7.2); a poison event is parked and
+//! replayed (roadmap 0.7.7); a renamed event is upcast end to end (roadmap 0.3);
 //! owner names are sealed by the shredding store and one subject is
-//! erased (0.7.6); and an account is closed, its further writes refused
-//! (0.7.6).
+//! erased (roadmap 0.7.6); and an account is closed, its further writes refused
+//! (roadmap 0.7.6).
 //!
 //! Dynamic consistency boundaries live in `examples/loan_eligibility.rs`
 //! and inline views in `examples/inline_view.rs`.
@@ -56,9 +56,9 @@ impl fmt::Display for AccountId {
 // the rename to `Deposited` upcasts the old name on read. `Deposited`
 // and `Withdrawn` carry the account id so the `Tagged` impl below can
 // derive each event's tag from its payload — a stored tag would be
-// wrong for every event written before its type gained one (0.7.1).
+// wrong for every event written before its type gained one (roadmap 0.7.1).
 //
-// `Opened.owner` is a `Sensitive` (0.7.6): the account holder is the
+// `Opened.owner` is a `Sensitive` (roadmap 0.7.6): the account holder is the
 // data subject, and the shredding store seals the name before it
 // reaches the log. The `AmountV1` upcaster below shows the old deposit
 // shape having no `account` field at all.
@@ -77,7 +77,7 @@ struct Withdrawn {
     amount: u64,
 }
 /// The closure fact, appended by the caller before `close_stream` — the
-/// store emits no lifecycle marker of its own (0.7.6).
+/// store emits no lifecycle marker of its own (roadmap 0.7.6).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Closed {
     account: u64,
@@ -152,7 +152,7 @@ fn decide(
         AccountCommand::Close if state.closed => Err(AccountError::Closing),
         AccountCommand::Close => Ok(vec![Closed { account }.into()]),
         // Domain-wise a closed account balances any amount; what refuses
-        // the write is the closed *stream* (0.7.6 below). Only the
+        // the write is the closed *stream* (roadmap 0.7.6). Only the
         // domain's own rules reject here.
         AccountCommand::Open { owner } => Ok(vec![
             Opened {
@@ -191,6 +191,10 @@ fn decide(
 // `initial` receives the id, so the state can carry it; `event_derive`
 // adds the serde glue the shredding store and SQL stores need.
 #[derive(Aggregate)]
+// The umbrella's own examples live in the `eventyr` package itself,
+// where `proc-macro-crate` cannot distinguish them from the target
+// crate — a user's crate is not named `eventyr` and needs none of
+// this. (Same story as serde's own examples.)
 #[eventyr(
     crate = "eventyr",
     id = AccountId,
@@ -212,7 +216,7 @@ impl AccountState {
     }
 }
 
-// Tags (0.7.1): a pure function of the event, the same as its stored
+// Tags (roadmap 0.7.1): a pure function of the event, the same as its stored
 // name. Boundary decisions query the log through tags (see
 // `examples/loan_eligibility.rs`); the fee saga below reads through a
 // filtered subscription, the read-side cousin.
@@ -228,7 +232,7 @@ impl Tagged for AccountEvent {
     }
 }
 
-// -- the multi-stream transfer (0.4) --------------------------------
+// -- the multi-stream transfer (roadmap 0.4) --------------------------------
 
 /// A transfer between two accounts — the batch-machine decision. The
 /// decider *is* the command (`Command = Self`), so one `Clone` serves
@@ -252,7 +256,7 @@ impl Transfer {
         StreamId::for_aggregate::<Account>(&AccountId(id))
     }
 
-    /// `for_aggregates` (0.4+) derives the streams and the per-stream
+    /// `for_aggregates` (roadmap 0.4) derives the streams and the per-stream
     /// folds from the boundary the decider itself names — the two-place
     /// hand-wiring of `BatchMachine::new` (streams *and* a fold map, the
     /// decider *and* its own command) was exactly that shape by hand.
@@ -363,7 +367,7 @@ impl Projection for Ledger {
 }
 
 /// A ledger that refuses any withdrawal over 1_000 — the poison event
-/// for the parking story (0.7.7). Its `Error` is a plain `String`:
+/// for the parking story (roadmap 0.7.7). Its `Error` is a plain `String`:
 /// projections reject with whatever they can display.
 struct PickyLedger {
     balances: Arc<Mutex<BTreeMap<u64, u64>>>,
@@ -388,12 +392,12 @@ impl Projection for PickyLedger {
     }
 }
 
-// -- the wire-fee saga (0.6.1, keys 0.7.5) ---------------------------
+// -- the wire-fee saga (roadmap 0.6.1, keys 0.7.5) -------------------
 
 /// Every deposit to account 2 charges account 1 a 1-unit wire fee.
 ///
 /// `SagaMachine` stamps each command with the idempotency key
-/// `"fee:<sequence>:<index>"` (0.7.5): if the run crashes between
+/// `"fee:<sequence>:<index>"` (roadmap 0.7.5): if the run crashes between
 /// dispatch and ack, the redelivered deposit re-issues the command, and
 /// the target stream's key check returns the earlier commit instead of
 /// charging twice. The dispatcher must forward `command.metadata` into
@@ -424,13 +428,13 @@ async fn main() {
     domain_rules();
 
     // The write side: an in-memory store sealed by the shredding
-    // wrapper (0.7.6). The log itself holds ciphertext; readers through
+    // wrapper (roadmap 0.7.6). The log itself holds ciphertext; readers through
     // the wrapper see plain values until a subject's key is erased.
     let inner = Arc::new(InMemoryStore::<AccountEvent>::new());
     let shredder = Arc::new(Shredder::new(Aes256GcmCipher, InMemoryKeyStore::new()));
     let store = Arc::new(ShreddingStore::new(inner.clone(), shredder.clone()));
 
-    // Snapshots on (0.3): the long-lived account's state is persisted
+    // Snapshots on (roadmap 0.3): the long-lived account's state is persisted
     // every 3 committed versions, and later loads start from it.
     let snapshots = Arc::new(InMemorySnapshotStore::new());
     let repo: AggregateRepository<Account, _, _> =
@@ -444,7 +448,7 @@ async fn main() {
     };
 
     // Open two accounts, with the request's correlation id stamped on
-    // every event (0.5.2).
+    // every event (roadmap 0.5.2).
     repo.execute_with_metadata(
         AccountId(1),
         AccountCommand::Open {
@@ -480,8 +484,8 @@ async fn main() {
         }
     }
 
-    // A cross-account transfer on the batch machine (0.4), under an
-    // idempotency key (0.7.5). The key travels in the metadata and its
+    // A cross-account transfer on the batch machine (roadmap 0.4), under an
+    // idempotency key (roadmap 0.7.5). The key travels in the metadata and its
     // record is the streams the command writes to — no side table, and
     // nothing new to keep consistent.
     let transfer = Transfer {
@@ -509,8 +513,8 @@ async fn main() {
         "a keyed replay transfers nothing twice: {second:?}"
     );
 
-    // The fee saga (0.6.1): bob's deposit charges alice the wire fee.
-    // Its subscription is filtered (0.7.4) — only `account-*` streams
+    // The fee saga (roadmap 0.6.1): bob's deposit charges alice the wire fee.
+    // Its subscription is filtered (roadmap 0.7.4) — only `account-*` streams
     // are read, and the checkpoint still advances past long runs where
     // nothing matched.
     let repo = Arc::new(repo);
@@ -540,7 +544,7 @@ async fn main() {
     assert!(matches!(saga_outcome, SubscriptionOutcome::CaughtUp { .. }));
 
     // The ledger: rebuild it off the global stream, woken by commits
-    // (0.7.2). `wake_on` ends idle sleeps early when the store commits;
+    // (roadmap 0.7.2). `wake_on` ends idle sleeps early when the store commits;
     // here catch-up is immediate because the log is already full.
     let balances = Arc::new(Mutex::new(BTreeMap::new()));
     let outcome = Projector::new(
@@ -561,7 +565,7 @@ async fn main() {
     let expected: BTreeMap<u64, u64> = [(1, 99), (2, 30)].into_iter().collect();
     assert_eq!(*balances.lock().expect("the lock"), expected);
 
-    // Poison events (0.7.7): a 5_000-unit withdrawal the picky ledger
+    // Poison events (roadmap 0.7.7): a 5_000-unit withdrawal the picky ledger
     // refuses. `Park { retries: 2 }` lets it reject three times, records
     // the event in the parked store, and carries on past it — one bad
     // event never stalls the projection (Halt stays the default;
@@ -622,7 +626,7 @@ async fn main() {
         "the replay applies the once-poisoned event"
     );
 
-    // The upcast story (0.3): a deposit stored under its old name
+    // The upcast story (roadmap 0.3): a deposit stored under its old name
     // `AmountV1` — a bare number, from before deposits knew their
     // account — is lifted to the current `Deposited` shape on read.
     let chain = UpcasterChain::new()
@@ -670,7 +674,7 @@ async fn main() {
     .expect("decode");
     assert_eq!(upcasted, 42);
 
-    // Lifecycle (0.7.6): carol's account is closed. The domain records
+    // Lifecycle (roadmap 0.7.6): carol's account is closed. The domain records
     // its own `Closed` event first; the store then refuses every append
     // path while the history stays readable.
     repo.execute_with_metadata(
@@ -698,7 +702,7 @@ async fn main() {
         ExecutionError::Store(StoreError::StreamClosed { .. })
     ));
 
-    // Reading state without a command (0.7.8): the repository folds the
+    // Reading state without a command (roadmap 0.7.8): the repository folds the
     // stream into the aggregate's state — carol is `closed`, and the
     // load answers "what is she now" without re-deciding anything. The
     // seeded form is the same fold from the snapshot.
@@ -709,7 +713,7 @@ async fn main() {
     assert!(carol.state.closed);
     assert_eq!(carol.version, Version::new(2)); // open + close
 
-    // Erasure (0.7.6): bob closes his account and exercises his right
+    // Erasure (roadmap 0.7.6): bob closes his account and exercises his right
     // to be forgotten. Deleting his key turns every sealed `owner` of
     // his into `Shredded` — history still folds, only the personal data
     // is gone. And nothing new for an erased subject is ever written in
@@ -733,7 +737,7 @@ async fn main() {
     );
 }
 
-/// The decide rules, pinned with the `Scenario` DSL (0.2) instead of
+/// The decide rules, pinned with the `Scenario` DSL (roadmap 0.2) instead of
 /// ad-hoc asserts: `given` a history, `when` a command, `then` the
 /// events or the rejection.
 fn domain_rules() {

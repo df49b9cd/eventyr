@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use eventyr_core::envelope::{EventEnvelope, NewEvent};
 use eventyr_core::error::StoreError;
-use eventyr_core::subscription::SubscriptionPolicy;
+use eventyr_core::subscription_machine::SubscriptionPolicy;
 use eventyr_core::vocabulary::{ExpectedVersion, StreamId, Version};
 use eventyr_store::notify::{CommitListener, CommitSignal};
 use eventyr_store::store::EventStore;

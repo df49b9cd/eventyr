@@ -1,7 +1,9 @@
 //! The embedded snapshot store, behind the `snapshots` feature: a
 //! fourth keyspace, `"{stream_id}\0{version:016}"` → JSON
-//! [`Snapshot`]-shaped rows, read through a reverse range scan so the
-//! newest version is the first hit — the port's newest-wins semantics
+//! [`Snapshot`]-shaped rows.
+//!
+//! The rows are read through a reverse range scan so the newest
+//! version is the first hit. The port's newest-wins semantics
 //! fall out of the key layout, and `save` drops an offer at or below the
 //! newest stored version so an equal-version offer cannot replace it.
 
@@ -40,6 +42,12 @@ impl<S> FjallSnapshotStore<S> {
     ///
     /// Pair this with a [`FjallStore`](crate::FjallStore) opened on the
     /// same database: the snapshots live beside the log.
+    ///
+    /// # Errors
+    ///
+    /// The snapshots keyspace could not be created on the database —
+    /// an engine (I/O, corruption) failure, or a keyspace of the same
+    /// name existing with an incompatible configuration.
     pub fn open(keyspace: &SingleWriterTxDatabase) -> Result<Self, FjallStoreError> {
         Ok(Self {
             snapshots: keyspace

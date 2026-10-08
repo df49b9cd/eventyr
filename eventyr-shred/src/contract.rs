@@ -7,6 +7,13 @@ use crate::keys::KeyStore;
 
 /// Run the cipher contract against `cipher`. Panics with the first
 /// broken property.
+///
+/// # Panics
+///
+/// When the cipher broke a contract property: two generated keys were
+/// identical, the ciphertext leaked the plaintext, the round trip
+/// mismatched, or a wrong key or wrong `aad` decrypted. The message
+/// names the broken property.
 pub fn cipher_contract<C: Cipher>(cipher: &C) {
     let key = cipher.generate_key().expect("generate a key");
     let other = cipher.generate_key().expect("generate another key");
@@ -78,6 +85,13 @@ pub fn cipher_contract<C: Cipher>(cipher: &C) {
 /// Run the key store contract against `make_store`'s fresh stores. The
 /// property erasure rests on: an erased subject stays erased — its key
 /// is gone, and it cannot be given a new one.
+///
+/// # Panics
+///
+/// When the store broke a contract property: a live key did not
+/// round-trip, a raced create lost the existing key, or an erased
+/// subject answered with a key or accepted a new one. The message
+/// names the broken property.
 pub fn key_store_contract<K: KeyStore>(make_store: impl Fn() -> K) {
     use futures::executor::block_on;
 

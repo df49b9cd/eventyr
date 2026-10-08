@@ -17,7 +17,7 @@ use crate::driver::{drive_write, drive_write_with_snapshots};
 use crate::snapshot_store::SnapshotStore;
 use crate::store::EventStore;
 
-/// A state folded from one stream, and the version it reached (0.7.8).
+/// A state folded from one stream, and the version it reached (roadmap 0.7.8).
 ///
 /// `version` is the last folded event's position — `Version::EMPTY`
 /// on an empty or unknown stream, and below the bound `load_at` asked
@@ -86,7 +86,7 @@ pub enum ExecutionOutcome<E, S = ()> {
         /// The snapshot the machine offered at commit, if any.
         snapshot: Option<OfferSnapshot<S>>,
     },
-    /// The command carried an idempotency key (0.7.5) whose earlier
+    /// The command carried an idempotency key (roadmap 0.7.5) whose earlier
     /// commit is already in the stream; nothing was decided or appended.
     /// `committed` is that earlier commit, as stored.
     AlreadyCommitted {
@@ -148,13 +148,19 @@ where
         }
     }
 
-    /// Load the instance's state by folding its whole stream (0.7.8).
+    /// Load the instance's state by folding its whole stream (roadmap 0.7.8).
     ///
     /// No command, no append, no retry: one fold from
     /// [`Aggregate::initial`]. Snapshots are not consulted — see
     /// [`load_with_snapshots`](AggregateRepository::load_with_snapshots)
     /// on a snapshots-on repository. An unknown stream loads its
     /// `initial` and reports `Version::EMPTY`.
+    ///
+    /// # Errors
+    ///
+    /// The store's stream read failed, or the stream it read was
+    /// protocol-violating: events of another stream, a non-contiguous
+    /// version run, or a snapshot store answering for another stream.
     pub async fn load(&self, id: A::Id) -> Result<Loaded<A::State>, StoreError> {
         self.fold_while(&id, None, |_| Ok(true)).await
     }
@@ -164,6 +170,11 @@ where
     /// `Version::EMPTY` returns the initial state with no I/O. A version
     /// past the stream's head returns the head state and reports the
     /// head — `Loaded.version` is what was actually folded.
+    ///
+    /// # Errors
+    ///
+    /// As [`load`](Self::load): the stream read failed or the events
+    /// read back violated the fold's invariants.
     pub async fn load_at(
         &self,
         id: A::Id,
@@ -216,6 +227,52 @@ where
     /// built with [`with_snapshots`](AggregateRepository::with_snapshots)
     /// — snapshots are a read-side fast path, never a change to the
     /// write contract.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecutionError::Domain`] when `decide` rejected the command.
+    /// [`ExecutionError::Store`] when the store failed: a conflict that
+    /// exhausted the retry budget, a transient unavailability, a
+    /// protocol-violating read, or a fatal store error.
+    ///
+    /// # Examples
+    ///
+    /// Open then deposit — the second `execute` folds the first's
+    /// event, so the deposit decides against an open account. The
+    /// committed envelopes are as the store recorded them:
+    ///
+    /// ```
+    /// # fn main() {
+    /// use eventyr_core::testing::account::*;
+    /// use eventyr_core::write::RetryPolicy;
+    /// use eventyr_store::prelude::*;
+    /// use futures::executor::block_on;
+    ///
+    /// let repository = AggregateRepository::<Account, _>::new(
+    ///     InMemoryStore::new(),
+    ///     RetryPolicy::default(),
+    /// );
+    ///
+    /// block_on(repository.execute(
+    ///     AccountId(1),
+    ///     AccountCommand::Open { owner: "me".into() },
+    /// )).expect("open");
+    ///
+    /// match block_on(repository.execute(
+    ///     AccountId(1),
+    ///     AccountCommand::Deposit { amount: 50 },
+    /// )) {
+    ///     Ok(ExecutionOutcome::Committed { committed, .. }) => {
+    ///         let events: Vec<_> = committed.iter().map(|e| &e.event).collect();
+    ///         assert!(matches!(
+    ///             events.as_slice(),
+    ///             [AccountEvent::Deposited { amount: 50 }],
+    ///         ));
+    ///     }
+    ///     _ => panic!("a deposit on an open account commits"),
+    /// }
+    /// # }
+    /// ```
     pub async fn execute(
         &self,
         id: A::Id,
@@ -226,10 +283,10 @@ where
     }
 
     /// [`execute`](Self::execute) with the interaction's metadata stamped
-    /// on every emitted event (0.5.2).
+    /// on every emitted event (roadmap 0.5.2).
     ///
     /// A metadata [`idempotency_key`](eventyr_core::envelope::Metadata::idempotency_key)
-    /// makes the call idempotent (0.7.5): if the stream already holds
+    /// makes the call idempotent (roadmap 0.7.5): if the stream already holds
     /// events stamped with the key, the command is not decided again
     /// and the outcome is [`AlreadyCommitted`](ExecutionOutcome::AlreadyCommitted).
     /// The check reads the stream the command targets, so it holds
@@ -240,6 +297,12 @@ where
     /// (and their causes) without threading ids through the domain.
     /// `decide` never sees them — causation/correlation are boundary
     /// concerns, not the domain's.
+    ///
+    /// # Errors
+    ///
+    /// As [`execute`](Self::execute): a domain rejection, or a store
+    /// failure — a conflict after retries, a transient error, or a
+    /// fatal one.
     pub async fn execute_with_metadata(
         &self,
         id: A::Id,
@@ -277,7 +340,7 @@ where
     }
 
     /// The shared read fold behind `load` / `load_at` /
-    /// `load_until` (0.7.8): seeds from `seed` (a snapshot, when one is
+    /// `load_until` (roadmap 0.7.8): seeds from `seed` (a snapshot, when one is
     /// used) or from [`Aggregate::initial`], then folds the stream from
     /// the seed's version onward, applying each event while `keep` says
     /// continue. `keep` runs *before* the fold so `load_until` can stop
@@ -326,7 +389,7 @@ where
     }
 
     /// Fold every event whose metadata timestamp is at or before
-    /// `timestamp`, load-only (0.7.8, `time` feature).
+    /// `timestamp`, load-only (roadmap 0.7.8, `time` feature).
     ///
     /// The fold stops at the *first* event after the instant — a stream
     /// appends once per version and timestamps can reorder across
@@ -335,6 +398,12 @@ where
     /// stream: only stores that persist one (the in-memory and Postgres
     /// stores) can answer a load by time. Never snapshot-seeded — a
     /// snapshot records a version, not an instant.
+    ///
+    /// # Errors
+    ///
+    /// As [`load`](Self::load), or an event in the folded stretch
+    /// carries no timestamp — a store that does not persist one cannot
+    /// answer a load by time.
     #[cfg(feature = "time")]
     pub async fn load_until(
         &self,
@@ -411,6 +480,15 @@ where
     ///
     /// Bonded on `SS: SnapshotStore` so the type system rules out a
     /// snapshots-off repository calling it.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecutionError::Domain`] when `decide` rejected the command.
+    /// [`ExecutionError::Store`] when the store failed: the snapshot
+    /// read, a conflict that exhausted the retry budget, a
+    /// protocol-violating stream, or a fatal store error. A failed
+    /// post-commit snapshot *save* is not one — it is
+    /// fire-and-forget.
     pub async fn execute_with_snapshots(
         &self,
         id: A::Id,
@@ -425,7 +503,7 @@ where
     }
 
     /// Load the instance's state from the newest persisted snapshot,
-    /// folding only the delta after it (0.7.8).
+    /// folding only the delta after it (roadmap 0.7.8).
     ///
     /// The snapshot is a seed, never the whole answer: a failed snapshot
     /// read fails the load (the write path's rule — a seed is not a
@@ -435,6 +513,12 @@ where
     /// snapshots-off repository; a full replay of a snapshots-on one goes
     /// through a plain repository over the same store. The distinct names
     /// mean no call silently pays for the wrong fold.
+    ///
+    /// # Errors
+    ///
+    /// The snapshot read failed (the write path's rule: a seed is not a
+    /// cache to fall back past), or the delta fold's stream read failed
+    /// or violated the fold's invariants.
     pub async fn load_with_snapshots(&self, id: A::Id) -> Result<Loaded<A::State>, StoreError> {
         let stream_id = StreamId::for_aggregate::<A>(&id);
         let seed = self.snapshots.load(&stream_id).await?;
@@ -448,6 +532,11 @@ where
     /// only move forward), so this seeds from one at or below the bound
     /// and otherwise replays. `Version::EMPTY` returns the initial state
     /// with no I/O.
+    ///
+    /// # Errors
+    ///
+    /// As [`load_with_snapshots`](Self::load_with_snapshots): the
+    /// snapshot read failed, or the delta fold did.
     pub async fn load_at_with_snapshots(
         &self,
         id: A::Id,
@@ -468,7 +557,21 @@ where
         self.fold_at_most(&id, seed, version).await
     }
     /// [`execute_with_snapshots`](Self::execute_with_snapshots) with the
-    /// interaction's metadata stamped on every emitted event (0.5.2).
+    /// interaction's metadata stamped on every emitted event (roadmap 0.5.2).
+    ///
+    /// # Errors
+    ///
+    /// As [`execute_with_snapshots`](Self::execute_with_snapshots): a
+    /// domain rejection, or a store failure — the snapshot read, a
+    /// conflict after retries, or a fatal error.
+    ///
+    /// # Panics
+    ///
+    /// When the repository carries no snapshot cadence policy — the
+    /// constructor [`with_snapshots`](Self::with_snapshots) sets one
+    /// before this method is reachable, so a plain repository built
+    /// with [`from_policy`](Self::from_policy) cannot get here (the
+    /// `SS: SnapshotStore` bound rules it out at the type level).
     pub async fn execute_with_snapshots_and_metadata(
         &self,
         id: A::Id,

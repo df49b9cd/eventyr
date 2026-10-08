@@ -3,12 +3,12 @@
 //!
 //! Two answers to "what is account 7's balance, right now?":
 //!
-//! - **Inline** (0.7.3): the store folds every committed event into the
+//! - **Inline** (roadmap 0.7.3): the store folds every committed event into the
 //!   view's row inside the append's own transaction, so a read straight
 //!   after the write sees it. SQLite and Postgres maintain it; a row
 //!   that cannot be folded fails the append. Keep inline views cheap —
 //!   they run inside the append's serialized section.
-//! - **Async** (0.6.3): a `ViewProjection` replays the log into the
+//! - **Async** (roadmap 0.6.3): a `ViewProjection` replays the log into the
 //!   same row shape, eventually consistently — the same `View`,
 //!   the same rows, so a view moves between the two without a rewrite.
 //!
@@ -28,7 +28,11 @@ use eventyr::store::prelude::*;
 use eventyr::subscription::prelude::Projection;
 
 /// One account's money history.
+// `crate = "eventyr"`: this example lives in the `eventyr` package
+// itself, so the derive cannot resolve the target from the manifest —
+// a user's crate would not need the attribute.
 #[derive(Clone, Debug, PartialEq, EventName, serde::Serialize, serde::Deserialize)]
+#[eventyr(crate = "eventyr")]
 enum MoneyEvent {
     Opened { account: u64 },
     Deposited { account: u64, amount: u64 },
@@ -119,7 +123,11 @@ async fn main() {
 
     // -- async: the same `View` driven as a projection ----------------
     // Rebuild-first: fold the global stream, checkpoint, done. Rows are
-    // read back through the projection's own store.
+    // read back through the projection's own store — an in-memory one
+    // here, so the example stays about the two driving modes, not the
+    // second storage backend. (Any `ViewStore` works, including the
+    // SQLite one above; a view moves between inline and async without
+    // a rewrite.)
     let memory = InMemoryViewStore::<Balance>::new();
     let mut async_view = ViewProjection::new("balance", memory, row_of);
     for envelope in futures::TryStreamExt::try_collect::<Vec<_>>(store.stream_all(Sequence::START))

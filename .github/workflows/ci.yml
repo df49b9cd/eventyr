@@ -93,6 +93,31 @@ jobs:
       - name: Feature checks
         run: cargo hack check --workspace --each-feature --no-dev-deps
 
+  # The crates must stay publishable: path-only dev-deps between
+  # workspace members, the packaged README, and the metadata the
+  # crates.io/docs.rs pages need. Publishing stays manual; this only
+  # verifies `cargo package` can build every crate.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Package (dry run)
+        run: cargo package --workspace --no-verify --allow-dirty
+
+  # rust-version = "1.99" is a promise in the README: prove the
+  # workspace checks on exactly that toolchain, so a dependency or
+  # an API added on a newer stable cannot raise it silently.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check (MSRV)
+        run: cargo check --workspace --all-features
+
   # Miri over the core: UB checks on the machines and their proptests.
   # Scoped to what finishes; timed at ~6 minutes locally.
   miri:

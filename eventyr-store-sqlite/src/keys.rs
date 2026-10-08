@@ -1,4 +1,4 @@
-//! A [`KeyStore`] for crypto-shredding (0.7.6), behind the `shred`
+//! A [`KeyStore`] for crypto-shredding (roadmap 0.7.6), behind the `shred`
 //! feature: subject keys in a `subject_keys` table on the store's own
 //! connection — or on a separate database, which is better: a key that
 //! lives beside the ciphertext in one backup is only as erased as that
@@ -40,11 +40,23 @@ impl Clone for SqliteKeyStore {
 
 impl SqliteKeyStore {
     /// A key store on its own database file — the recommended layout.
+    ///
+    /// # Errors
+    ///
+    /// The key database could not be opened (missing directory,
+    /// permissions, a corrupt or non-SQLite file), or its schema
+    /// could not be created on it.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, SqliteStoreError> {
         Self::from_connection(rusqlite::Connection::open(path)?)
     }
 
     /// A key store on an existing connection.
+    ///
+    /// # Errors
+    ///
+    /// The key schema could not be created on the connection's
+    /// database (read-only file, a foreign table of the same name, or
+    /// the database locked by another writer).
     pub fn from_connection(conn: rusqlite::Connection) -> Result<Self, SqliteStoreError> {
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
@@ -53,6 +65,12 @@ impl SqliteKeyStore {
     }
 
     /// A key store beside an event store, on its connection.
+    ///
+    /// # Errors
+    ///
+    /// The key schema could not be created on the shared database
+    /// (read-only file, a foreign table of the same name, or the
+    /// database locked by another writer).
     pub fn beside<E>(store: &crate::SqliteStore<E>) -> Result<Self, SqliteStoreError> {
         let conn = store.conn();
         crate::lock_conn(&conn).execute_batch(SCHEMA)?;

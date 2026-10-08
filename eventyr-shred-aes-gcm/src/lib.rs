@@ -26,6 +26,7 @@
 //! # Ok::<(), eventyr_shred::CipherError>(())
 //! ```
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 use aes_gcm::Aes256Gcm;
 use eventyr_shred::aead::AeadCipher;
 use eventyr_shred::{Cipher, CipherError, SubjectKey};

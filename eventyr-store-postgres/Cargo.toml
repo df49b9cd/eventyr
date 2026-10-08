@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 keywords = ["event-sourcing", "postgres", "sqlx"]
+repository = "https://github.com/df49b9cd/eventyr"
+readme = "README.md"
+homepage = "https://github.com/df49b9cd/eventyr"
+categories = ["database"]
+documentation = "https://docs.rs/eventyr-store-postgres"
 
 [lints]
 workspace = true
@@ -54,7 +59,11 @@ uuid = { workspace = true, optional = true }
 [dev-dependencies]
 eventyr-store-postgres = { path = ".", features = ["snapshots", "views", "checkpoints", "leases"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
-eventyr-projection = { workspace = true, features = ["inline", "testing"] }
-eventyr-subscription = { workspace = true, features = ["testing"] }
+eventyr-projection = { path = "../eventyr-projection", features = ["inline", "testing"] }
+eventyr-subscription = { path = "../eventyr-subscription", features = ["testing"] }
 uuid.workspace = true
-eventyr-store-testing = { workspace = true, features = ["serde"] }
+eventyr-store-testing = { path = "../eventyr-store-testing", features = ["serde"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

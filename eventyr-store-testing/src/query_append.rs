@@ -1,4 +1,4 @@
-//! The [`QueryAppend`] contract checks (0.7.1).
+//! The [`QueryAppend`] contract checks (roadmap 0.7.1).
 //!
 //! A store that serves dynamic consistency boundaries proves it here:
 //! reads select by type and tags in global order, a condition fails on

@@ -1,4 +1,4 @@
-//! Parked events (0.7.7): where a subscription records an event its
+//! Parked events (roadmap 0.7.7): where a subscription records an event its
 //! projection kept rejecting, so it can carry on past it.
 //!
 //! A parked event is skipped, not lost: the record keeps the whole
@@ -157,12 +157,12 @@ impl<E, P: ParkedStore<E> + ?Sized> ParkedStore<E> for &P {
     }
 }
 
-/// A parked store for subscriptions that never park ([`FailurePolicy::Halt`](eventyr_core::subscription::FailurePolicy::Halt)):
+/// A parked store for subscriptions that never park ([`FailurePolicy::Halt`](eventyr_core::subscription_machine::FailurePolicy::Halt)):
 /// a `Park` reaching it is refused, so the event is redelivered rather
 /// than skipped.
 ///
 /// A [`Projector`](crate::runner::Projector) with a
-/// [`FailurePolicy::Park`](eventyr_core::subscription::FailurePolicy::Park)
+/// [`FailurePolicy::Park`](eventyr_core::subscription_machine::FailurePolicy::Park)
 /// policy over `NoParking` refuses to run. Driven directly, every
 /// refusal counts on
 /// [`PARK_FAILURES`](eventyr_store::metrics::names::PARK_FAILURES).
@@ -189,6 +189,12 @@ impl<E: Send> ParkedStore<E> for NoParking {
 
 /// Run the [`ParkedStore`] contract against `make_store`'s fresh stores.
 /// Every implementation runs it, behind this crate's `testing` feature.
+///
+/// # Panics
+///
+/// When the store broke the port's contract: a parked event did not
+/// list back, a replace did not take, a remove left the event, or a
+/// replay or clear misbehaved. The message names the broken check.
 #[cfg(any(test, feature = "testing"))]
 pub fn parked_store_contract<P: ParkedStore<u64>>(make_store: impl Fn() -> P) {
     use eventyr_core::envelope::{EventEnvelope, Metadata};

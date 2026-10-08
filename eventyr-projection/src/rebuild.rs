@@ -25,7 +25,7 @@
 //! correct.
 
 use eventyr_core::error::StoreError;
-use eventyr_core::subscription::{Checkpoint, SubscriptionPolicy};
+use eventyr_core::subscription_machine::{Checkpoint, SubscriptionPolicy};
 use eventyr_core::upcast::RawEvent;
 use eventyr_subscription::checkpoint::CheckpointStore;
 use eventyr_subscription::runner::{Projection, Projector};
@@ -92,7 +92,7 @@ impl<C: CheckpointStore> SchemaCheckpointStore for C {}
 /// [`UpcastingSource`], scopes the checkpoint under `name@version`, and
 /// forces [`stop_at_catch_up`](SubscriptionPolicy::stop_at_catch_up) —
 /// the existing [`Projector`] runs to
-/// [`CaughtUp`](eventyr_core::subscription::SubscriptionOutcome::CaughtUp)
+/// [`CaughtUp`](eventyr_core::subscription_machine::SubscriptionOutcome::CaughtUp)
 /// and returns. Catch-up and live-following are deliberately two
 /// separate runs (the caller then drives the follow-on projector
 /// without the flag): per §6's "no built-in consumer loop", this crate

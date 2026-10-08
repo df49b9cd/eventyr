@@ -1,10 +1,12 @@
 //! A [`CheckpointStore`], behind the `checkpoints` feature: each
 //! subscription's last-acked position in the `checkpoints` table
 //! (migration `0011_checkpoints`), in the database the projection reads
-//! from, so a restart resumes where it left off.
+//! from.
+//!
+//! A restart resumes where it left off.
 
 use eventyr_core::error::StoreError;
-use eventyr_core::subscription::Checkpoint;
+use eventyr_core::subscription_machine::Checkpoint;
 use eventyr_core::vocabulary::Sequence;
 use eventyr_store::store::sql_position;
 use eventyr_subscription::checkpoint::CheckpointStore;

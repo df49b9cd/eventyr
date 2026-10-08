@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use eventyr_core::envelope::{EventEnvelope, Metadata, NewEvent};
 use eventyr_core::error::StoreError;
-use eventyr_core::subscription::{Batch, Checkpoint, SubscriptionOutcome, SubscriptionPolicy};
+use eventyr_core::subscription_machine::{
+    Batch, Checkpoint, SubscriptionOutcome, SubscriptionPolicy,
+};
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 use eventyr_store::memory::InMemoryStore;
 use eventyr_store::store::EventStore;
@@ -935,7 +937,7 @@ async fn a_parking_policy_without_a_parked_store_refuses_to_run() {
 /// counted, so a stalled projection shows up on a dashboard.
 #[tokio::test(start_paused = true)]
 async fn a_refused_park_is_counted() {
-    use eventyr_core::subscription::SubscriptionMachine;
+    use eventyr_core::subscription_machine::SubscriptionMachine;
     use eventyr_store::metrics::names::{PARK_FAILURES, PARKED_EVENTS};
 
     let store = Arc::new(InMemoryStore::new());

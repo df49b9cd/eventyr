@@ -39,7 +39,7 @@ const PARTITION_HEADS: &str = "heads";
 const PARTITION_GLOBAL: &str = "global";
 const PARTITION_META: &str = "meta";
 /// `stream_id` → `[closed: u8, first_kept: u64 BE]`, only for streams
-/// that were closed or truncated (0.7.6). `heads` already keeps a
+/// that were closed or truncated (roadmap 0.7.6). `heads` already keeps a
 /// truncated stream's version.
 const PARTITION_LIFECYCLE: &str = "lifecycle";
 const KEY_NEXT_SEQUENCE: &[u8] = b"next";
@@ -60,8 +60,10 @@ struct StoredRow<E> {
 }
 
 /// An embedded [`EventStore`] and [`StreamsAll`] over fjall — and, for
-/// [`Tagged`] events, [`QueryAppend`] (0.7.1), answered by scanning the
-/// global log. Its [`CommitSignal`] (0.7.2) wakes subscribers on every
+/// [`Tagged`] events, [`QueryAppend`] (roadmap 0.7.1), answered by scanning the
+/// global log.
+///
+/// Its [`CommitSignal`] (roadmap 0.7.2) wakes subscribers on every
 /// commit made through this store or its clones.
 ///
 /// Shareable and cloneable (it wraps a [`fjall::SingleWriterTxDatabase`]):
@@ -84,7 +86,7 @@ pub struct FjallStore<E> {
     global: SingleWriterTxKeyspace,
     meta: SingleWriterTxKeyspace,
     lifecycle: SingleWriterTxKeyspace,
-    /// Raised after every commit (0.7.2); shared by clones.
+    /// Raised after every commit (roadmap 0.7.2); shared by clones.
     signal: LocalCommitSignal,
     _event: std::marker::PhantomData<fn() -> E>,
 }
@@ -125,6 +127,53 @@ impl<E> FjallStore<E> {
     /// append survives a crash or power loss, and the transaction's
     /// atomicity means a crash never leaves half of one; a failed
     /// fsync surfaces as `Other(fjall::Error::...)`.
+    ///
+    /// # Examples
+    ///
+    /// Open on a directory, append, read back — the futures resolve
+    /// immediately, so a plain `block_on` drives the round trip with
+    /// no runtime:
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use eventyr_core::envelope::NewEvent;
+    /// use eventyr_core::event_name::EventName;
+    /// use eventyr_core::vocabulary::{ExpectedVersion, StreamId, Version};
+    /// use eventyr_store::store::EventStore;
+    /// use eventyr_store_fjall::FjallStore;
+    /// use futures::executor::block_on;
+    /// use futures::TryStreamExt;
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// // Any serde enum; the stored row holds its JSON.
+    /// #[derive(Clone, Serialize, Deserialize)]
+    /// enum LedgerEvent { Credited { amount: u64 } }
+    /// impl EventName for LedgerEvent {
+    ///     fn event_name(&self) -> &'static str { "Credited" }
+    /// }
+    ///
+    /// let dir = tempfile::tempdir()?;
+    /// let store = FjallStore::<LedgerEvent>::open(&dir)?;
+    /// let committed = block_on(store.append(
+    ///     &StreamId::from("ledger-1"),
+    ///     ExpectedVersion::Empty,
+    ///     vec![NewEvent::new(LedgerEvent::Credited { amount: 50 })],
+    /// ))?;
+    /// assert_eq!(committed[0].version, Version::new(1));
+    ///
+    /// // Read it back: the same event, from the range scan.
+    /// let read = block_on(store.stream(&StreamId::from("ledger-1"), Version::EMPTY)
+    ///     .try_collect::<Vec<_>>())?;
+    /// assert_eq!(read.len(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The database could not be created or opened at `path` (missing
+    /// directory, permissions, a non-fjall directory), a keyspace could
+    /// not be created in it, or a corrupted database failed to open.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, FjallStoreError> {
         let keyspace = SingleWriterTxDatabase::builder(path).open()?;
         Self::from_keyspace(keyspace)
@@ -136,6 +185,12 @@ impl<E> FjallStore<E> {
     /// transactions fsync the journal on every commit
     /// ([`PersistMode::SyncAll`]), even on a database opened with
     /// `manual_journal_persist`.
+    ///
+    /// # Errors
+    ///
+    /// One of the five keyspaces could not be created on the database
+    /// — an I/O failure, or a keyspace of the same name existing with
+    /// an incompatible configuration.
     pub fn from_keyspace(keyspace: SingleWriterTxDatabase) -> Result<Self, FjallStoreError> {
         Ok(Self {
             streams: keyspace.keyspace(PARTITION_STREAMS, KeyspaceCreateOptions::default)?,

@@ -34,14 +34,18 @@ impl fmt::Display for Applicant {
 }
 
 /// The account's money history, plus the loan outcome.
+// `crate = "eventyr"`: this example lives in the `eventyr` package
+// itself, so the derive cannot resolve the target from the manifest —
+// a user's crate would not need the attribute.
 #[derive(Clone, Debug, PartialEq, EventName, serde::Serialize, serde::Deserialize)]
+#[eventyr(crate = "eventyr")]
 enum MoneyEvent {
     Deposited { account: u64, amount: u64 },
     Withdrawn { account: u64, amount: u64 },
     Approved { account: u64, amount: u64 },
 }
 
-/// Tags are a pure function of the payload (0.7.1): a query is correct
+/// Tags are a pure function of the payload (roadmap 0.7.1): a query is correct
 /// on any history, including events written before the tag existed.
 impl Tagged for MoneyEvent {
     fn tags(&self) -> Vec<Tag> {

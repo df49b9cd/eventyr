@@ -22,12 +22,71 @@
 //! payloads stay selectable by an upcaster.
 //!
 //! The migrations are compiled into the crate and run by
-//! [`store::migrate`]. Features add the optional parts: `snapshots`
-//! (the `SnapshotStore`), `views` (the `ViewStore` and inline views,
-//! 0.7.3), `checkpoints` (a durable `CheckpointStore` for subscriptions)
-//! and `time` (envelope timestamps). Every migration runs whatever the
-//! features, so turning one on later needs no schema change.
+//! [`store::migrate`]. Every migration runs whatever the features, so
+//! turning one on later needs no schema change.
+//!
+//! ## Cargo features
+//!
+//! - `time` — populates `Metadata::timestamp` from `created_at`; turns
+//!   on core's `time` field and sqlx's `OffsetDateTime` decode.
+//! - `snapshots` — the `SnapshotStore` implementation over the
+//!   `snapshots` migration; off by default: stores that only want the
+//!   event log pay nothing.
+//! - `views` — the `ViewStore` port and inline views (roadmap 0.7.3), over the
+//!   `views` table.
+//! - `checkpoints` — a durable `CheckpointStore` for subscriptions,
+//!   over the `checkpoints` table (migration 0011).
+//! - `leases` — projector leases: one driver per checkpoint name
+//!   (roadmap 0.7.9), over the `projector_leases` table (migration 0012).
+//!
+//! ## Database setup
+//!
+//! **Give Eventyr its own schema.** The migrations record themselves in
+//! sqlx's default `_sqlx_migrations` table. If the application runs its
+//! own sqlx migrations in the same schema, whichever of the two migrates
+//! second rejects the other's rows (`VersionMissing`). Point each at
+//! its own schema — `PgStore::connect("postgres://…?options=-c%20search_path%3Deventyr")`
+//! or a `search_path` set on the role — and the tables never meet.
+//!
+//! **Postgres 11 or newer** (identity columns, `starts_with`). CI tests
+//! 17; nothing newer than 11 is required.
+//!
+//! **Privileges.** `CREATE` on the target schema for the first run (the
+//! migrations create tables and a PL/pgSQL function); `SELECT`/`INSERT`/
+//! `UPDATE`/`DELETE` on the tables thereafter. Appends take
+//! *transaction-scoped advisory locks* and commits raise `NOTIFY`, which
+//! need no extra grants.
+//!
+//! **One writable primary per store.** Eventyr's `global_sequence` is
+//! gap-free and in commit order because every append holds one
+//! database-wide advisory lock from drawing its sequence number until
+//! commit. That contract assumes a single-writer database: a primary
+//! with physical replicas (Patroni, CloudNativePG, RDS Multi-AZ) is
+//! supported; multi-writer or sharded Postgres, and databases whose
+//! advisory locks or sequences are not primary-scoped, are not. Use
+//! synchronous replication (`synchronous_commit = on` with a synchronous
+//! standby) when a failover must lose no acknowledged commit — an
+//! asynchronous failover can reuse sequence numbers for *different*
+//! events, which silently breaks consumers holding positions from
+//! before the rewind. Checkpoints, views, parked events, and leases kept
+//! in the event store's database rewind together with the log and stay
+//! correct; anything outside it (other-database read models, broker
+//! messages, client-held positions) needs its own rewind detection.
+//! `LISTEN`/`NOTIFY` do not work on a standby: [`notify::PgCommitSignal`]
+//! must reach the primary, and projectors reading from a replica poll.
+//! The full contract is DESIGN.md §16.2.
+//!
+//! **Schema-relative object names.** Every query is schema-unqualified
+//! (`events`, `append_events`, …), so the store works inside whatever
+//! schema the connection's `search_path` resolves to — one database can
+//! host several isolated stores by pointing each at its own schema.
+//! (Caveat: the commit-order advisory lock and the `eventyr_commits`
+//! NOTIFY channel are database-wide, so stores in one database still
+//! serialize appends against each other and wake each other's listeners;
+//! 0.8.2 scopes both per store. A commit in another schema costs one
+//! empty poll, never a correctness problem.)
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #[cfg(feature = "checkpoints")]
 pub mod checkpoints;
 #[cfg(feature = "leases")]

@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 keywords = ["event-sourcing", "cqrs", "event-store", "sans-io", "no-std"]
+repository = "https://github.com/df49b9cd/eventyr"
+readme = "README.md"
+homepage = "https://github.com/df49b9cd/eventyr"
+categories = ["database"]
+documentation = "https://docs.rs/eventyr-core"
 
 [lints]
 workspace = true
@@ -30,3 +35,7 @@ time = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

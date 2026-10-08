@@ -8,12 +8,22 @@
 //! ([`repository::AggregateRepository::load`],
 //! [`load_at`](repository::AggregateRepository::load_at), and with the
 //! `time` feature [`load_until`](repository::AggregateRepository::load_until))
-//! (0.7.8).
+//! (roadmap 0.7.8).
 //!
 //! The traits are runtime-agnostic: `append` returns a future, the
 //! streams are async streams, and nothing here names tokio. The
-//! in-memory store is synchronous under a lock; the Postgres store
-//! (0.2) will do its work in the future and stream.
+//! in-memory store is synchronous under a lock; the durable stores
+//! (`eventyr-store-postgres`, `-sqlite`, `-fjall`) do their I/O as
+//! the returned futures and streams are polled.
+//!
+//! ## Cargo features
+//!
+//! - `tracing` — the reference backend for the `Metrics` port: a
+//!   `tracing` event per instrument call; the port itself lives in
+//!   `eventyr-core`, the feature only enables the dep.
+//! - `time` — `AggregateRepository::load_until` (roadmap 0.7.8): fold a
+//!   stream to an instant; mirrors `Metadata::timestamp`, which is
+//!   `eventyr-core`'s `time`.
 //!
 //! ## A taste
 //!
@@ -107,6 +117,7 @@
 //! # }
 //! ```
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 pub mod driver;
 pub mod memory;
 pub mod metrics;

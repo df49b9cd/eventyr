@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
-use eventyr_core::subscription::{
+use eventyr_core::subscription_machine::{
     FailurePolicy, SleepReason, SubscriptionAction, SubscriptionInput, SubscriptionMachine,
     SubscriptionOutcome, SubscriptionPolicy,
 };
@@ -151,7 +151,9 @@ where
 }
 
 /// The driver's `caught_up` hook: called once per idle sleep, the pulse
-/// that says the projection has caught up to its source's head. A test
+/// that says the projection has caught up to its source's head.
+///
+/// A test
 /// that wants to assert on a live read model waits on it instead of on a
 /// timer (Emmett's `whenCaughtUp()`).
 ///
@@ -225,7 +227,7 @@ impl Default for DriverPorts<'static> {
 
 impl<'m, W, K> DriverPorts<'m, W, K> {
     /// End an *idle* sleep early when `listener` reports a commit
-    /// (0.7.2): a caught-up projector polls at once instead of after
+    /// (roadmap 0.7.2): a caught-up projector polls at once instead of after
     /// `idle_sleep`.
     ///
     /// Arm `listener` (via
@@ -245,7 +247,7 @@ impl<'m, W, K> DriverPorts<'m, W, K> {
         }
     }
 
-    /// Record the events the machine parks (0.7.7) in `parked`. Only a
+    /// Record the events the machine parks (roadmap 0.7.7) in `parked`. Only a
     /// machine whose policy is
     /// [`FailurePolicy::Park`]
     /// ever parks.
@@ -259,7 +261,7 @@ impl<'m, W, K> DriverPorts<'m, W, K> {
     }
 
     /// Report each fetch, apply, park, and ack through `metrics`
-    /// (0.5.3): projection progress, latency, and failures become
+    /// (roadmap 0.5.3): projection progress, latency, and failures become
     /// observable.
     pub fn with_metrics<'n>(self, metrics: &'n dyn Metrics) -> DriverPorts<'n, W, K>
     where
@@ -403,7 +405,7 @@ async fn fetch_batch<E, S>(
     machine: &mut SubscriptionMachine<E>,
     source: &S,
     metrics: &dyn Metrics,
-    from: eventyr_core::subscription::Checkpoint,
+    from: eventyr_core::subscription_machine::Checkpoint,
     limit: usize,
 ) -> SubscriptionAction<E>
 where
@@ -506,7 +508,7 @@ async fn ack_batch<E, C>(
     metrics: &dyn Metrics,
     batch_started: &mut Option<std::time::Instant>,
     name: &str,
-    checkpoint: eventyr_core::subscription::Checkpoint,
+    checkpoint: eventyr_core::subscription_machine::Checkpoint,
 ) -> (SubscriptionAction<E>, bool)
 where
     C: CheckpointStore,
@@ -557,7 +559,7 @@ where
     machine.handle(SubscriptionInput::Slept)
 }
 
-/// How a leased projector run ended before the machine finished (0.7.9).
+/// How a leased projector run ended before the machine finished (roadmap 0.7.9).
 ///
 /// The lease is driver policy — the `SubscriptionMachine`'s protocol has
 /// no transition for it — so "lost" surfaces as this error, never as a
@@ -574,7 +576,7 @@ pub enum RunError {
         /// The projected name the lease covered.
         name: String,
         /// The last checkpoint acked before the lease went.
-        checkpoint: eventyr_core::subscription::Checkpoint,
+        checkpoint: eventyr_core::subscription_machine::Checkpoint,
     },
     /// `acquire` on entry found the name already held: the caller backs
     /// off and retries rather than racing the holder's checkpoint.
@@ -604,17 +606,27 @@ impl From<StoreError> for RunError {
     }
 }
 
-/// [`drive_projector`] under a [`ProjectorLease`] (0.7.9): hold the
+/// [`drive_projector`] under a [`ProjectorLease`] (roadmap 0.7.9): hold the
 /// named lease from before the run's first checkpoint write until it
-/// ends — renewed when due before every `Fetch` and before every `Ack`
-/// (the renewal is the fence on the checkpoint write) — and stop on a
-/// loss with the last acked position, never writing again.
+/// ends, and stop on a loss with the last acked position, never
+/// writing again.
+///
+/// The lease is renewed when due before every `Fetch` and before every
+/// `Ack` (the renewal is the fence on the checkpoint write).
 ///
 /// The `SubscriptionMachine`'s protocol is untouched: nothing here is
 /// a transition it can make (§7); the driver simply refuses to keep
 /// driving once the name is no longer exclusive. A `LeaseLost` is the
 /// signal to hand the name to a retrying supervisor, not a machine
 /// state.
+///
+/// # Errors
+///
+/// [`RunError::Taken`] when the name is already held elsewhere,
+/// [`RunError::LeaseLost`] when the lease expired or was taken over
+/// mid-run — with the last acked checkpoint as the resume point — and
+/// [`RunError::Store`] when the checkpoint or lease store failed
+/// (acquire, load, renew, or a checkpoint write the run stopped on).
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_projector_leased<E, S, C, P, F, Fut, W, K, Le>(
     machine: &mut SubscriptionMachine<E>,
@@ -654,7 +666,7 @@ where
             ports.metrics.counter(LEASE_LOST, 1);
             return Err(RunError::LeaseLost {
                 name: name.to_owned(),
-                checkpoint: eventyr_core::subscription::Checkpoint::ORIGIN,
+                checkpoint: eventyr_core::subscription_machine::Checkpoint::ORIGIN,
             });
         }
         Err(LeaseError::Store { error, .. }) => return Err(RunError::Store(error)),
@@ -817,7 +829,7 @@ async fn lease_lost<Le: ProjectorLease>(
     leases: &Le,
     lease: Le::Lease,
     name: &str,
-    last_acked: eventyr_core::subscription::Checkpoint,
+    last_acked: eventyr_core::subscription_machine::Checkpoint,
 ) -> RunError {
     let _ = leases.release(lease).await;
     RunError::LeaseLost {
@@ -946,7 +958,7 @@ impl<S, C, P, W, K> Projector<S, C, P, W, K> {
         self
     }
 
-    /// Report each fetch, apply, park, and ack through `metrics` (0.5.3)
+    /// Report each fetch, apply, park, and ack through `metrics` (roadmap 0.5.3)
     /// — among them [`PARKED_EVENTS`], the one to alert on. Without it
     /// the projector reports to [`NoopMetrics`].
     pub fn with_metrics(mut self, metrics: impl Metrics + 'static) -> Self {
@@ -954,7 +966,7 @@ impl<S, C, P, W, K> Projector<S, C, P, W, K> {
         self
     }
 
-    /// Wake on commits (0.7.2): when caught up, poll as soon as
+    /// Wake on commits (roadmap 0.7.2): when caught up, poll as soon as
     /// `signal` reports a commit instead of after the idle sleep. The
     /// idle sleep stays the fallback, so a lost wake-up costs latency,
     /// never an event.
@@ -985,7 +997,7 @@ impl<S, C, P, W, K> Projector<S, C, P, W, K> {
         }
     }
 
-    /// Park events the projection keeps rejecting (0.7.7): set
+    /// Park events the projection keeps rejecting (roadmap 0.7.7): set
     /// `policy` and record parked events in `store`. With
     /// [`FailurePolicy::Park`]
     /// a poison event no longer stalls the projector; it is recorded,
@@ -1071,6 +1083,11 @@ pub struct ProjectorWithCatch<'m, S, C, P, W, K> {
 
 impl<S, C, P, K> ProjectorWithCatch<'_, S, C, P, NoSignal, K> {
     /// [`Projector::run`] with the pulse.
+    ///
+    /// # Errors
+    ///
+    /// As [`Projector::run`]: loading the checkpoint failed, or the
+    /// policy parks but the projector has no parked store.
     pub async fn run<F, Fut>(self, sleep: F) -> Result<SubscriptionOutcome, StoreError>
     where
         S: SubscriptionSource<Event = P::Event>,
@@ -1090,6 +1107,12 @@ impl<S, C, P, K> ProjectorWithCatch<'_, S, C, P, NoSignal, K> {
 
 impl<S, C, P, W: CommitSignal, K> ProjectorWithCatch<'_, S, C, P, W, K> {
     /// [`Projector::run_woken`] with the pulse.
+    ///
+    /// # Errors
+    ///
+    /// As [`Projector::run_woken`]: arming the listener failed, the
+    /// checkpoint load failed, or the policy parks but the projector
+    /// has no parked store.
     pub async fn run_woken<F, Fut>(self, sleep: F) -> Result<SubscriptionOutcome, StoreError>
     where
         S: SubscriptionSource<Event = P::Event>,
@@ -1110,7 +1133,7 @@ impl<S, C, P, W: CommitSignal, K> ProjectorWithCatch<'_, S, C, P, W, K> {
 
 impl<S, C, P, K> Projector<S, C, P, NoSignal, K> {
     /// Run under the lease `leases` with the default [`LeasePolicy`]
-    /// (0.7.9): only one driver of this `name` runs at a time; the
+    /// (roadmap 0.7.9): only one driver of this `name` runs at a time; the
     /// others get [`RunError::Taken`] until it releases or expires.
     pub fn lease_with<Le: ProjectorLease>(
         self,
@@ -1141,7 +1164,7 @@ impl<S, C, P, W: CommitSignal, K> Projector<S, C, P, W, K> {
     }
 }
 
-/// A [`Projector`] bound to a lease (0.7.9): its drivers stop on
+/// A [`Projector`] bound to a lease (roadmap 0.7.9): its drivers stop on
 /// losing it instead of racing another holder's checkpoint.
 pub struct LeasedProjector<S, C, P, W, K, Le> {
     projector: Projector<S, C, P, W, K>,
@@ -1171,6 +1194,15 @@ impl<S, C, P, W, K, Le> LeasedProjector<S, C, P, W, K, Le> {
     }
 
     /// Drive the subscription under the lease.
+    ///
+    /// One run holds the lease for its whole life — a single
+    /// acquisition, no re-acquire — and the lease's `max_grace` caps
+    /// even a healthy run at `ttl × max_grace` from acquire
+    /// (`LeasePolicy`'s defaults give about a minute). A long-lived
+    /// projector therefore loops: match `LeaseLost` (a routine
+    /// handover, with the last acked checkpoint as the resume point)
+    /// and `Taken` (another holder), sleep out the lease, and run
+    /// again; the distributed example shows the shape.
     ///
     /// # Errors
     ///
@@ -1245,7 +1277,15 @@ impl<S, C, P, W, K, Le> LeasedProjector<S, C, P, W, K, Le> {
 }
 
 impl<S, C, P, W: CommitSignal, K, Le> LeasedProjector<S, C, P, W, K, Le> {
-    /// [`run_woken`](Projector::run_woken) under the lease.
+    /// [`run_woken`](Projector::run_woken) under the lease. The
+    /// single-acquisition life and the `LeaseLost` handover are as
+    /// [`LeasedProjector::run_leased`] documents them.
+    ///
+    /// # Errors
+    ///
+    /// As [`LeasedProjector::run_leased`], or arming the listener
+    /// failed: [`RunError::Taken`], [`RunError::LeaseLost`], or
+    /// [`RunError::Store`].
     pub async fn run_woken_leased<F, Fut>(self, sleep: F) -> Result<SubscriptionOutcome, RunError>
     where
         S: SubscriptionSource<Event = P::Event>,

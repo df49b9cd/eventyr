@@ -8,7 +8,7 @@
 //! at its own older sequence and updates nothing, so replays can never
 //! regress a row. `load` reads the one row.
 //!
-//! Behind the `views` feature, with inline views (0.7.3): a
+//! Behind the `views` feature, with inline views (roadmap 0.7.3): a
 //! [`PgStore`] built
 //! [`with_inline_views`](crate::PgStore::with_inline_views) folds every
 //! append's events into the same rows inside the append's transaction.

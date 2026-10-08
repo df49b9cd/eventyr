@@ -62,6 +62,7 @@ rusqlite = { version = "0.34" }
 fjall = { version = "3" }
 sqlx = { version = "0.9", default-features = false }
 syn = { version = "3" }
+proc-macro-crate = "3"
 quote = { version = "1" }
 proc-macro2 = { version = "1" }
 

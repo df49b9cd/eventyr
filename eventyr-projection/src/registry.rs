@@ -1,7 +1,9 @@
 //! The upcaster registry: a validated, lookup-ready set of rungs keyed
-//! by `(event_type, from_version)` — the 0.5.1 read-side, store-side per
-//! §3's placement rule (read-side glue does not belong in the pure
-//! core). The vocabulary it walks ([`EventSchemaVersion`]) stays in
+//! by `(event_type, from_version)` — the 0.5.1 read-side, store-side
+//! per §3's placement rule.
+//!
+//! Read-side glue does not belong in the pure core; the vocabulary it
+//! walks ([`EventSchemaVersion`]) stays in
 //! `eventyr-core::version_registry` because [`RawEvent`] carries it.
 //!
 //! A **registry** is the set of upcasters a store or projection knows.
@@ -30,6 +32,12 @@ use eventyr_core::version_registry::EventSchemaVersion;
 pub trait VersionUpcaster: Send + Sync {
     /// Lift `payload` (stored at this rung's `from` version) to the next
     /// version's bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`UpcastError`] naming the event type when the payload is not
+    /// the shape this rung starts from — a loud miss, never a silent
+    /// drop.
     fn upcast(&self, payload: Vec<u8>) -> Result<Vec<u8>, UpcastError>;
 }
 
@@ -251,6 +259,12 @@ impl UpcasterRegistry {
     /// ([`UnknownType`](RegistryError::UnknownType)) — a stored fact the
     /// code has never heard of is not conflated with one at the current
     /// version.
+    ///
+    /// # Errors
+    ///
+    /// [`UpcastError`] when a rung on the ladder rejected the payload,
+    /// or the stored version is above every registered rung (the code
+    /// is older than the log), or the type has no ladder at all.
     pub fn upcast(&self, raw: RawEvent) -> Result<RawEvent, UpcastError> {
         // A type with an empty ladder cannot arise through `with`, but
         // it reads the same as no ladder at all.

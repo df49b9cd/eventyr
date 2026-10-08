@@ -153,7 +153,7 @@ fn sqlite_checkpoint_store_passes_the_checkpoint_store_contract() {
 /// is reopened: the point of a durable checkpoint store.
 #[test]
 fn a_checkpoint_survives_reopening_the_database() {
-    use eventyr_core::subscription::Checkpoint;
+    use eventyr_core::subscription_machine::Checkpoint;
     use eventyr_core::vocabulary::Sequence;
     use eventyr_store_sqlite::SqliteCheckpointStore;
     use eventyr_subscription::checkpoint::CheckpointStore;

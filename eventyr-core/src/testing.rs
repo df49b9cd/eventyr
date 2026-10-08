@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use crate::aggregate::Aggregate;
 use crate::batch::{BatchAction, BatchInput, BatchMachine, Decide};
 use crate::boundary::{BoundaryAction, BoundaryInput, BoundaryMachine, Decision};
-use crate::subscription::{SubscriptionAction, SubscriptionInput, SubscriptionMachine};
+use crate::subscription_machine::{SubscriptionAction, SubscriptionInput, SubscriptionMachine};
 use crate::write::{WriteAction, WriteInput, WriteMachine};
 
 mod sealed {
@@ -236,6 +236,13 @@ pub struct Outcome<A: Aggregate> {
 
 impl<A: Aggregate> Outcome<A> {
     /// Expect success with exactly these events, in order.
+    ///
+    /// # Panics
+    ///
+    /// When the outcome mismatched: the decision was a rejection while
+    /// events were expected, or the committed events differ from
+    /// `expected`. The message names the scenario, the expected events,
+    /// and what was actually decided.
     pub fn then_events(self, expected: &[A::Event]) -> Self
     where
         A::Event: PartialEq + core::fmt::Debug,
@@ -269,6 +276,13 @@ impl<A: Aggregate> Outcome<A> {
     /// `A::Error: PartialEq` first appears here — aggregates whose error
     /// type lacks `PartialEq` can still assert rejections with
     /// [`then_error_matching`](Outcome::then_error_matching).
+    ///
+    /// # Panics
+    ///
+    /// When the outcome mismatched: the decision was a success while a
+    /// rejection was expected, or the rejection differs from `expected`.
+    /// The message names the scenario, the expected rejection, and what
+    /// was actually decided.
     pub fn then_error(self, expected: &A::Error) -> Self
     where
         A::Event: core::fmt::Debug,
@@ -290,6 +304,12 @@ impl<A: Aggregate> Outcome<A> {
 
     /// Expect a domain rejection matching `pred` — for aggregates whose
     /// error type carries no `PartialEq`.
+    ///
+    /// # Panics
+    ///
+    /// When the outcome mismatched: the decision was a success while a
+    /// rejection was expected, or the rejection did not satisfy `pred`.
+    /// The message names the scenario and the rejection that failed it.
     pub fn then_error_matching(self, pred: impl FnOnce(&A::Error) -> bool) -> Self
     where
         A::Event: core::fmt::Debug,
@@ -309,6 +329,12 @@ impl<A: Aggregate> Outcome<A> {
     }
 
     /// Expect the exact `Result`, when the shape itself is the point.
+    ///
+    /// # Panics
+    ///
+    /// When the decided `Result` differs from `expected` — wrong events,
+    /// or a rejection where events were expected (or the reverse). The
+    /// message names the scenario, the expected result, and the actual.
     pub fn then_result(self, expected: &Result<Vec<A::Event>, A::Error>) -> Self
     where
         A::Event: PartialEq + core::fmt::Debug,

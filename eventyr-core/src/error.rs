@@ -29,13 +29,13 @@ pub enum StoreError {
         /// The highest matching position the store saw.
         sequence: crate::vocabulary::Sequence,
     },
-    /// The stream is closed (0.7.6): it accepts no more appends. Its
+    /// The stream is closed (roadmap 0.7.6): it accepts no more appends. Its
     /// history stays readable unless it was also truncated.
     StreamClosed {
         /// The closed stream.
         stream_id: StreamId,
     },
-    /// The read asked for events the store no longer has (0.7.6): the
+    /// The read asked for events the store no longer has (roadmap 0.7.6): the
     /// stream was truncated, and its first remaining event is at
     /// `first`. Never folded around — state rebuilt from a partial
     /// history would be wrong without saying so. A reader that starts

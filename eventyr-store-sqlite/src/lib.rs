@@ -20,7 +20,20 @@
 //! connection behind a mutex — SQLite serializes writers exactly as
 //! fjall's single-writer database does, and `append_batch`'s one
 //! transaction across streams is atomic for the same reason.
+//!
+//! ## Cargo features
+//!
+//! - `snapshots` — the `SnapshotStore` implementation over a second
+//!   table; off by default: stores that only want the event log pay
+//!   nothing.
+//! - `views` — the `views` table: the `ViewStore` port and inline
+//!   views (roadmap 0.7.3).
+//! - `shred` — a crypto-shredding `KeyStore` (roadmap 0.7.6).
+//! - `parked` — a `ParkedStore` for subscriptions' poison events
+//!   (roadmap 0.7.7).
+//! - `checkpoints` — a durable `CheckpointStore` for subscriptions.
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #[cfg(feature = "checkpoints")]
 mod checkpoints;
 #[cfg(feature = "shred")]

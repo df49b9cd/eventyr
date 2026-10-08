@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 keywords = ["event-sourcing", "gdpr", "crypto-shredding", "encryption"]
+repository = "https://github.com/df49b9cd/eventyr"
+readme = "README.md"
+homepage = "https://github.com/df49b9cd/eventyr"
+categories = ["database"]
+documentation = "https://docs.rs/eventyr-shred"
 
 [lints]
 workspace = true
@@ -38,10 +43,14 @@ aead = { version = "0.6", default-features = false, features = ["alloc", "getran
 zeroize = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
 
 [dev-dependencies]
-eventyr-store-testing = { workspace = true }
+eventyr-store-testing = { path = "../eventyr-store-testing" }
 # The contracts live behind `testing`; the in-crate suite runs them
 # (self-feature so dev-deps see them).
 eventyr-shred = { path = ".", features = ["testing"] }
 # The parked contract lives behind `testing`; in-crate examples and
 # tests call it like a parked-store implementation's suite would.
-eventyr-subscription = { workspace = true, features = ["testing"] }
+eventyr-subscription = { path = "../eventyr-subscription", features = ["testing"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

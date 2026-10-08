@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 keywords = ["event-sourcing", "cqrs", "proc-macro"]
+repository = "https://github.com/df49b9cd/eventyr"
+readme = "README.md"
+homepage = "https://github.com/df49b9cd/eventyr"
+categories = ["database"]
+documentation = "https://docs.rs/eventyr-macros"
 
 [lints]
 workspace = true
@@ -17,12 +22,20 @@ proc-macro = true
 proc-macro2.workspace = true
 quote.workspace = true
 syn.workspace = true
+# Resolves the core crate the generated code targets: `eventyr_core`
+# when the user depends on it directly, `eventyr` for umbrella users —
+# so the `crate = "..."` attribute is only needed for renames.
+proc-macro-crate.workspace = true
 
 [dev-dependencies]
-eventyr-core = { workspace = true }
+eventyr-core = { path = "../eventyr-core" }
 eventyr = { path = "../eventyr" }
 trybuild.workspace = true
 # `std`: the pass test's internally tagged enum needs serde's buffering,
 # and trybuild builds it in a target of its own — no unification.
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

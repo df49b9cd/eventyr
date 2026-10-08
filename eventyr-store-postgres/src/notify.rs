@@ -1,4 +1,4 @@
-//! The Postgres commit signal (0.7.2): `LISTEN eventyr_commits`.
+//! The Postgres commit signal (roadmap 0.7.2): `LISTEN eventyr_commits`.
 //!
 //! Every append raises `NOTIFY eventyr_commits` inside its transaction
 //! (migration 0007); Postgres delivers it when the transaction commits.

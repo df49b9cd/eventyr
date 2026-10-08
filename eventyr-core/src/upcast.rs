@@ -37,11 +37,17 @@ impl RawEvent {
 
 /// Transforms one historical event shape into the current one.
 ///
-/// The chain (0.2, with the Postgres store) selects upcasters by event
+/// The chain (roadmap 0.2) selects upcasters by event
 /// type; a selected upcaster that cannot parse its payload is an
 /// [`Err`](UpcastError) — never a silent drop.
 pub trait Upcaster<E>: Send + Sync {
     /// Transform `raw` into the current event shape.
+    ///
+    /// # Errors
+    ///
+    /// [`UpcastError`] naming the event type when the stored payload is
+    /// not the shape this upcaster knows — a loud miss, never a silent
+    /// drop.
     fn upcast(&self, raw: RawEvent) -> Result<E, UpcastError>;
 }
 

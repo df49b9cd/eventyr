@@ -154,7 +154,6 @@ fn decide(
 
 #[derive(Aggregate)]
 #[eventyr(
-    crate = "eventyr",
     id = AccountId,
     state = AccountState,
     error = AccountError,

@@ -1,5 +1,5 @@
 -- The read-model rows: one per (view, view_id), newest-wins on the
--- folded sequence (DESIGN §13's 0.6.3; the same contract 0002's
+-- folded sequence (DESIGN §13, roadmap 0.6.3; the same contract 0002's
 -- snapshots carry). One table serves every view type; the name scopes
 -- it, exactly as the projection's checkpoint key does.
 

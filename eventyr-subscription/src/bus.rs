@@ -15,7 +15,7 @@ use core::future::Future;
 
 use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
-use eventyr_core::subscription::Checkpoint;
+use eventyr_core::subscription_machine::Checkpoint;
 
 /// Live push of committed envelopes: "new events are arriving" as a
 /// subscription, so a projector can skip the idle poll when the store
@@ -53,7 +53,9 @@ pub trait Subscription: Send + Sync {
     fn poll(
         &mut self,
         checkpoint: Checkpoint,
-    ) -> impl Future<Output = Result<eventyr_core::subscription::Batch<Self::Event>, StoreError>> + Send;
+    ) -> impl Future<
+        Output = Result<eventyr_core::subscription_machine::Batch<Self::Event>, StoreError>,
+    > + Send;
 
     /// Persist that every event through `checkpoint` applied.
     fn ack(

@@ -8,7 +8,9 @@ use futures::TryStreamExt;
 use futures::executor::block_on;
 
 /// The event payloads the suite needs from `E`: a payload per `u64`,
-/// plus the equality and debuggability the assertions need. The
+/// plus the equality and debuggability the assertions need.
+///
+/// The
 /// reflexive `From<u64> for u64` makes plain `u64` the natural choice
 /// for generic stores.
 pub trait ContractEvent: Clone + Send + PartialEq + core::fmt::Debug + From<u64> {}
@@ -42,6 +44,29 @@ async fn stream_of<E: ContractEvent, S: EventStore<Event = E>>(
 /// Each check gets a fresh store (`make_store()`), so stores with
 /// setup cost (a test-database schema per case) can charge it per
 /// check.
+///
+/// # Panics
+///
+/// When the store broke the port's contract: an append did not come
+/// back versioned and sequenced, an expectation violation did not
+/// surface as a conflict carrying the current version, a conflicted
+/// append left events behind, or a read did not honor its exclusive
+/// bound. Each check names the broken rule.
+///
+/// # Examples
+///
+/// One `#[test]`, handing the suite a fresh, empty store — here the
+/// in-memory one, so the example needs no database:
+///
+/// ```
+/// # fn main() {
+/// use eventyr_store::prelude::InMemoryStore;
+///
+/// // `u64` is the reflexive `ContractEvent`: a payload per value.
+/// eventyr_store_testing::event_store_contract::<u64, _>(InMemoryStore::<u64>::new);
+/// eventyr_store_testing::streams_all_contract::<u64, _>(InMemoryStore::<u64>::new);
+/// # }
+/// ```
 pub fn event_store_contract<E, S>(make_store: impl Fn() -> S)
 where
     E: ContractEvent,
@@ -228,7 +253,7 @@ fn metadata_round_trips<E: ContractEvent, S: EventStore<Event = E>>(store: &S) {
     assert_eq!(
         events[0].metadata.idempotency_key.as_deref(),
         Some("key-1"),
-        "the idempotency key round-trips (0.7.5)"
+        "the idempotency key round-trips (roadmap 0.7.5)"
     );
     assert_eq!(events[1].metadata.idempotency_key, None);
 }

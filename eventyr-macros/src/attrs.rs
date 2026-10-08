@@ -84,8 +84,35 @@ pub(crate) fn path_list(meta: &ParseNestedMeta<'_>) -> Result<Vec<Path>, Error> 
 }
 
 /// The crate the generated code targets by default.
+///
+/// Resolved from the caller's manifest, the serde `crate = "..."`
+/// convention: the umbrella when the user depends on `eventyr` (the
+/// common case — its prelude carries the derives), `eventyr_core` when
+/// they depend on core directly, and the found name either way, so a
+/// renamed dependency works without the attribute. Only when the
+/// manifest can't be read (e.g. rustdoc walking a remote source) does
+/// this fall back to plain `eventyr_core` — and an explicit
+/// `#[eventyr(crate = "...")]` always wins.
 pub(crate) fn default_core_crate() -> Path {
-    syn::parse_quote!(::eventyr_core)
+    use proc_macro_crate::FoundCrate;
+
+    let found = proc_macro_crate::crate_name("eventyr")
+        .or_else(|_| proc_macro_crate::crate_name("eventyr-core"));
+    match found {
+        // The invoking crate *is* the target — the umbrella's or
+        // core's own tests, examples, and doctests. Bare `crate` paths
+        // resolve to the invoking crate root, where the glob
+        // re-exports carry `aggregate`/`event_name`/`__private`.
+        Ok(FoundCrate::Itself) => syn::parse_quote!(crate),
+        // The name the caller's manifest gives the dependency, so a
+        // renamed `eventyr_core = { package = "..." }` needs no
+        // attribute either.
+        Ok(FoundCrate::Name(name)) => {
+            let ident = proc_macro2::Ident::new(&name, proc_macro2::Span::call_site());
+            syn::parse_quote!(::#ident)
+        }
+        Err(_) => syn::parse_quote!(::eventyr_core),
+    }
 }
 
 /// Makes `path` absolute (`::name`) so a local module cannot shadow the

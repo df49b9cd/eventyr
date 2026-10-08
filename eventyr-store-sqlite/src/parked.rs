@@ -1,4 +1,4 @@
-//! A [`ParkedStore`] (0.7.7), behind the `parked` feature: parked events
+//! A [`ParkedStore`] (roadmap 0.7.7), behind the `parked` feature: parked events
 //! in a `parked_events` table on the store's connection, so a park is
 //! durable in the same database the projection reads from.
 
@@ -47,6 +47,12 @@ impl<E> Clone for SqliteParkedStore<E> {
 
 impl<E> SqliteParkedStore<E> {
     /// A parked store beside an event store, on its connection.
+    ///
+    /// # Errors
+    ///
+    /// The `parked_events` schema could not be created on the shared
+    /// database (read-only file, a foreign table of the same name, or
+    /// the database locked by another writer).
     pub fn beside<X>(store: &crate::SqliteStore<X>) -> Result<Self, SqliteStoreError> {
         let conn = store.conn();
         lock_conn(&conn).execute_batch(SCHEMA)?;
@@ -57,6 +63,12 @@ impl<E> SqliteParkedStore<E> {
     }
 
     /// A parked store on its own connection.
+    ///
+    /// # Errors
+    ///
+    /// The `parked_events` schema could not be created on the
+    /// connection's database (read-only file, a foreign table of the
+    /// same name, or the database locked by another writer).
     pub fn from_connection(conn: rusqlite::Connection) -> Result<Self, SqliteStoreError> {
         conn.execute_batch(SCHEMA)?;
         Ok(Self {

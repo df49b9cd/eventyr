@@ -1,4 +1,4 @@
-//! The `ProjectorLease` port: one driver per checkpoint name (0.7.9).
+//! The `ProjectorLease` port: one driver per checkpoint name (roadmap 0.7.9).
 //!
 //! Two copies of a projector against one checkpoint corrupt the read
 //! model the runner is otherwise careful about: both fetch, both apply,
@@ -95,11 +95,19 @@ impl core::fmt::Display for LeaseError {
 
 impl core::error::Error for LeaseError {}
 
-/// How long a lease lives and how long a dead holder may still claim
-/// it (`grace`), and how long *any* holder may keep it (`max_grace`).
+/// How long a lease lives, how long a dead holder may still claim it
+/// (`grace`), and how long *any* holder may keep it (`max_grace`).
 ///
 /// The defaults — 5 s / 3 / 12 — mean renew every 5 s and a run that
-/// can no longer renew holds the name for at most one minute.
+/// can no longer renew holds the name for at most one minute. Note
+/// what `max_grace` also costs a *healthy* run: the cap is measured
+/// from acquire and renewing does not extend it, so a lease is
+/// surrendered — [`RunError::LeaseLost`](crate::runner::RunError) —
+/// after `ttl × max_grace` (one minute at the defaults) even while
+/// renewing perfectly. That is the deliberate ceiling on accidental
+/// captivity; the driver does not re-acquire, so a long-lived
+/// projector wraps its run in a loop and treats `LeaseLost` as a
+/// routine handover, not a failure.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LeasePolicy {
     /// The renewal rhythm: a renewal is due each `ttl`.
@@ -196,6 +204,12 @@ impl InMemoryLeaseStore {
 
     /// Force `name` past its grace — the test seam for "the holder
     /// stalled": the next renewal or acquire sees the lease as expired.
+    ///
+    /// # Panics
+    ///
+    /// When the monotonic clock's uptime is shorter than the lease
+    /// window being backdated past — impossible on any real machine,
+    /// but the `checked_sub` must say so rather than wrap.
     #[cfg(any(test, feature = "testing"))]
     pub fn expire(&self, name: &str) {
         if let Some(row) = self.lock().get_mut(name) {
@@ -210,6 +224,12 @@ impl InMemoryLeaseStore {
     /// next renewal fails on the acquired-at bound alone. Backdating
     /// both anchors would not discriminate: the grace clause would
     /// fail first, and a store with no acquired-at check would pass.
+    ///
+    /// # Panics
+    ///
+    /// When the monotonic clock's uptime is shorter than the lease
+    /// window being backdated past — impossible on any real machine,
+    /// but the `checked_sub` must say so rather than wrap.
     #[cfg(any(test, feature = "testing"))]
     pub fn expire_at_max_grace(&self, name: &str) {
         if let Some(row) = self.lock().get_mut(name) {
@@ -336,11 +356,19 @@ impl_lease_delegation!(&L);
 impl_lease_delegation!(std::sync::Arc<L>);
 
 /// Run the [`ProjectorLease`] contract against `make_store`'s stores.
+///
 /// Every implementation runs it, behind this crate's `testing`
 /// feature. A fresh store per call is not required — each case uses
 /// its own name, so one shared store (a clone of one pool, say)
 /// works; the factory is called per case so a fresh store *can* be
 /// given.
+///
+/// # Panics
+///
+/// When the store broke the lease contract: a fresh name did not
+/// acquire, a held name did, a live lease expired or a lost one
+/// renewed, or grace or `max_grace` was not honored. The message
+/// names the broken case.
 #[cfg(any(test, feature = "testing"))]
 pub fn lease_store_contract<L: ProjectorLease>(make_store: impl Fn() -> L) {
     use futures::executor::block_on;

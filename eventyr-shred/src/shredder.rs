@@ -109,6 +109,74 @@ impl From<ShredError> for StoreError {
 
 /// A cipher and a key store: seals and opens the [`Sensitive`](crate::Sensitive)
 /// fields of events, and erases subjects.
+///
+/// # Examples
+///
+/// Seal an event, open it back, then erase the subject — the sealed
+/// field survives in the log but reads back shredded. A stand-in toy
+/// cipher (XOR with the key, not real encryption) keeps the example
+/// dependency-free; the real ciphers are `eventyr-shred-aes-gcm` and
+/// `eventyr-shred-chacha`:
+///
+/// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use eventyr_shred::{Cipher, CipherError, InMemoryKeyStore, Sensitive, Shredder, SubjectKey};
+/// use futures::executor::block_on;
+/// use serde::{Deserialize, Serialize};
+///
+/// // A toy cipher: XOR with the key — not encryption, but the
+/// // shredder only needs the Cipher contract.
+/// struct Toy;
+/// impl Cipher for Toy {
+///     fn algorithm(&self) -> &'static str { "toy" }
+///     fn generate_key(&self) -> Result<SubjectKey, CipherError> {
+///         Ok(SubjectKey::from_bytes(vec![7; 32]))
+///     }
+///     fn encrypt(&self, key: &SubjectKey, plaintext: &[u8], aad: &[u8])
+///         -> Result<Vec<u8>, CipherError> {
+///         let mut out = plaintext.to_vec();
+///         for (i, byte) in out.iter_mut().enumerate() {
+///             *byte ^= key.as_bytes()[i % 32] ^ aad.first().copied().unwrap_or(0);
+///         }
+///         Ok(out)
+///     }
+///     fn decrypt(&self, key: &SubjectKey, ciphertext: &[u8], aad: &[u8])
+///         -> Result<Vec<u8>, CipherError> {
+///         self.encrypt(key, ciphertext, aad) // XOR is its own inverse
+///     }
+/// }
+///
+/// #[derive(Clone, Serialize, Deserialize)]
+/// enum CustomerEvent {
+///     Registered { email: Sensitive<String> },
+/// }
+///
+/// let shredder = Shredder::new(Toy, InMemoryKeyStore::new());
+/// let event = CustomerEvent::Registered {
+///     email: Sensitive::new("customer-1", "ada@example.com".to_owned()),
+/// };
+///
+/// // Seal: the email is encrypted before it reaches the log. The
+/// // sealed form is what the store keeps — clone it as the log's copy.
+/// let sealed = block_on(shredder.seal(event))?;
+/// assert!(matches!(sealed, CustomerEvent::Registered { email: Sensitive::Sealed(_) }));
+/// let stored = sealed.clone();
+///
+/// // Open: with the key, the email comes back.
+/// let opened = block_on(shredder.open(sealed))?;
+/// let CustomerEvent::Registered { email } = &opened;
+/// assert_eq!(email.get().map(String::as_str), Some("ada@example.com"));
+///
+/// // Erase the subject, then read the log's copy again: the key is
+/// // gone, so the field reads back shredded — the ciphertext stays in
+/// // the log, unreadable.
+/// block_on(shredder.erase("customer-1"))?;
+/// let shredded = block_on(shredder.open(stored))?;
+/// let CustomerEvent::Registered { email } = shredded;
+/// assert!(email.is_shredded());
+/// # Ok(())
+/// # }
+/// ```
 pub struct Shredder<C, K> {
     cipher: C,
     keys: K,
@@ -123,6 +191,12 @@ impl<C: Cipher, K: KeyStore> Shredder<C, K> {
     /// Erase `subject`: delete its key. Every field sealed under it
     /// reads back as [`Shredded`](crate::Sensitive::Shredded) from now on,
     /// and no new data for it can be sealed.
+    ///
+    /// # Errors
+    ///
+    /// The key store failed — the deletion itself; erasure is
+    /// idempotent, so an already-erased subject is a success, never an
+    /// error.
     pub async fn erase(&self, subject: &str) -> Result<(), StoreError> {
         self.keys.delete(subject).await
     }
@@ -130,6 +204,14 @@ impl<C: Cipher, K: KeyStore> Shredder<C, K> {
     /// Encrypt every `Plain` field of `event`, creating a subject's key
     /// on first use. Already-sealed fields pass through. An event with
     /// no sensitive fields passes through untouched — no round trip.
+    ///
+    /// # Errors
+    ///
+    /// [`ShredError::Keys`] when the key store failed (an erased
+    /// subject's key cannot come back: [`ShredError::SubjectErased`]);
+    /// [`ShredError::Cipher`] when the cipher rejected the key or the
+    /// encryption failed; a redacted [`ShredError::Json`] when the
+    /// event's own serde round trip failed.
     pub async fn seal<E>(&self, event: E) -> Result<E, ShredError>
     where
         E: serde::Serialize + serde::de::DeserializeOwned,
@@ -173,6 +255,15 @@ impl<C: Cipher, K: KeyStore> Shredder<C, K> {
     /// Decrypt every `Sealed` field of `event`. A field whose subject's
     /// key is gone becomes `Shredded`; a field that fails to decrypt
     /// under a key that exists is an error.
+    ///
+    /// # Errors
+    ///
+    /// [`ShredError::WrongAlgorithm`] when a sealed field names a
+    /// cipher other than this shredder's; [`ShredError::Cipher`] when a
+    /// field fails authentication under a key that exists — tampering
+    /// or corruption, never erasure; [`ShredError::Keys`] when the key
+    /// store failed; a redacted [`ShredError::Json`] when the event's
+    /// own serde round trip failed.
     pub async fn open<E>(&self, event: E) -> Result<E, ShredError>
     where
         E: serde::Serialize + serde::de::DeserializeOwned,
