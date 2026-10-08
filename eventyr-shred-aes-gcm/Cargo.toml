@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 keywords = ["event-sourcing", "gdpr", "crypto-shredding", "aes-gcm"]
+repository = "https://github.com/df49b9cd/eventyr"
+readme = "README.md"
+homepage = "https://github.com/df49b9cd/eventyr"
+categories = ["database"]
+documentation = "https://docs.rs/eventyr-shred-aes-gcm"
 
 [lints]
 workspace = true
@@ -15,4 +20,8 @@ eventyr-shred = { workspace = true, features = ["aead"] }
 aes-gcm = { workspace = true, features = ["aes", "alloc", "getrandom"] }
 
 [dev-dependencies]
-eventyr-shred = { workspace = true, features = ["testing"] }
+eventyr-shred = { path = "../eventyr-shred", features = ["testing"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

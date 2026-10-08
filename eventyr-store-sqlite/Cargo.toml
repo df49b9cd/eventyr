@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 keywords = ["event-sourcing", "sqlite", "event-store"]
+repository = "https://github.com/df49b9cd/eventyr"
+readme = "README.md"
+homepage = "https://github.com/df49b9cd/eventyr"
+categories = ["database"]
+documentation = "https://docs.rs/eventyr-store-sqlite"
 
 [lints]
 workspace = true
@@ -40,9 +45,13 @@ futures.workspace = true
 # the feature (a crate's own --features don't reach `tests/`).
 [dev-dependencies]
 eventyr-store-sqlite = { path = ".", features = ["snapshots", "views", "shred", "parked", "checkpoints"] }
-eventyr-projection = { workspace = true, features = ["inline", "testing"] }
-eventyr-shred = { workspace = true, features = ["testing"] }
-eventyr-shred-chacha = { workspace = true }
-eventyr-store-testing = { workspace = true, features = ["serde"] }
-eventyr-subscription = { workspace = true, features = ["testing"] }
+eventyr-projection = { path = "../eventyr-projection", features = ["inline", "testing"] }
+eventyr-shred = { path = "../eventyr-shred", features = ["testing"] }
+eventyr-shred-chacha = { path = "../eventyr-shred-chacha" }
+eventyr-store-testing = { path = "../eventyr-store-testing", features = ["serde"] }
+eventyr-subscription = { path = "../eventyr-subscription", features = ["testing"] }
 tempfile.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

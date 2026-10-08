@@ -31,6 +31,12 @@ impl<E> EventEnvelope<E> {
     /// The read-side adapters (upcasting, decrypting) change only the
     /// event; this carries the storage fields across untouched.
     ///
+    /// # Errors
+    ///
+    /// `f`'s own error, unchanged — e.g. an [`UpcastError`](crate::error::UpcastError)
+    /// when the adapter is an upcaster. The storage fields travel
+    /// untouched whatever `f` returns.
+    ///
     /// ```
     /// use eventyr_core::envelope::{EventEnvelope, Metadata};
     /// use eventyr_core::vocabulary::{Sequence, StreamId, Version};
@@ -68,7 +74,7 @@ pub struct Metadata {
     pub causation_id: Option<String>,
     /// The id grouping one interaction's events across aggregates.
     pub correlation_id: Option<String>,
-    /// The key of the command that produced this event (0.7.5). A write
+    /// The key of the command that produced this event (roadmap 0.7.5). A write
     /// carrying a key whose events are already in the target stream is
     /// not decided again — the machine returns the earlier commit. See
     /// [`WriteOutcome::AlreadyCommitted`](crate::write::WriteOutcome::AlreadyCommitted).
@@ -119,7 +125,7 @@ impl Metadata {
     }
 
     /// Builder-style: the idempotency key of the command these events
-    /// come from (0.7.5).
+    /// come from (roadmap 0.7.5).
     pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
         self.idempotency_key = Some(key.into());
         self

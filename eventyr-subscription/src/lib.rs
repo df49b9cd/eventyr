@@ -5,19 +5,28 @@
 //! [`StreamsAll`](eventyr_store::store::StreamsAll) store.
 //!
 //! The machine itself —
-//! [`SubscriptionMachine`](eventyr_core::subscription::SubscriptionMachine)
+//! [`SubscriptionMachine`](eventyr_core::subscription_machine::SubscriptionMachine)
 //! — lives in `eventyr-core` (DESIGN.md §3: a machine and the types it
 //! transitions on live in core). This crate is the store side: the I/O
 //! ports ([`source::SubscriptionSource`], [`checkpoint::CheckpointStore`],
 //! [`lease::ProjectorLease`] — one driver per checkpoint name, 0.7.9 —
 //! [`runner::Projection`]) and the driver ([`runner::Projector`] /
 //! [`runner::drive_projector`], or [`runner::drive_projector_leased`])
-//! it runs against. The `bus` feature carries the §6 [`bus::Subscription`] shape and the §2
-//! [`bus::EventBus`] trait — the 0.3 live-push seam — off by default.
-//! The `testing` feature exports the port contracts
-//! ([`checkpoint::checkpoint_store_contract`],
-//! [`parked::parked_store_contract`], [`lease::lease_store_contract`])
-//! for store implementations to run in their tests.
+//! it runs against.
+//!
+//! ## Cargo features
+//!
+//! - `bus` — the §6 [`bus::Subscription`] shape and the §2
+//!   [`bus::EventBus`] trait — the 0.3 live-push seam; off by default,
+//!   shipping as transport adapters land.
+//! - `testing` — exports [`checkpoint::checkpoint_store_contract`],
+//!   [`parked::parked_store_contract`], and
+//!   [`lease::lease_store_contract`], for store implementations'
+//!   tests; not for production builds.
+//! - `tokio_notify` — a [`Catch`](runner::Catch) impl for
+//!   `Arc<tokio::sync::Notify>`: the `caught_up` port's ready-made
+//!   listener for tokio-based runners; off by default — the machine
+//!   runs without tokio, this is the tests' and services' seam.
 //!
 //! ## A taste
 //!
@@ -79,6 +88,7 @@
 //! # }
 //! ```
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #[cfg(feature = "bus")]
 pub mod bus;
 pub mod checkpoint;
@@ -108,7 +118,7 @@ pub mod prelude {
     pub use eventyr_core::saga::{
         Saga, SagaAction, SagaCommand, SagaInput, SagaMachine, SagaOutcome,
     };
-    pub use eventyr_core::subscription::{
+    pub use eventyr_core::subscription_machine::{
         Batch, Checkpoint, FailurePolicy, SubscriptionAction, SubscriptionInput,
         SubscriptionMachine, SubscriptionOutcome, SubscriptionPolicy,
     };

@@ -40,6 +40,12 @@ pub trait InlineView<E>: Send + Sync {
 
     /// Fold `event` into the stored row (`None`: the view's initial
     /// row) and return the new row.
+    ///
+    /// # Errors
+    ///
+    /// [`InlineViewError`] when the stored row's payload does not
+    /// decode into the view's type, or the new row does not serialize —
+    /// the append carrying it must fail rather than write a broken row.
     fn fold(
         &self,
         stored: Option<serde_json::Value>,
@@ -49,7 +55,9 @@ pub trait InlineView<E>: Send + Sync {
 
 /// An inline row could not be read or written: a stored payload that
 /// no longer decodes into the view's type, or a value that does not
-/// serialize. The store fails the append with it — an inline view that
+/// serialize.
+///
+/// The store fails the append with it — an inline view that
 /// cannot be maintained must not let the write through.
 #[derive(Debug)]
 pub struct InlineViewError {
@@ -167,6 +175,17 @@ pub fn rows_touched<E>(
 /// row's version folds nothing, so a row written by an async
 /// [`ViewProjection`](crate::view::ViewProjection) of the same view is
 /// never regressed.
+///
+/// # Errors
+///
+/// [`InlineViewError`] when any view's fold rejected its event — the
+/// append carrying the batch must fail rather than write broken rows.
+///
+/// # Panics
+///
+/// Unreachable by construction: a dirty row's key was just folded
+/// into `loaded`, so the look-up cannot miss. A panic here is a bug in
+/// this function, not a store condition.
 pub fn fold_inline<E>(
     views: &[Arc<dyn InlineView<E>>],
     events: &[EventEnvelope<E>],

@@ -11,12 +11,12 @@
 1. **Trait-first, framework-last.** The core is a handful of small traits (`Aggregate`, `EventStore`, `Projection`, `Subscription`). Users can adopt the write side without the read side, and implement a store without adopting the aggregate pattern. This is the lesson of `eventually` (trait-first, well-liked) vs `esrs` (opinionated, Prima-specific) and `thalo` (runtime lock-in: wasm + sled).
 2. **Pure domain, I/O at the edges.** `decide` and `apply` are pure functions. All I/O lives in stores, subscriptions, and the repository shell. `katha` proves this shape works beautifully in Rust; `eventcore` proves it scales to multi-stream commands.
 3. **Sans-IO machines for multi-step logic.** Anything that is more than one step — the load→decide→append→retry write path, projection checkpointing — is a *pure state machine*: it consumes results and emits actions; a driver performs the I/O. This is the discipline of sans-IO protocol stacks (`quinn-proto`, `str0m`, Python's `h11`/`h2`), applied to event sourcing. Concurrency logic becomes testable without a database and runnable under any runtime.
-4. **Async at the rim only.** Machines and domain traits are sync-pure; async lives in store traits and drivers via `async fn` in trait (stable since 1.75) — no `#[async_trait]` allocation, no `Pin<Box<...>>` signatures like `eventually`'s old API. The same machines run under tokio, blocking code, or a deterministic test harness.
+4. **Async at the rim only.** Machines and domain traits are sync-pure; async lives in store traits and drivers as `fn … -> impl Future + Send` (RPITIT, stable since 1.75) — no `#[async_trait]` allocation, no `Pin<Box<...>>` signatures like `eventually`'s old API, and the `+ Send` is part of the contract. The same machines run under tokio, blocking code, or a deterministic test harness.
 5. **Concrete enums, no `dyn Event`.** Events are plain Rust enums — exhaustive `match`, compile-time exhaustiveness, no downcasting. `mnesis`'s core pitch, and it fits Eventyr's identity.
-6. **Zero required dependencies in the core crate.** `serde` is optional (feature-gated); the core traits don't need it. Stores that serialize pull it in themselves. The machine core is `no_std + alloc` — it needs no runtime at all; its single optional feature is `time` (the envelope timestamp, off in core, on in the umbrella).
+6. **Zero required dependencies in the core crate.** `serde` is optional (feature-gated); the core traits don't need it. Stores that serialize pull it in themselves. The machine core is `no_std + alloc` — it needs no runtime at all; its optional features are `time` (the envelope timestamp, off in core, on in the umbrella), `macros` (re-exporting the derives, off in core), and `serde` (the value types' serde glue the stores need, off in core).
 7. **Derive macros are sugar, not the API.** `#[derive(Aggregate)]` can generate the event enum + serde glue (like `sourcery`/`thalo`), but everything the macro generates is writable by hand. No `export_aggregate!`-style runtime coupling.
-8. **Postgres-first persistence.** The flagship store is Postgres (like `esrs`'s `PgStore`, `eventually-postgres`), with an in-memory store for tests. Sled/fjall embedded stores are community/feature-gated additions.
-9. **Versioning is a first-class concern.** Optimistic concurrency (`ExpectedVersion`), event upcasting, and deprecation are designed in from day one — the things that separate a demo from a production library (esrs's `Schema`/`Persistable`, cqrs-es's upcasters).
+8. **Postgres-first persistence.** The flagship store is Postgres (like `esrs`'s `PgStore`, `eventually-postgres`), with an in-memory store for tests. The embedded stores are first-class crates too: SQLite as the contract suite's reference port, fjall for runtime-free embedding.
+9. **Versioning is a first-class concern.** Optimistic concurrency (`ExpectedVersion`) and event upcasting are designed in from day one — the things that separate a demo from a production library (esrs's `Schema`/`Persistable`, cqrs-es's upcasters). Upcasting runs on the projection read path, over raw sources; the aggregate load path decodes the stored shape directly, so a reshaped event is a loud failure there, never a silent rewrite (§10).
 
 ## 2. Non-goals
 
@@ -30,20 +30,26 @@
 ## 3. Crate layout
 
 ```
-eventyr/                    # umbrella: re-exports core + prelude
+eventyr/                    # umbrella: re-exports core + prelude; README as its docs
 ├── eventyr-core/           # machines + protocol vocabulary; no_std + alloc; zero deps
-├── eventyr-store/          # async EventStore/StreamsAll traits, in-memory impl, drivers, repository
-├── eventyr-macros/         # #[derive(Aggregate)] etc. (proc-macro crate)
-├── eventyr-store-postgres/ # sqlx-based store, migrations
-├── eventyr-projection/     # read path: upcaster chains, raw→typed sources, schema-versioned rebuilds
-└── eventyr-subscription/   # catch-up subscriptions, event bus trait
+├── eventyr-store/          # EventStore/StreamsAll ports, in-memory impl, drivers, repository, CommitSignal
+├── eventyr-macros/         # #[derive(Aggregate)] / #[derive(EventName)] (proc-macro crate)
+├── eventyr-store-postgres/ # sqlx-based store, migrations, snapshots/views/checkpoints/leases
+├── eventyr-store-sqlite/   # embedded store (rusqlite); the contract suite's reference port
+├── eventyr-store-fjall/    # embedded store over fjall; driveable without a runtime
+├── eventyr-store-testing/  # the contract suites any store must pass
+├── eventyr-projection/     # read path: upcaster chains, raw→typed sources, views, rebuilds
+├── eventyr-subscription/   # catch-up subscriptions, projector runner, leases, sagas runner
+├── eventyr-shred/          # crypto-shredding: Sensitive fields, Shredder, store wrapper
+├── eventyr-shred-aes-gcm/  # AES-256-GCM cipher adapter for shred
+└── eventyr-shred-chacha/   # XChaCha20-Poly1305 cipher adapter for shred
 ```
 
-**Placement rule.** A type lives in `eventyr-core` if and only if a machine transitions on it: the domain traits (`Aggregate`), the protocol vocabulary (`StreamId`, `Version`, `Sequence`, `ExpectedVersion`, `StoreError`, `NewEvent`, `EventEnvelope`, `Metadata`), and the machines themselves. Everything that performs or abstracts I/O — `EventStore`, `StreamsAll`, `Projection`, `Subscription`, the drivers, the repository — lives in the store-side crates. Store-side crates depend on core; core depends on nothing. This is what keeps the core `no_std + alloc` with zero dependencies: machines reference only vocabulary types.
+**Placement rule.** A type lives in `eventyr-core` when a machine transitions on it or the domain protocol names it: the domain trait (`Aggregate`), the protocol vocabulary (`StreamId`, `Version`, `Sequence`, `ExpectedVersion`, `StoreError`, `NewEvent`, `EventEnvelope`, `Metadata`), the machines themselves, and the read-path vocabulary a projection's inputs share (`Upcaster`, `RawEvent`, `EventName`, `EventSchemaVersion`, `Metrics`). Everything that performs or abstracts I/O — `EventStore`, `StreamsAll`, `Projection`, `SubscriptionSource`, the drivers, the repository — lives in the store-side crates. Store-side crates depend on core; core depends on nothing (its optional features pull in `time`, the derive macros, and `serde` glue — all off by default). This is what keeps the core `no_std + alloc` with zero required dependencies: machines reference only vocabulary types.
 
 `Metadata.timestamp` is the one concession: `Option<OffsetDateTime>` exists only behind `eventyr-core`'s `time` feature (off in core, on in the umbrella) — without it the field is absent and timestamps travel as opaque metadata.
 
-Feature flags on the umbrella crate mirror the crates: `macros` (default), `store` (default), `postgres`, `snapshots` (the Postgres snapshot store), `projection`, `subscription`. This is the `eventcore`/`eventide` workspace pattern — it keeps the core dependency-free and lets users pay only for what they use.
+Feature flags on the umbrella crate mirror the crates: `time`, `macros`, `store` (the defaults), `subscription`, `bus`, `projection`, `postgres` (+`postgres_snapshots`/`postgres_checkpoints`/`postgres_leases`/`postgres_views`), `sqlite` (+ its five substores), `fjall` (+`fjall_snapshots`), `shred` (+ cipher and parked companions), `metrics`. The README's feature table is the complete list. This is the `eventcore`/`eventide` workspace pattern — it keeps the core dependency-free and lets users pay only for what they use.
 
 ## 4. Core: domain & protocol vocabulary (eventyr-core)
 
@@ -78,7 +84,7 @@ Design notes:
 
 - **`apply` takes `&mut State` and can't fail.** Events are facts; applying a fact is total. If an event can't be applied, the model is wrong and the process should stop loudly. (cqrs-es and katha agree; esrs's fallible apply invites silent corruption.)
 - **`decide` is `&self`-free and pure.** No `&self` receiver means the aggregate *type* is just a namespace for behavior — no actor, no dependencies smuggled in. Dependencies (clocks, catalogs) belong in the `Command` or a `Context` parameter added by the repository layer, not in the trait. This keeps domain logic unit-testable with zero mocking.
-- **`Optional` adapter** (`eventyr::Optional`): for aggregates whose initial state is "doesn't exist", `State = Option<T>` is so common that we ship a blanket adapter, like `eventually`'s `Optional`/`AsAggregate`.
+- **`Optional` helper trait** (`eventyr_core::aggregate::Optional`, in the prelude): for aggregates whose initial state is "doesn't exist", `State = Option<T>` is so common that the helper exists, like `eventually`'s `Optional`/`AsAggregate`. It is a small trait you implement on the inner state (`T: Default`): `Optional::apply_state` folds an event into `Option<T>` treating `None` as "created by this event", and your `Aggregate::apply` delegates to it; `initial` and `decide` stay yours. Not a blanket impl — the trait has nowhere to carry the aggregate's own `initial`/`decide`, so those stay hand-written either way.
 - **`initial`, not `Default`.** The trait constructs its own starting state — given the id, for aggregates that embed it — so states without a meaningful `Default` don't fight the trait. The repository folds from `A::initial`.
 - **An id a payload needs lives in the state.** `decide(state, command)` never sees the id, deliberately — no dependencies smuggled in — so an event payload that must carry it (a payload-derived `Tagged` event is the common case, 0.7.1) gets it from state: give the state an `id` field and start it with the derive's `initial = MyState::new(id)`. The bank example's `Deposited { account, .. }` works exactly this way.
 
@@ -91,7 +97,10 @@ pub struct StreamId(String); // e.g. "bank_account-<uuid>"
 pub struct Version(u64);    // 1-based position within a stream
 pub struct Sequence(u64);   // global, store-assigned, monotonically increasing (gaps allowed: identity columns burn values on rolled-back appends)
 
-pub trait AggregateId: Clone + Eq + std::hash::Hash + std::fmt::Debug {}
+pub trait AggregateId: Clone + Eq + core::hash::Hash + core::fmt::Debug + core::fmt::Display {}
+// Implemented automatically for every type meeting the bounds. The
+// Display matters: it builds the `"{NAME}-{id}"` stream id, so it is
+// part of the contract, not sugar.
 
 impl StreamId {
     /// `"{NAME}-{id}"` — the single place the id→stream mapping exists.
@@ -107,13 +116,25 @@ The store error is also core vocabulary — the machine protocol must distinguis
 /// The failure kinds the protocols distinguish. Store implementations map
 /// their concrete errors into these at the port boundary; `Other` carries
 /// the source along for diagnostics (`core::error::Error` is no_std since 1.81).
+#[non_exhaustive]
 pub enum StoreError {
     /// Optimistic-concurrency violation; the write machine may retry.
-    Conflict { current: Version },
-    /// Transient failure; retryable per policy.
+    /// `stream_id` names the conflicting stream when the store knows it
+    /// (a batch does); a single-stream append leaves it `None`.
+    Conflict { stream_id: Option<StreamId>, current: Version },
+    /// A boundary append's `AppendCondition` failed: a matching event
+    /// was committed at `sequence` after the condition's position (0.7.1).
+    QueryConflict { sequence: Sequence },
+    /// The stream is closed — a tombstone; further appends are refused
+    /// and the history stays readable (0.7.6).
+    StreamClosed { stream_id: StreamId },
+    /// The read started before a truncation's cut (0.7.6).
+    Truncated { stream_id: StreamId, first: Version },
+    /// Transient failure (connection lost, timeout). Retrying the whole
+    /// interaction is the caller's business; the machine does not retry I/O.
     Unavailable,
     /// Anything else: abort.
-    Other(Box<dyn core::error::Error + Send + Sync>),
+    Other(Arc<dyn core::error::Error + Send + Sync>),
 }
 ```
 
@@ -131,6 +152,9 @@ pub struct EventEnvelope<E> {
 pub struct Metadata {
     pub causation_id: Option<String>,
     pub correlation_id: Option<String>,
+    /// The key of the command that produced this event (0.7.5): a write
+    /// whose key is already committed returns the earlier commit.
+    pub idempotency_key: Option<String>,
     #[cfg(feature = "time")] // off in core, on in the umbrella
     pub timestamp: Option<OffsetDateTime>,
 }
@@ -149,7 +173,7 @@ pub enum ExpectedVersion {
 
 ### 4.4 Upcasting
 
-Upcasting is a chain of pure transformers applied on read, cqrs-es style. An upcaster that cannot transform a payload it recognizes must fail loudly — a silently dropped historical event is data loss:
+Upcasting is a chain of pure transformers applied on the projection read path, cqrs-es style. An upcaster that cannot transform a payload it recognizes must fail loudly — a silently dropped historical event is data loss:
 
 ```rust
 /// Transforms one historical event shape into the current one.
@@ -166,34 +190,61 @@ The write path is *not* a pure function: load → fold → decide → append can
 
 ```rust
 /// What the machine wants the driver to do.
-pub enum WriteAction<E, Err> {
-    /// Read the stream (from `from`, exclusive) to rebuild state.
+pub enum WriteAction<E, Err, S = ()> {
+    /// Read the stream (from `from`, exclusive) to rebuild state. A
+    /// conflict retry re-reads only the delta past the folded version.
     LoadStream { stream_id: StreamId, from: Version },
+    /// Seed the fold from the newest snapshot (with `with_snapshots`),
+    /// then delta-load above it. First action of a snapshotted machine.
+    LoadSnapshot { stream_id: StreamId },
     /// Append events, guarded by the expected version.
     Append { stream_id: StreamId, expected: ExpectedVersion, events: Vec<NewEvent<E>> },
     /// Terminal: the interaction's outcome.
-    Done(WriteOutcome<E, Err>),
+    Done(WriteOutcome<E, Err, S>),
 }
 
 /// What the driver reports back to the machine.
-pub enum WriteInput<E> {
+pub enum WriteInput<E, S = ()> {
     Loaded { events: Vec<EventEnvelope<E>> },
+    SnapshotLoaded { snapshot: Option<Snapshot<S>> },
     Appended { committed: Vec<EventEnvelope<E>> },
-    Conflict { current: Version },
+    Conflict { stream_id: Option<StreamId>, current: Version },
     Failed(StoreError),
 }
 
-pub struct WriteMachine<A: Aggregate> { /* state: phase, folded state, retries */ }
+/// The interaction's terminal result.
+pub enum WriteOutcome<E, Err, S = ()> {
+    /// The store recorded the events; `snapshot` is the fire-and-forget
+    /// offer when the machine is `with_snapshots` and policy says save.
+    Committed { committed: Vec<EventEnvelope<E>>, snapshot: Option<Snapshot<S>> },
+    /// A keyed command (0.7.5) whose earlier commit was already in the
+    /// stream — returned instead of deciding again.
+    AlreadyCommitted { committed: Vec<EventEnvelope<E>> },
+    /// `decide` produced no events.
+    Noop,
+    /// `decide` rejected the command.
+    Rejected(Err),
+    /// The store failed: conflict after exhausting retries, or a fatal
+    /// error. Protocol violations land here too — machines never panic.
+    Failed(StoreError),
+}
+
+pub struct WriteMachine<A: Aggregate, S = ()> { /* phase, folded state, retries */ }
 
 impl<A: Aggregate> WriteMachine<A> {
-    /// Begin: returns the first action (always `LoadStream`).
-    pub fn start(&mut self) -> WriteAction<A::Event, A::Error>;
+    pub fn new(id: A::Id, command: A::Command, retry_policy: RetryPolicy) -> Self;
+    /// Begin: `LoadStream` — or `LoadSnapshot` on a `with_snapshots` machine.
+    pub fn start(&mut self) -> WriteAction<A::Event, A::Error, S>;
+    /// Stamp one interaction's metadata (correlation/causation ids)
+    /// onto every event — and with `Metadata::with_idempotency_key`,
+    /// the key that makes a re-run end `AlreadyCommitted`.
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self;
     /// Consume a driver result, transition, and emit the next action.
-    pub fn handle(&mut self, input: WriteInput<A::Event>) -> WriteAction<A::Event, A::Error>;
+    pub fn handle(&mut self, input: WriteInput<A::Event, S>) -> WriteAction<A::Event, A::Error, S>;
 }
 ```
 
-The machine's transitions are exactly the repository protocol: on `Loaded` → fold with `A::apply` → run `A::decide` → emit `Append`; on `Appended` → emit `Done(Ok)`; on `Conflict` → if retries remain, emit `LoadStream` again (re-fold, re-decide against fresh state), else `Done(Err(Conflict))`.
+The machine's transitions are exactly the repository protocol: on `Loaded` → fold with `A::apply` → run `A::decide` → emit `Append` (or `Done(Noop)`/`Done(Rejected)` when `decide` produces or rejects nothing); on `Appended` → emit `Done(Committed)`; on `Conflict` → if retries remain, emit `LoadStream` again for the delta (re-fold, re-decide against fresh state), else `Done(Failed(StoreError::Conflict))`. A keyed machine checks its stream's events for its key while folding and ends `AlreadyCommitted` when it finds one — the stream *is* the deduplication record (0.7.5).
 
 The separation of concerns is the point: **the aggregate decides *what* (domain policy); the machine decides *how* (interaction protocol); the driver performs it (I/O).** Retry policy, conflict handling, and idempotency are all machine state — inspectable, testable, and identical under every runtime.
 
@@ -221,6 +272,16 @@ pub trait EventStore {
         stream_id: &StreamId,
         from: Version,
     ) -> impl Stream<Item = Result<EventEnvelope<Self::Event>, StoreError>> + Send;
+
+    /// Multi-stream batch append: every append or none, each stream
+    /// guarded by its own expectation (0.4, `BatchMachine`'s port; a
+    /// violation names the stream and its version in the Conflict).
+    /// Stores that cannot commit across streams use the
+    /// `append_batch_fallback` helper rather than faking it.
+    fn append_batch(
+        &self,
+        batch: Vec<StreamAppend<Self::Event>>,
+    ) -> impl Future<Output = Result<Vec<CommittedStream<Self::Event>>, StoreError>> + Send;
 }
 
 /// Global ordered stream — the projection/subscription backbone.
@@ -237,12 +298,13 @@ pub trait StreamsAll: EventStore {
 - **`&self`, not `&mut self`.** Stores are shared (`Arc`, connection pools) and serve concurrent appends to different streams; internal synchronization is the store's concern. This also keeps the repository's `execute(&self)` honest.
 - **`append` is transactional**: all events or none (eventually's contract, esrs's `persist`).
 - **`ExpectedVersion` on append** gives optimistic concurrency; stores return `StoreError::Conflict` on mismatch. The machine retries `decide` on conflict (bounded retries, configurable).
-- **The `StreamsAll` split keeps honesty**: aggregate persistence needs only `EventStore`; projections and subscriptions require `StreamsAll`.
-- **No `remove`/`delete` in the core trait.** Event streams are the system of record; hard-deleting events is a GDPR/ops concern handled by a separate `StreamPruner` (esrs has `delete`; we deliberately demote it — deleting history is the exception, not the store's job).
+- **The `StreamsAll` split keeps honesty**: aggregate persistence needs only `EventStore`; projections and subscriptions require `StreamsAll`. Filtered global reads (`stream_all_filtered`, with the scan bound that lets a sparse filter checkpoint past unmatched runs) are a default method stores may override (0.7.4).
+- **Opt-in ports stay separate**: `QueryAppend` (0.7.1's dynamic boundaries), `StreamLifecycle` (`close_stream`/`truncate_before`, 0.7.6), `SnapshotStore`, `CommitSignal` (0.7.2). Implementing `EventStore` — plus `append_batch` — is the whole required surface.
+- **No `remove`/`delete` in the core trait.** Event streams are the system of record. What exists instead is `StreamLifecycle` (0.7.6): a close is a tombstone that refuses further appends while the history stays readable, truncation removes a prefix and reads that would fold across the cut fail with `StoreError::Truncated`, and erasure of *content* is crypto-shredding (0.7.6, `eventyr-shred`). esrs has `delete`; we deliberately demote it — deleting history is the exception, and each form is a separate, explicit port.
 
 ### 5.2 Drivers — the imperative shell
 
-A driver is a boring loop: perform the action, feed the result back. 0.1 ships two over the same machines; the blocking driver arrives with the embedded stores (0.4):
+A driver is a boring loop: perform the action, feed the result back. Async and scripted drivers shipped with 0.1, the blocking ones with 0.4; every machine has both, plus `*_with_metrics` variants:
 
 ```rust
 /// Async driver over any `EventStore` (tokio, smol, anything).
@@ -265,8 +327,9 @@ pub fn drive_scripted<A>(
     script: impl IntoIterator<Item = WriteInput<A::Event>>,
 ) -> Vec<WriteAction<A::Event, A::Error>>;
 
-/// Blocking driver for CLI/embedded use — 0.4, with the embedded stores.
-pub fn drive_write_blocking<A, S>(...);
+/// Blocking driver for CLI/embedded use; every machine has one
+/// (`drive_write_blocking`, `drive_write_batch_blocking`,
+/// `drive_boundary_blocking`, `drive_projector_blocking`).
 ```
 
 ### 5.3 Repository — the ergonomic entry point
@@ -293,7 +356,7 @@ where
         command: A::Command,
     ) -> Result<ExecutionOutcome<A::Event>, ExecutionError<A>> {
         let mut machine = WriteMachine::new(id, command, self.retry_policy);
-        drive_write(&mut machine, &self.store).await
+        Ok(drive_write(&mut machine, &self.store).await)
     }
 }
 ```
@@ -303,27 +366,46 @@ This is `katha`'s `make_handler` / `sourcerer`'s `GenericRepository` / `eventcor
 ## 6. Projections & subscriptions (eventyr-subscription, eventyr-projection)
 
 ```rust
-pub trait Projection {
-    type Event;
+/// What the runner folds events into. At-least-once; must be idempotent.
+pub trait Projection: Send {
+    type Event: Send;
+    /// Rejection of one event: the runner backs off and redelivers the
+    /// whole batch from the last ack.
     type Error;
 
-    /// Left-fold one event into the read model. At-least-once; must be idempotent.
-    async fn apply(&mut self, event: &EventEnvelope<Self::Event>) -> Result<(), Self::Error>;
+    /// Left-fold one event into the read model.
+    fn apply(&mut self, event: &EventEnvelope<Self::Event>)
+        -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-pub trait Subscription {
-    type Event;
-    type Error;
+/// What the runner reads from. `StoreSubscription` adapts any
+/// `StreamsAll` store; `FilteredSubscription` narrows it (0.7.4).
+pub trait SubscriptionSource: Send + Sync {
+    type Event: Send;
 
-    /// Poll for events after the checkpoint. Returns when caught up or batch drained.
-    async fn poll(&mut self, checkpoint: Checkpoint) -> Result<Batch, Self::Error>;
-    async fn ack(&mut self, checkpoint: Checkpoint) -> Result<(), Self::Error>;
+    /// Read up to `max` events with sequence > `from`, in global
+    /// sequence order, as a `Batch`. Fewer than `max` — down to zero —
+    /// means caught up.
+    fn fetch(&self, from: Checkpoint, max: usize)
+        -> impl Future<Output = Result<Batch<Self::Event>, StoreError>> + Send;
+}
+
+/// Where the runner persists `name`'s last acked position.
+pub trait CheckpointStore: Send + Sync {
+    fn load(&self, name: &str) -> impl Future<Output = Result<Checkpoint, StoreError>> + Send;
+    fn store(&self, name: &str, checkpoint: Checkpoint)
+        -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 ```
 
+(`Subscription`/`poll`/`ack` — the original sketch here — shipped as the
+`bus`-gated [`EventBus`](eventyr-subscription's `Subscription`) companion
+trait instead, the seam for a user's own live transport; the runner itself
+reads `SubscriptionSource` and acks `CheckpointStore`.)
+
 - **At-least-once delivery, idempotent apply** — the only honest contract (thalo's guarantee, EventStoreDB's model). The help for *being* idempotent is `SkipRedelivered` (0.7.7's companion): a `Projection` wrapper that records the newest folded position per stream and skips anything redelivered at or below it, so the batch retry in 0.7.7 cannot re-count the events before a poison one. The wrapper dedupes within a run; the checkpoint dedupes between runs; a rebuild from the start needs neither.
 - **Checkpointed catch-up subscriptions** over any `StreamsAll` store (eventually's `Subscription::checkpoint/resume`): the projector runner persists the last-acked global sequence, so restarts resume without reprocessing.
-- **The projector is also a machine** — `ProjectorMachine`, per the canonical table in §7; the runner is just its driver. This is where sans-IO pays off most: at-least-once semantics, redelivery after failure, and resume-from-checkpoint are exactly the kind of multi-step, failure-prone protocol that should never be an untestable async loop. The driver additionally owns a fourth port, the `ProjectorLease` (0.7.9): one driver per checkpoint name, renewed on the batch boundary, so two configured projectors against the same name never corrupt the read model. The implemented machine (`SubscriptionMachine` in `eventyr-core`, named for its §6-facing role) adds the table's *implied* steps as explicit actions: `Fetch` is the poll §6's `Subscription::poll` implies (`Batch` must be requested), and `Slept` is the driver's answer to `Sleep` — no clock in the machine. That delta between the table's four names and the implemented protocol is intentional.
+- **The projector is also a machine** — `SubscriptionMachine`, per the canonical table in §7; the runner is just its driver. This is where sans-IO pays off most: at-least-once semantics, redelivery after failure, and resume-from-checkpoint are exactly the kind of multi-step, failure-prone protocol that should never be an untestable async loop. The driver additionally owns a fourth port, the `ProjectorLease` (0.7.9): one driver per checkpoint name, renewed on the batch boundary, so two configured projectors against the same name never corrupt the read model. The machine turns the table's *implied* steps into explicit actions: `Fetch` requests a batch, and `Slept` is the driver's answer to `Sleep` — no clock in the machine. That delta between the table's names and the implemented protocol is intentional.
 - **No built-in consumer loop** — the runner is a plain `tokio` task users spawn; Eventyr ships a `Projector` helper but doesn't own the event loop (mnesis's "the loop is the consumer's" — right for a library).
 
 ## 7. Machine modeling rules (sans-IO discipline)
@@ -344,7 +426,7 @@ Where machines live in Eventyr (this table is the single source for each machine
 | `WriteMachine` | `Loaded`/`SnapshotLoaded`/`Appended`/`Conflict`/`Failed` | `LoadStream`/`LoadSnapshot`/`Append`/`Done` | load→fold→decide→append, conflict retry; with `with_snapshots`, snapshot-load then delta-load, monotonicity-guarded, and a fire-and-forget snapshot offer on `Committed`; a keyed command whose earlier commit is in the stream ends `AlreadyCommitted` |
 | `BatchMachine` | `Loaded` (one per stream)/`Appended`/`Conflict`/`Failed` | `LoadStreams`/`AppendBatch`/`Done` | load the fixed, sorted boundary → fold each stream → `Decide` against every fold, routing each event to a stream (`RoutedDecision`) → one atomic append, each stream guarded by its own version; a conflict re-reads only the stream it names (an unnamed one is attributed to the first stream and checked) and re-decides |
 | `BoundaryMachine` | `Read`/`Appended`/`Conflict`/`Failed` | `Read`/`Append`/`Done` | read the decision's query → fold → decide (`RoutedDecision`) → append under an `AppendCondition` (nothing matching the validation query after the position read); a conflict re-reads the delta and re-decides |
-| `ProjectorMachine` (`SubscriptionMachine`) | `Fetched`/`Applied`/`ApplyFailed`/`Parked`/`ParkFailed`/`Acked`/`AckFailed`/`Slept`/`Failed`/`Shutdown` | `Fetch`/`Apply`/`Park`/`Ack`/`Sleep`/`Done` | at-least-once apply, checkpoint, resume; a failed apply, park, or ack backs off and redelivers from the last ack; under `FailurePolicy::Park` an event rejected past its budget is parked and skipped; `Shutdown` finishes and acks the in-flight batch, survives a failure (one closing re-read), and ends `Stopped` at the last ack |
+| `SubscriptionMachine` | `Fetched`/`Applied`/`ApplyFailed`/`Parked`/`ParkFailed`/`Acked`/`AckFailed`/`Slept`/`Failed`/`Shutdown` | `Fetch`/`Apply`/`Park`/`Ack`/`Sleep`/`Done` | at-least-once apply, checkpoint, resume; a failed apply, park, or ack backs off and redelivers from the last ack; under `FailurePolicy::Park` an event rejected past its budget is parked and skipped; `Shutdown` finishes and acks the in-flight batch, survives a failure (one closing re-read), and ends `Stopped` at the last ack |
 | `SagaMachine` | `Dispatched`/`DispatchFailed` | `Dispatch`/`Done` | per event: `start` runs the pure `react`, then one dispatch per `(target stream, command)` in order; checkpoint and redelivery stay with the subscription it runs inside (`SagaProjection`) |
 
 Snapshots deliberately did **not** become their own machine: the §7 table's planned `SnapshotMachine` was folded into `WriteMachine::with_snapshots` as an opt-in preload, because the write protocol (load→decide→append→retry) is the same interaction either way — snapshot loading is just an initial skip-ahead in the same fold, and snapshot saving is a fire-and-forget offer on the commit outcome, not a new machine phase.
@@ -353,7 +435,7 @@ Formally, the aggregate is itself a single-step state machine — `apply` *is* i
 
 ## 8. Derive macros (eventyr-macros)
 
-`#[derive(Aggregate)]` sits on the aggregate *marker* struct (a unit struct — the aggregate type is a namespace, not a state holder) and wires the `Aggregate` impl by convention: `NAME` is the snake_cased struct name, `Id`/`Event`/`Command`/`Error` follow the `{Ident}...` position convention, `State` is `Self` (point `state` at a type for the marker-plus-state shape), `initial` is `Default::default()` — or `Self` when a unit struct is its own state — and `apply`/`decide` delegate to same-module free functions. Every convention is overridable with `#[eventyr(...)]` attributes (`name`, `id`, `state`, `event`, `event_enum`, `command`, `error`, `initial`, `apply`, `decide`, `crate`); `crate` retargets the generated code at the umbrella crate (the serde `crate = "..."` pattern), and `initial` sees the id as `id`. The generated enum takes `event_derive(Serialize, ...)` and `event_attr("#[serde(...)]")` for the codec attributes a store or shred pipeline needs — it stays plain Rust, so all of this is writable by hand.
+`#[derive(Aggregate)]` sits on the aggregate *marker* struct (a unit struct — the aggregate type is a namespace, not a state holder) and wires the `Aggregate` impl by convention: `NAME` is the snake_cased struct name, `Id`/`Event`/`Command`/`Error` follow the `{Ident}...` position convention, `State` is `Self` (point `state` at a type for the marker-plus-state shape), `initial` is `Default::default()` — or `Self` when a unit struct is its own state — and `apply`/`decide` delegate to same-module free functions. Every convention is overridable with `#[eventyr(...)]` attributes (`name`, `id`, `state`, `event`, `event_enum`, `command`, `error`, `initial`, `apply`, `decide`, `crate`). Generated code targets whichever crate the caller's manifest depends on — `eventyr_core` or the umbrella — resolved the serde `crate = "..."` way from `Cargo.toml`; only a *renamed* dependency needs the attribute. The generated event enum always derives `Clone, Debug, PartialEq` (payload structs need those too). `initial` sees the id as `id`. The generated enum takes `event_derive(Serialize, ...)` and `event_attr("#[serde(...)]")` for the codec attributes a store or shred pipeline needs — it stays plain Rust, so all of this is writable by hand.
 
 `#[eventyr(events(Opened, Deposited))]` generates the event enum from payload structs (the sourcery pattern): one newtype variant per payload, a `From<Payload>` conversion for building events in `decide`, and an `EventName` impl naming each variant after its payload. Name it with `event_enum = BankEvent` (default: `{Ident}Event`); the `Event` type follows the enum. The reverse conversion is a `match` — the point of a concrete enum.
 
@@ -361,11 +443,11 @@ Everything is hand-writable; the macro is sugar. `#[derive(EventName)]` gives st
 
 ## 9. Postgres store sketch
 
-Single-table, stream-scoped optimistic locking — the standard, boring, correct design (esrs, eventually-postgres, eventcore-postgres all converge here):
+Single-table, stream-scoped optimistic locking — the standard, boring, correct design (esrs, eventually-postgres, eventcore-postgres all converge here). Migration 0001's table:
 
 ```sql
 CREATE TABLE events (
-    global_sequence  BIGSERIAL PRIMARY KEY,
+    global_sequence BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     stream_id       TEXT        NOT NULL,
     stream_version  BIGINT      NOT NULL,
     event_type      TEXT        NOT NULL,
@@ -376,14 +458,15 @@ CREATE TABLE events (
 );
 ```
 
-The `UNIQUE` constraint's backing index serves the per-stream lookups; no separate index is needed. Append = one transaction: `SELECT ... FOR UPDATE` (or `INSERT ... ON CONFLICT` + version check) then batch insert. `stream_all` = keyset pagination on `global_sequence`. The store serializes via `serde` + `serde_json` (feature-gated in the store crate, never in core).
+The `UNIQUE` constraint's backing index serves the per-stream lookups (migration 0005 adds `(event_type, global_sequence)` for the prefilter the derived tags of 0.7.1 use). Append = one transaction inside the `append_events` PL/pgSQL function (0001, split into helpers in 0010): take the per-stream advisory lock (`pg_advisory_xact_lock(hashtext(stream_id))` — a `FOR UPDATE` cannot lock a stream that does not exist yet), refuse closed streams (0009), check the expected version, then — the part everything else depends on — take the constant commit-order advisory lock, `pg_notify`, and insert. That commit-order lock is held from drawing `global_sequence` until commit: no sequence becomes visible before an earlier one, which is the property `StreamsAll` and the filtered-read scan bound rest on, and the price is that appends to different streams no longer commit in parallel (per-store locking is 0.8.2). `stream_all` = keyset pagination on `global_sequence`. The store serializes via `serde` + `serde_json` in the store crate — core stays dependency-free, and `serde` is core's opt-in glue feature the stores turn on.
 
 ## 10. Testing story
 
 - **Pure core = table-driven tests.** `decide`/`apply` test with plain asserts, no mocks, no async, no store. Given/when/then helpers in `eventyr::testing`.
 - **Machines = transition tests.** Each machine gets exhaustive transition tests: a `Vec` of inputs → expected action sequence (what `drive_scripted` returns). Conflict-retry, at-least-once redelivery, and checkpoint resume are all tested as pure data — the tests that are hardest to write against a real store become trivial. This is the sans-IO payoff: the concurrency-critical 10% of the library gets the strongest verification, not the weakest.
-- **In-memory store** doubles as the acceptance-test store; contract tests (a `StoreContract` test-suite trait, eventcore-testing style) that any third-party store must pass to claim compatibility.
-- **`TestScenario`** (0.2, shipped): `Scenario::given(id, events).when(command).then_events(events)` in `eventyr_core::testing`, re-exported through the prelude — pure domain tests with labeled assertion failures, borrowed from eventcore's testing crate.
+- **In-memory store** doubles as the acceptance-test store; contract tests — callable suites in `eventyr-store-testing` (`event_store_contract`, `streams_all_contract`, `event_store_batch_contract`, `snapshot_contract`, `query_append_contract`, `commit_signal_contract`, `filtered_read_contract`, `lifecycle_contract`; the eventcore-testing idea as free functions over a store factory) — that any third-party store must pass to claim compatibility.
+- **`Scenario`** (0.2, shipped): `Scenario::<A>::given(&id, [..]).when(&command).then_events(&[..])` in `eventyr_core::testing`, re-exported through the prelude — pure domain tests with labeled assertion failures, borrowed from eventcore's testing API. `ProjectionScenario` (0.7.x) is the read-side counterpart.
+- **Upcasting is the projection read path's tool.** The chains run over a `SubscriptionSource<Event = RawEvent>` (`UpcastingSource`, `VersionedSource`); the repository and the stores decode payloads straight into the event enum, so a reshaped event type fails an aggregate load with a decode error rather than silently upcasting. (0.5.1's registry validates a version ladder per event type; nothing makes a *store* raw until one needs to serve one — 0.6.2's withdrawal note stands.)
 - **Verification discipline** (mnesis's bar): proptest for machine invariants (e.g. "a machine that receives `Appended` always emits `Done`", "checkpoint never regresses"), `miri` in CI over the core's unit tests (scoped to what a CI job can run in minutes), `trybuild` for macro diagnostics.
 
 ## 11. What we take from each library
@@ -404,13 +487,16 @@ The `UNIQUE` constraint's backing index serves the per-stream lookups; no separa
 
 ## 12. Roadmap
 
+*(The 0.x.y numbers below are design milestones tracked in this document, not crate versions: the workspace's crates are still pre-release and unpublished, and the first crates.io release will map the shipped milestones onto semver. The `git log` and the per-item "Shipped" notes are the history; this section is the current state.)*
+
 - **0.1** — shipped. Core traits + protocol vocabulary, `WriteMachine` with transition tests, in-memory store, async + scripted drivers, repository wrapper, derive macros, and the `Optional` state adapter (`State = Option<T>` for "does not exist yet" aggregates, §4.1).
-- **0.2** — partially shipped: Postgres store + migrations (`eventyr-store-postgres`), upcasters (upcast vocabulary in core, chains and raw→typed sources in `eventyr-projection`), checkpointed subscriptions (`SubscriptionMachine`, the projector runner). Also shipped: `TestScenario` (`Scenario`/`Outcome` in `eventyr_core::testing`).
-- **0.3** — partially shipped: the projection read path (upcaster chains, schema-versioned rebuilds), `EventBus` trait (behind `eventyr-subscription`'s `bus` feature). Also shipped: snapshot support, opt-in per repository — `SnapshotPolicy`/`WritePolicy` and `WriteMachine::with_snapshots` in core (one `LoadSnapshot` action, delta `LoadStream`, the snapshot-version monotonicity guard in the fold, and the fire-and-forget `OfferSnapshot` on `WriteOutcome::Committed`), `SnapshotStore` + `InMemorySnapshotStore` and `AggregateRepository::with_snapshots` in `eventyr-store`, the `snapshots` table/persistence in `eventyr-store-postgres` behind its `snapshots` feature, mirrored by the umbrella's `snapshots` feature. Single-feed fan-out to N projections on one checkpoint, if ever built, is a combinator over the existing `SubscriptionMachine` (`Fanout` multiplexing the one `Apply` action to N idempotent members) — never a new machine, and deferred until a "must advance together" use case justifies it.
+- **0.2** — shipped: Postgres store + migrations (`eventyr-store-postgres`), upcasters (upcast vocabulary in core, chains and raw→typed sources in `eventyr-projection`), checkpointed subscriptions (`SubscriptionMachine`, the projector runner). Also shipped: `TestScenario` (`Scenario`/`Outcome` in `eventyr_core::testing`).
+- **0.3** — shipped: the projection read path (upcaster chains, schema-versioned rebuilds), `EventBus` trait (behind `eventyr-subscription`'s `bus` feature). Also shipped: snapshot support, opt-in per repository — `SnapshotPolicy`/`WritePolicy` and `WriteMachine::with_snapshots` in core (one `LoadSnapshot` action, delta `LoadStream`, the snapshot-version monotonicity guard in the fold, and the fire-and-forget `OfferSnapshot` on `WriteOutcome::Committed`), `SnapshotStore` + `InMemorySnapshotStore` and `AggregateRepository::with_snapshots` in `eventyr-store`, the `snapshots` table/persistence in `eventyr-store-postgres` behind its `snapshots` feature, mirrored by the umbrella's `snapshots` feature. Single-feed fan-out to N projections on one checkpoint is a combinator over the existing `SubscriptionMachine` — never a new machine — and shipped as `Fanout` in `eventyr-subscription`.
 - **0.4** — shipped: the blocking write driver (`drive_write_blocking` / `drive_write_with_snapshots_blocking` in `eventyr-store`, `drive_projector_blocking` in `eventyr-subscription`), the contract-test crate (`eventyr-store-testing`: `event_store_contract`, `streams_all_contract`, `snapshot_contract`, `event_store_batch_contract` — the eventcore-testing idea as a callable suite, self-tested against the in-memory store and wired to gate the Postgres and fjall stores), the embedded store (`eventyr-store-fjall`: fjall-backed `EventStore`/`StreamsAll`/`SnapshotStore`, serde in the store, no runtime needed to drive), and multi-stream commands (eventcore-style, below).
 
-- **0.5** — **shipped**: no new subsystem, four width pieces — (1) the upcaster registry (`eventyr_core::version_registry`), (2) metadata/correlation made load-bearing at the driver boundary (`with_metadata` on both machines; `execute_with_metadata` on the repository), (3) the `Metrics` port + `tracing` instrumentation behind the `metrics` feature, and (4) **the worked example**: `eventyr/examples/bank.rs` — one domain touching every shipped feature (a derived `Account` aggregate with `Optional` state and payload-shaped events, two metadata-carrying opens, a cross-account transfer on the batch machine, a `Projection` ledger rebuilt off the stream, and the `AmountV1` → `Deposited` rename upcast end to end), runnable as a binary and gated as a test. See below.
-- **0.6** — shipped: sagas, views, SQLite; see §13. **0.7** — in progress (0.7.1–0.7.9 shipped), planned: dynamic consistency boundaries, live push, inline views, erasure, and operational hardening; see §14.
+- **0.5** — **shipped**: no new subsystem, four width pieces — (1) the upcaster registry (`eventyr_core::version_registry`), (2) metadata/correlation made load-bearing at the driver boundary (`with_metadata` on both machines; `execute_with_metadata` on the repository), (3) the `Metrics` port + `tracing` instrumentation behind the `metrics` feature, and (4) **the worked example**: `eventyr/examples/bank.rs` — one domain touching the write-side features (a derived `Account` aggregate with payload-shaped events, two metadata-carrying opens, a cross-account transfer on the batch machine, a `Projection` ledger rebuilt off the stream, and the `AmountV1` → `Deposited` rename upcast end to end), runnable as a binary and gated as a test. Later milestones widened it (snapshots, the idempotent saga, closure, shredding, parking, commit-woken projections); the dynamic-boundary and inline-view pieces have their own focused examples. See below.
+- **0.6** — shipped: sagas, views, SQLite; see §13.
+- **0.7** — shipped (0.7.1–0.7.9): dynamic consistency boundaries, live push, inline views, filtered reads, idempotent commands, lifecycle and erasure, poison-event parking, the read path, projector leases; see §14.
 - **0.8** — planned: running Eventyr across many processes and stores. Checkpoints a stale projector cannot overwrite, a commit-order lock scoped to one store, read-your-writes tokens, event ids and the saga keys built on them, rewind detection, and the Postgres deployment contract; hybrid logical clocks evaluated for order across stores. See §15 and §16.
 - **0.9** — planned, breaking: slices. Order per slice instead of per store, writers concurrent across slices, projectors leasing slices, and DCB conditions scoped by tag. One slice behaves exactly as 0.8. See §16.
 - **0.10** — planned: `ShardedStore` (writers beyond one database, sharded on a tag) and HLC-merged projections. See §16.
@@ -434,15 +520,21 @@ No new subsystem; four width pieces, in order.
 
 0.2 shipped upcast *vocabulary* (`RawEvent`, `Upcaster`) and chains (`eventyr-projection::chain`), and 0.3 shipped the read path over them — but nothing yet *runs* an upcaster against a stored event at read time, and nothing *verifies* a chain is well-formed at startup. 0.5 closes that loop: an **upcaster registry** — the set of upcasters a store/projection knows, indexed by `(event_type, schema_version)` — that both Postgres reads and projection sources consult, and that fails loudly at startup on a broken chain (a gap in versions, a cycle, a name collision). cqrs-es calls these upcasters; esrs calls the whole seam `Schema`. Eventyr keeps §4.4's discipline: upcasting is *data transformation toward the current schema*, decided per event type, never a code migration of stored payloads.
 
-The registry is a plain value, not a machine (one lookup per event is one step — §7 keeps machines for multi-step protocols). It is honest where the chain can't be: `OrphanedType` (a stored event no upcaster selects), `DanglingVersion` (a v2 upcaster with no v1 base), `AmbiguousTarget` (two upcasters writing the same current type). All surface at registration as errors, never as silently-dropped events at read.
+The registry is a plain value, not a machine (one lookup per event is one step — §7 keeps machines for multi-step protocols). It is honest where the chain can't be: registration rejects a `DuplicateRung` (two upcasters writing the same version), a `DanglingVersion` (a v2 upcaster with no v1 base), a `MissingBase` (a v1 that never ran); reads reject `UnknownType`/`UnknownVersion` loudly. All surface as errors, never as silently-dropped events at read.
+
+**Shipped** (with the registry cut down to what a raw source can use): `UpcasterRegistry` lives in `eventyr-projection::registry` and validates a per-type *version ladder*; `eventyr_core::version_registry` carries the `EventSchemaVersion` vocabulary. It is run by `VersionedSource` over a raw `SubscriptionSource` — the only reads that go through it. No store persists a schema version, so no store consults the registry directly (0.6.2's withdrawal note explains why); Postgres reads decode payloads straight into the event enum.
 
 ### 0.5.2 Metadata & correlation — the observability seam
 
-§4.2/§4.3 carry `Metadata { causation_id, correlation_id, timestamp }` end to end, but nothing *produces* them: today the caller grafts ids onto `NewEvent`s by hand. 0.5 adds the read-side/writer-side seam that makes them load-bearing: a `RequestContext` (or `Correlation` vocabulary type) the repository/driver stamps onto every event of an interaction — correlation id of the request, causation id of the event that prompted it — so a whole saga traces one id without the domain carrying it. This is `sourcery`'s envelope-carried metadata done on purpose: ids are protocol vocabulary, produced at the driver boundary, never smuggled into `decide`.
+§4.3 carries `Metadata { causation_id, correlation_id, idempotency_key, timestamp }` end to end, but nothing *produces* them: the caller grafts ids onto `NewEvent`s by hand. 0.5 adds the seam that makes them load-bearing.
 
-### 0.5.3 Runtime metrics & lifecycle hooks — the operations story
+**Shipped** as `with_metadata` on every machine (`WriteMachine`, `BatchMachine`, `BoundaryMachine`, `SagaMachine`) and `execute_with_metadata` on the repository: the caller builds the `Metadata` once per interaction — correlation id of the request, causation id of the event that prompted it — and the machine stamps it onto every event it appends, so a whole interaction traces one id without the domain carrying it. No `RequestContext`/`Correlation` type shipped: the metadata value *is* the context. This is `sourcery`'s envelope-carried metadata done on purpose: ids are protocol vocabulary, produced at the driver boundary, never smuggled into `decide`.
+
+### 0.5.3 Runtime metrics — the operations story
 
 §2 rules out baked-in transports but not *telemetry*. The store buses and the projector runner need `tracing` spans and counters at the protocol boundaries (append latency, conflict-retries, projection lag) or a deployed system is blind. 0.5 adds a thin `Metrics` port — counters/gauges/histograms as a trait, a `tracing` impl behind a feature flag, `NoopMetrics` the default — so instrumenting a store or projector is an option, not a framework takeover. This is the §6 runner's natural companion: the runner is already the seam a production deploy wraps.
+
+**Shipped**: the `Metrics` port lives in core; `TracingMetrics` behind `eventyr-store`'s `tracing` feature (the umbrella's `metrics`). Drivers take it explicitly — `drive_write_with_metrics`, `Projector::with_metrics` — and default to `NoopMetrics`, so nothing is instrumented until asked. No lifecycle hooks shipped; the driver boundary is the hook.
 
 ### 0.5.4 The example — a worked domain end to end
 
@@ -467,23 +559,23 @@ The single structural gap. `esrs` ships first-class `Policies` (fire-and-forget 
 
 ### 0.6.2 — Two-layer schema decoupling (`Schema`/`Persistable` as a named seam)
 
-`esrs`'s one idea Eventyr has only implicitly: a first-class separation between `Aggregate::Event` and what is *stored*. Eventyr's story today is upcasting (`UpcasterRegistry`, `VersionedSource`) — strong on the rename/reshape axis — but the "stored row shape ≠ domain event shape" mapping (explicit serde rename, storage-only fields, drop-a-field) has no named trait. 0.6.2 adds a narrow `Codec`/`Schema` trait per store (not in core): the place where an event's persisted form is declared, so the registry's raw-payload work has a typed entry point instead of living only inside `eventyr-store-postgres`'s JSON columns.
-
-**Withdrawn.** A first cut shipped the traits (`Persistable`, `SchemaCodec`, `DecodeEvent`) and one codec per store, but no store routed its reads or writes through them, and the events table has no column to persist a declared schema version. An unwired seam costs readers more than it saves, so it was removed. It returns only together with a store that uses it end to end: a `schema_version` column, and the Postgres append/read path going through the codec.
+**Withdrawn.** The plan was a narrow per-store `Codec`/`Schema` trait ("stored row shape ≠ domain event shape"). A first cut shipped the traits (`Persistable`, `SchemaCodec`, `DecodeEvent`) and one codec per store, but no store routed its reads or writes through them, and the events table has no column to persist a declared schema version. An unwired seam costs readers more than it saves, so it was removed. It returns only together with a store that uses it end to end: a `schema_version` column, and the Postgres append/read path going through the codec. Until then, upcasting (`UpcasterRegistry`, `VersionedSource`) is the versioning story, scoped to the projection read path (§10).
 
 ### 0.6.3 — A read-model store adapter (`ViewRepository` equivalent)
 
 `cqrs-es`'s most-advertised read-side feature Eventyr entirely lacks: a per-aggregate materialized view, persisted transactionally with the command, in the same database. Eventyr's projection story is deliberately rebuild-first (fold the global stream, checkpoint, done) — which covers analytics and audit, but not the "look it up by id, fast, right after the write" query that makes a CQRS demo feel complete. 0.6.3 adds a `ViewStore` port (a projection whose state *is* a row) and one Postgres implementation, as an alternative read-path driver alongside `RebuildPlan`. Placement: `eventyr-projection`, never core — it is read-side glue per §3.
 
+**Shipped**: `View`/`ViewProjection` over `ViewStore` in `eventyr-projection::view`, with `PgViewStore` (and `SqliteViewStore`, 0.7.3's widening) — one row per `(view_name, view_id)`, newest-wins on the folded sequence, run by the same `Projector` as any other projection. The transactional half (rows written in the append transaction) is 0.7.3's inline views.
+
 ### 0.6.4 — A second durable store: SQLite / the community-store seam
 
-`cqrs-es` ships Postgres, MySQL, and DynamoDB (plus community SQLite); `kameo_es` ships projections over Postgres/SQLite/MongoDB. Eventyr ships Postgres + fjall + in-memory — enough to prove the port, not enough to make "bring your own database" credible. 0.6.4 does *not* ship a third official store; it ships the thing that makes third-party stores safe: the SQLite reference port (`eventyr-store-sqlite`, against `rusqlite`/`sqlx-sqlite`) as a worked example of the contract-test suite, plus the `append_batch`/`StreamsAll` conformance tiers documented. The goal is the seam proven by two shipped databases, not a fourth one to maintain.
+`cqrs-es` ships Postgres, MySQL, and DynamoDB (plus community SQLite); `kameo_es` ships projections over Postgres/SQLite/MongoDB. Eventyr ships Postgres + fjall + in-memory — enough to prove the port, not enough to make "bring your own database" credible. 0.6.4 ships the thing that makes third-party stores safe: the SQLite reference port as a worked example of the contract-test suite, plus the `append_batch`/`StreamsAll` conformance tiers documented. The goal is the seam proven by shipped databases, not another one to maintain.
+
+**Shipped**: `eventyr-store-sqlite` over `rusqlite` — the reference port the plan wanted, passing every contract tier, and a first-party crate (the umbrella's `sqlite` feature) rather than a community example. That makes three durable stores plus in-memory; the "more official stores" item in §14's *Deferred* list still stands.
 
 ### 0.6.5 — Aggregate-state caching as an opt-in policy
 
-`thalo` and `kameo_es` both advertise in-memory aggregate caching (LRU / actor-resident state) as a headline performance feature. Eventyr folds the (optionally snapshot-seeded) stream per command — correct and deterministic, but it means a hot aggregate pays a reload per write. 0.6.5 adds caching *as a snapshot-policy extension*, not a new state store: a `CachePolicy` on the repository that keeps the last-known `Snapshot` in-process and revalidates against the stream's version on write. It is snapshot promotion, not a second source of truth — the write machine already treats snapshots as read-side shortcuts, so the correctness story does not change.
-
-**Resolved without new code.** A first cut seeded decisions from the cached state *without* reading the stream, relying on the append's version check to catch staleness — but rejections and no-ops never append, so they were decided on stale state and returned to the caller, and a failed write left the cache stale permanently. It was removed. The supported shape is the existing snapshot path: `AggregateRepository::with_snapshots` over `InMemorySnapshotStore` with `SnapshotPolicy::new(1)` keeps the latest state in-process and reads only the events since it, so every outcome — commit, rejection, or no-op — is decided against the stream.
+**Resolved without new code.** The plan was a `CachePolicy` keeping the last-known state in-process. The first cut seeded decisions from the cached state *without* reading the stream — but rejections and no-ops never append, so they were decided on stale state, and a failed write left the cache stale permanently; it was removed. The supported shape is the existing snapshot path: `AggregateRepository::with_snapshots` over `InMemorySnapshotStore` with `SnapshotPolicy::new(NonZeroU64::new(1).unwrap())` keeps the latest state in-process and reads only the events since it, so every outcome — commit, rejection, or no-op — is decided against the stream. Caching beyond that stays refused: a cache the write path trusts is a second source of truth (the 0.7.5 keyed command has the same objection to key side-tables).
 
 ### 0.6 — what it is *not*
 
@@ -493,7 +585,7 @@ Still no framework. No HTTP, no lambda, no serverless demo app, no code-generate
 
 §13 compared Eventyr with the aggregate-centric Rust crates. This pass widens the field: the newer Rust crates (`disintegrate`, `happenstance`, `eventcore`, `sourcery`, UmaDB's `umadb-dcb`) and the strongest tools in other ecosystems (Marten, KurrentDB, Eventuous, Emmett, Axon). They agree on one structural shift and several operational pieces that 0.6 does not have. §2 still holds. Message-bus producers and gateways (Eventuous, `esrs`), web-framework glue (Emmett, Eventuous), actor hosting (`kameo_es`), and server-side projection runtimes (KurrentDB's JS projections) were all seen again and are rejected again on the same grounds.
 
-0.7 is planned, not shipped. Items are in priority order, and each names the seam it lands on, because "seam, store, or machine — never a runtime" remains the bar.
+0.7 shipped in nine pieces, each on the seam it names below, because "seam, store, or machine — never a runtime" was the bar. The subsections keep their original plan followed by what actually shipped, where the two differ.
 
 ### 0.7.1 — Dynamic consistency boundaries as a machine
 
@@ -588,9 +680,9 @@ Erasure covers the event log only. Snapshots, view rows, and logs that copied pe
 
 The projector runner backs off and redelivers indefinitely, so one event that a projection cannot apply stalls that projection permanently. KurrentDB parks a message after `maxRetryCount`, and Eventuous wraps handlers in retry policies. 0.7.7 adds a `FailurePolicy` to `SubscriptionPolicy`. `Retry(n)` then `Park` records the event in a `ParkedStore` (in-memory plus SQL, alongside checkpoints) and advances. `Halt` keeps today's behavior and stays the default, because skipping an event is a correctness decision the caller must opt into. Parked events can be listed and replayed. This is a new `SubscriptionMachine` transition, not a second machine.
 
-**Shipped as planned.** `SubscriptionPolicy::on_failure` takes a `FailurePolicy`. `Halt` is the default and keeps today's behaviour: back off and redeliver forever. `Park { retries }` lets the projection reject an event `retries` more times, then emits a new `SubscriptionAction::Park` carrying the envelope, the attempt count, and the last rejection. The driver records it in a `ParkedStore`. On `Parked` the machine carries on past the event exactly as if it had applied, and the batch acks as usual. On `ParkFailed` it backs off and redelivers, so an event is never skipped unless it was durably recorded. Only the projection's rejections count against an event; a failed ack or fetch is the infrastructure's fault, not the event's. An event that later applies resets its count.
+**Shipped, with the parked store narrower than planned.** `SubscriptionPolicy::on_failure` takes a `FailurePolicy`. `Halt` is the default and keeps today's behaviour: back off and redeliver forever. `Park { retries }` lets the projection reject an event `retries` more times, then emits a new `SubscriptionAction::Park` carrying the envelope, the attempt count, and the last rejection. The driver records it in a `ParkedStore`. On `Parked` the machine carries on past the event exactly as if it had applied, and the batch acks as usual. On `ParkFailed` it backs off and redelivers, so an event is never skipped unless it was durably recorded. Only the projection's rejections count against an event; a failed ack or fetch is the infrastructure's fault, not the event's. An event that later applies resets its count.
 
-`ParkedStore` (`park`, `list`, `remove`) lives beside `CheckpointStore` in `eventyr-subscription`, with `InMemoryParkedStore`, `NoParking` (the default: refuses, so nothing is skipped by accident — a `Park` policy over it fails at `run`, and a refusal drove directly counts on `eventyr_park_failures_total`), and a `parked_store_contract` behind the crate's `testing` feature. SQLite gets `SqliteParkedStore` behind a `parked` feature, keeping the whole envelope and its metadata. `Projector::park_into(store, policy)` wires both. The driver reports every park on a new `eventyr_parked_events_total` metric: any value above zero means a projection is missing events, so it is the one to alert on.
+`ParkedStore` (`park`, `list`, `remove`) lives beside `CheckpointStore` in `eventyr-subscription`, with `InMemoryParkedStore`, `NoParking` (the default: refuses, so nothing is skipped by accident — a `Park` policy over it fails at `run`, and a refusal drives the `eventyr_park_failures_total` counter), and a `parked_store_contract` behind the crate's `testing` feature. SQLite gets `SqliteParkedStore` behind a `parked` feature, keeping the whole envelope and its metadata. The planned SQL parked store shipped on SQLite only — Postgres has none yet, so §16.2's "parked events rewind with the database" applies to the SQLite deployment, and a Postgres deployment parks in-process until a `postgres_parked` feature exists. `Projector::park_into(store, policy)` wires both. The driver reports every park on a new `eventyr_parked_events_total` metric: any value above zero means a projection is missing events, so it is the one to alert on.
 
 Replay is the caller's: list the parked events, apply each to the fixed projection, and `remove` it. The end-to-end test does exactly that. The projection must be idempotent, as for any at-least-once delivery. A retry redelivers the batch from the last ack, so the events before a poison one arrive again with it (the test's first draft forgot that and counted them twice).
 
@@ -604,7 +696,7 @@ Replay is the caller's: list the parked events, apply each to the fixed projecti
 
 Nothing stops two copies of the same projector from running against one checkpoint and corrupting the read model. Emmett names this problem and documents a single-replica workaround. Partitioned parallelism stays deferred: hash events by stream id across N members is scheduled only after the lease exists to coordinate them — and Eventuous's out-of-order *checkpoint commit handler* is rejected as a single-checkpoint alternative, because it trades a simple invariant for gap bookkeeping.
 
-**Shipped.** §7's table gains no row — the lease is driver policy, not a machine transition. `ProjectorLease` (`acquire` → `renew` per due `Fetch` and before every `Ack` on the batch boundary, `release` on exit) lives in `eventyr-subscription`; the leased driver is `drive_projector_leased`, a sibling of `drive_projector` taking the lease store and policy, and a new `LeasedProjector` (`Projector::lease_with`/`run_leased`, `.run_woken_leased`, `.caught_up_on(..)`) surfaces the lost lease as `RunError::{Store, LeaseLost { name, checkpoint }, Taken { name }}` — `Taken` on entry, `LeaseLost` mid-run with the last acked checkpoint as the resume point. Nothing touches `SubscriptionMachine`'s protocol. Two implementations ship: `InMemoryLeaseStore` (ungated, for tests and single-process runs) and `PgLeaseStore` behind `eventyr-store-postgres`'s `leases` feature as a `projector_leases` row (migration 0012) — the row, not an advisory lock, because advisory locks are connection-pinned and sqlx pools hand renewals to whichever connection is free (the exact cost `PgCommitSignal`'s dedicated connection pays and its docs flag). SQLite and fjall get no impl this round: SQLite's cross-process exclusivity is a `BEGIN IMMEDIATE` transaction that must stay open — blocking the very read model the lease protects — and fjall is single-process by design. A `LeasePolicy { ttl, grace, max_grace }` (5 s / 3 / 12 ⇒ ≈ one minute of accidental captivity) is set on the projector. The lease deliberately does **not** put a fencing token into `CheckpointStore::store` — that would widen a shipped port and co-locate the checkpoint and lease in one transaction; the residual window is a lease lost mid-batch acking onto a successor's write, which the at-least-once idempotent-apply contract already tolerates. Fencing with a token in the checkpoint row is the documented follow-up. `lease_store_contract` (behind `testing`) is the port's gate.
+**Shipped.** §7's table gains no row — the lease is driver policy, not a machine transition. `ProjectorLease` (`acquire` → `renew` per due `Fetch` and before every `Ack` on the batch boundary, `release` on exit) lives in `eventyr-subscription`; the leased driver is `drive_projector_leased`, a sibling of `drive_projector` taking the lease store and policy, and a new `LeasedProjector` (`Projector::lease_with`/`run_leased`, `lease_with_woken`/`run_woken_leased`, `.caught_up_on(..)`) surfaces the lost lease as `RunError::{Store, LeaseLost { name, checkpoint }, Taken { name }}` — `Taken` on entry, `LeaseLost` mid-run with the last acked checkpoint as the resume point. Nothing touches `SubscriptionMachine`'s protocol. Two implementations ship: `InMemoryLeaseStore` (ungated, for tests and single-process runs) and `PgLeaseStore` behind `eventyr-store-postgres`'s `leases` feature as a `projector_leases` row (migration 0012) — the row, not an advisory lock, because advisory locks are connection-pinned and sqlx pools hand renewals to whichever connection is free (the exact cost `PgCommitSignal`'s dedicated connection pays and its docs flag). SQLite and fjall get no impl this round: SQLite's cross-process exclusivity is a `BEGIN IMMEDIATE` transaction that must stay open — blocking the very read model the lease protects — and fjall is single-process by design. A `LeasePolicy { ttl, grace, max_grace }` (5 s / 3 / 12 ⇒ ≈ one minute of accidental captivity) is set on the projector. The cap binds *any* holder, renewed or not, so even a healthy run ends `LeaseLost` after `ttl × max_grace` — the driver never re-acquires, and a long-lived projector loops on that handover (the crate docs and the distributed example show the shape). The lease deliberately does **not** put a fencing token into `CheckpointStore::store` — that would widen a shipped port and co-locate the checkpoint and lease in one transaction; the residual window is a lease lost mid-batch acking onto a successor's write, which the at-least-once idempotent-apply contract already tolerates. Fencing with a token in the checkpoint row is the documented follow-up. `lease_store_contract` (behind `testing`) is the port's gate.
 
 **Revised in §15.** The follow-up is a compare-and-set checkpoint, not a fencing token: that is what Axon, Marten, and Emmett ship, and none of them uses a monotonic token (§15.3, 0.8.1).
 
@@ -613,7 +705,7 @@ Nothing stops two copies of the same projector from running against one checkpoi
 ### Smaller items
 
 - **Projection testing** — **shipped.** `ProjectionScenario` in `eventyr-subscription` (`over`/`given`/`when`/custom `when_driven`/`then`), the read-side counterpart of `Scenario`: fold the seeded envelopes through the projection and assert on the projection, with no store and no `tokio`. The catch-up pulse is a `Catch` port on the driver (`DriverPorts::caught_up_on`, and the bundled `Projector::caught_up_on(..).run(..)` / `.run_woken(..)`), called at every idle sleep — the shape of Emmett's `whenCaughtUp()` but at the machine's idle boundary, never a wall clock.
-- **Focused examples**: `bank.rs` stays the end-to-end proof — now covering the full shipped surface (snapshots, the saga with its idempotency keys, closure, shredding and erasure, parking and replay, commit-woken projections) with the mirroring suite in `eventyr/tests/bank_story.rs` gating it. The single-topic examples follow the pieces above as they ship, like `sourcery`'s example set: `enrollment.rs` (a DCB decision) and `loan_eligibility.rs` (the narrowed validation query, and the blocking boundary driver) and `inline_view.rs` (inline and async views over SQLite) are shipped, and so is `distributed.rs`: three nodes that each write and each run a replica of one leased projector, run embedded on SQLite and clustered on Postgres (a pool per node) through the same function. It shows what 0.7.9 already gives a multi-node deployment (concurrent writers retrying conflicts, a cross-node retry committing once under its key, a frozen projector losing its lease to a standby, and the view absorbing the batch both applied) and writes 0.8.3's read-your-writes check by hand against `ViewRow::version`. CI runs every example, so their asserts gate merges, not just their compilation.
+- **Focused examples**: `bank.rs` stays the end-to-end proof — now covering the write-side surface it started from plus the pieces that landed around it (snapshots, the saga with its idempotency keys, closure, shredding and erasure, parking and replay, commit-woken projections) with the mirroring suite in `eventyr/tests/bank_story.rs` gating it. The dynamic-consistency-boundary and inline-view pieces live in their own focused examples, and leases have `distributed.rs`. The single-topic examples follow the pieces above as they ship, like `sourcery`'s example set: `enrollment.rs` (a DCB decision) and `loan_eligibility.rs` (the narrowed validation query, and the blocking boundary driver) and `inline_view.rs` (inline and async views over SQLite) are shipped, and so is `distributed.rs`: three nodes that each write and each run a replica of one leased projector, run embedded on SQLite and clustered on Postgres (a pool per node) through the same function. It shows what 0.7.9 already gives a multi-node deployment (concurrent writers retrying conflicts, a cross-node retry committing once under its key, a frozen projector losing its lease to a standby, and the view absorbing the batch both applied) and writes 0.8.3's read-your-writes check by hand against `ViewRow::version`. CI runs every example, so their asserts gate merges, not just their compilation.
 
 ### Deferred
 
@@ -639,7 +731,7 @@ Two things that commonly travel under the CQRS name are refused, now as §2 non-
 
 ### 15.2 What a store is
 
-**A store is one event log with its own global sequence.** Inside one store, every event has a unique `Sequence`, gap-free and in commit order; positions compare inside one store and mean nothing across two. Concretely:
+**A store is one event log with its own global sequence.** Inside one store, every event has a unique `Sequence`, committed in order and never reordered or filled in later; gaps from rolled-back appends or truncation are permanent (§4.2), and no sequence becomes visible before an earlier one (§9's commit-order lock). Positions compare inside one store and mean nothing across two. Concretely:
 
 | Backend | One store is | What shares it |
 |---|---|---|
@@ -710,7 +802,7 @@ Replace "wait until the projector catches up" with a token checked on the read s
 
 The parallelism 0.7.9 deferred until a lease existed. `EventFilter` gains a hash partition (`member` of `count`, selected by a stable hash of the stream id); each member runs its own checkpoint name and its own lease, so nothing in `SubscriptionMachine` changes and no gap bookkeeping appears (Eventuous's commit handler stays rejected, per 0.7.9). Per-stream order holds; order across streams does not, which is what Axon, Akka, and Message DB also give. The open question is the hash: the Postgres and SQLite filtered-read overrides must compute exactly the Rust hash in SQL. Either the hash is defined in SQL-friendly terms, or the append stores a partition bucket column. Changing `count` means a rebuild in the first cut; Axon-style split and merge is deferred.
 
-**Superseded by §16.4.** Slices put the partition into the log itself, so projectors lease slices instead of filtering a shared feed, and changing the number of instances moves leases instead of forcing a rebuild.
+**Superseded by §16.5.** Slices put the partition into the log itself (§16.4), so projectors lease slices instead of filtering a shared feed, and changing the number of instances moves leases instead of forcing a rebuild.
 
 ### 0.8.5 — Saga keys that survive more than one store
 
@@ -747,12 +839,14 @@ Still no framework. No command routing, no cluster membership, no leader electio
 
 ## 16. Horizontal scale: slices, shards, and the consistency boundary
 
+*Status: planned — §16.1–§16.9 is design for 0.9–0.10. Nothing named here (`Position`, `slice_heads`, `EventId`, `ShardedStore`, tag locks) exists in the code yet; §16.2's deployment contract is the one part that is current — it describes today's Postgres store, and the store crate's docs state it.*
+
 The target: Eventyr copes with many concurrent writers and many projectors on every adapter, out of the box, and the same application code runs on an embedded device and in a large cloud deployment. §15 explains why the 0.8 design cannot get there. A gap-free total order needs one sequencer, and every write has to pass through it: Eventyr's commit-order lock, KurrentDB's leader, Axon Server's leader per context. Whatever the sequencer is, it caps write throughput. Every system in the §15 scan that scales writes splits the log and keeps order only within each part (Kafka partitions, SierraDB partitions, Akka slices, Marten tenants, Message DB categories).
 
 So 0.9 changes the core guarantee:
 
-> **0.8:** one gap-free, commit-ordered sequence per store.
-> **0.9:** one gap-free, commit-ordered sequence per *slice*. Across slices, order is causal (§15.5's hybrid logical clock), and only for consumers that ask for it.
+> **0.8:** one commit-ordered sequence per store (gaps permanent, never filled — §4.2).
+> **0.9:** one commit-ordered sequence per *slice*. Across slices, order is causal (§15.5's hybrid logical clock), and only for consumers that ask for it.
 
 **One slice is exactly 0.8.** That is what makes "it shouldn't matter where it runs" true. An embedded deployment runs one slice and sees today's behaviour; a cloud deployment runs many slices and many shards. The domain, the machines, and their guarantees are the same in both; the slice count and the hosting are deployment settings. Every adapter implements slices, and the contract suite and the bank example run at one slice and at many.
 
@@ -768,7 +862,7 @@ So 0.9 changes the core guarantee:
 
 Eventyr's order is only as durable as the commit behind it. A failover that loses commits or a restore from backup rewinds the database to an earlier point in its history. Everything inside the database rewinds with it and stays consistent; anything that took a position outside the database before the rewind is now wrong. The contract, stated in the store's docs:
 
-- **One writable primary per store.** Supported: a single primary with physical replicas (Patroni, CloudNativePG, RDS Multi-AZ) and provisioned Aurora (a promoted replica loses no acknowledged commit). Unsupported: multi-writer or sharded Postgres. EDB PGD's advisory locks are not replicated and it resolves conflicts after commit; Citus sequences carry a node id in their high bits; Aurora Limitless sequences are out of order across routers; CockroachDB and YugabyteDB cache sequences per node or connection. Routing all writes to one node (PGD's write leader, Citus's coordinator) restores the single-writer case for ordering but stays unsupported. Write scaling is §16.6's job, not the database's.
+- **One writable primary per store.** Supported: a single primary with physical replicas (Patroni, CloudNativePG, RDS Multi-AZ) and provisioned Aurora (a promoted replica loses no acknowledged commit). Unsupported: multi-writer or sharded Postgres. EDB PGD's advisory locks are not replicated and it resolves conflicts after commit; Citus sequences carry a node id in their high bits; Aurora Limitless sequences are out of order across routers; CockroachDB and YugabyteDB cache sequences per node or connection. Routing all writes to one node (PGD's write leader, Citus's coordinator) restores the single-writer case for ordering but stays unsupported. Write scaling is §16.4's job (slices), not the database's.
 - **Synchronous replication for failover without loss.** `synchronous_commit = on` or `remote_apply` with a synchronous standby. One residual: if the wait for the standby is cancelled, the transaction is already committed locally and Postgres only warns.
 - **Asynchronous failover can reuse positions.** Postgres logs sequences 32 values ahead, so a promoted standby either skips ahead (a gap) or, if the old primary's last WAL never arrived, hands out the same numbers again for different events. A consumer that saw the lost events resumes past their positions and silently misses the new ones, while keeping the effects of events that no longer exist.
 - **Consumers inside the event store's database are safe.** A physical standby replays the primary's WAL in order, so a promoted standby holds an exact earlier state: if a checkpoint row survived, every event it covers survived too. Checkpoints, view rows, parked events, and leases that live in the event store's database therefore rewind together and stay correct. This is the documented default. Read models in another database, broker messages, emails, saga commands to other stores, and positions handed to clients are outside, and need §16.3's rewind detection.
@@ -783,7 +877,7 @@ Additive, no break; this is the 0.8 half of §16.
 - **Event ids.** Every event gets a random 128-bit id (UUIDv7) assigned store-side at append; core gains the `EventId` value type and stays free of a clock and a random-number generator. 0.7.5 decided against an event id, correctly for a single store: the stream is the record. It breaks once a key crosses into another store or survives a rewind.
 - **Saga keys on event ids.** `idempotency_key` is `"{saga}:{sequence}:{index}"` today. After an asynchronous failover of the source store, a different event can arrive at a reused sequence; its command carries the same key, and a target in another store drops it as already done. `"{saga}:{event_id}:{index}"` cannot collide. A saga whose target is in the same store as its source is unaffected either way: its commands rewind with their trigger.
 - **Rewind detection.** A checkpoint records the last applied event's id beside its position. On resume, the driver reads the event at that position; a different id (or none) means history was rewritten, and the run ends with a new `RunError::HistoryRewritten` instead of diverging silently, as `FailurePolicy::Halt` does for a poison event. In-database checkpoints always pass, by §16.2. Truncation (0.7.6) removes events on purpose, so a store that truncates must report a position it cut as truncated, not missing, or a deliberate cut reads as a rewind. This rides on 0.8.1's checkpoint change.
-- **Store identity** (0.8.2) and the **HLC stamp in metadata** (§15.5) ship in the same phase. Both are inputs to 0.9.
+- **Store identity** (0.8.2) ships with 0.8. The **HLC stamp in metadata** (§15.5) is designed but, per §15.5's status note, not scheduled: it ships when a user runs several stores, in whichever phase that is.
 
 ### 16.4 Slices (0.9)
 
@@ -791,7 +885,7 @@ Additive, no break; this is the 0.8 half of §16.
 
 **Positions.** `Position { store, slice, sequence }` replaces `Sequence` wherever a position leaves the store: checkpoints, tokens, envelopes. Within a slice the sequence is gap-free and commit-ordered, as 0.8's is within a store. `StreamsAll` gains `slices()` and `stream_slice(slice, from)`; `stream_all` stays as the one-slice special case.
 
-**Writers.** A single-stream append serializes only within its slice. On Postgres the slice's sequence moves from an identity column to a `slice_heads` row incremented in the append's transaction. That row lock serializes the slice and is held to commit, replacing the database-wide advisory lock; rollback returns the numbers, so the sequence is gap-free by construction and the 32-value sequence cache disappears. Appends to different slices commit in parallel, and group commit batches their flushes again.
+**Writers.** A single-stream append serializes only within its slice. On Postgres the slice's sequence moves from an identity column to a `slice_heads` row incremented in the append's transaction. That row lock serializes the slice and is held to commit, replacing the database-wide advisory lock; rollback returns the numbers, so a slice's sequence is gap-free by construction and Postgres's 32-value sequence cache disappears — a property 0.8's identity-column store does not have (its gaps are permanent, not filled). Appends to different slices commit in parallel, and group commit batches their flushes again.
 
 **Live push has to change with it.** Postgres's `NOTIFY` takes a database-wide lock at commit (`PreCommit_Notify`), so an append path that notifies on every commit serializes all writers again. With more than one slice, `PgCommitSignal` stops notifying from the append: projectors poll, or a single notifier watches `slice_heads` and raises the hint at most once per interval.
 
@@ -844,7 +938,7 @@ Plain appends never block each other; they wait only while a decision on one of 
 ### 16.9 Phasing
 
 1. **0.8, additive:** CAS checkpoints with rewind detection (0.8.1), a per-store lock and store identity (0.8.2), read-your-writes tokens (0.8.3), event ids and saga keys on them (§16.3), the HLC stamp in metadata, and the deployment contract (§16.2).
-2. **0.9, breaking, behaviour unchanged at one slice:** slices and `Position` in the vocabulary and every adapter; per-slice checkpoints and leases; the Postgres `slice_heads` sequence with per-slice serialization and live push off the append path; DCB's tag locks, `after` vector, and causal fold order.
+2. **0.9, breaking, behaviour unchanged at one slice:** slices and `Position` in the vocabulary and every adapter; per-slice checkpoints and leases; the Postgres `slice_heads` sequence with per-slice serialization and live push off the append path; DCB's tag locks, `after` vector, and causal fold order. (The HLC stamp joins whichever phase first needs it — §15.5.)
 3. **0.10:** `ShardedStore` with shard-tag routing; HLC-merged projections; slice splitting by doubling.
 
 ### 16 — what it is *not*

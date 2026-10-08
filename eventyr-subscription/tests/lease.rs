@@ -129,7 +129,7 @@ async fn a_renewed_lease_stays_held_then_dies_at_max_grace() {
 /// round before it parks; the lease is zero-TTL, lost at that renewal.
 #[tokio::test(start_paused = true)]
 async fn a_lost_lease_stops_the_driver_at_the_last_ack() {
-    use eventyr_core::subscription::FailurePolicy;
+    use eventyr_core::subscription_machine::FailurePolicy;
     use eventyr_subscription::prelude::{InMemoryParkedStore, Projection};
 
     struct Picky;

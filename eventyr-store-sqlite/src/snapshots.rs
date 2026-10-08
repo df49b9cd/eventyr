@@ -1,7 +1,7 @@
 //! The snapshot store over the same connection, behind the
 //! `snapshots` feature: a `snapshots` table with one row per stream,
 //! newest-wins on the stream version — the same contract the Postgres
-//! snapshot store carries (DESIGN §6.3).
+//! snapshot store carries (DESIGN §12, 0.3).
 
 use std::sync::Arc;
 
@@ -30,6 +30,12 @@ impl<S> Clone for SqliteSnapshotStore<S> {
 impl<S> SqliteSnapshotStore<S> {
     /// A snapshot store over the same connection the event store uses —
     /// the snapshots live beside the log.
+    ///
+    /// # Errors
+    ///
+    /// The `snapshots` schema could not be created on the shared
+    /// database (read-only file, a foreign table of the same name, or
+    /// the database locked by another writer).
     pub fn new<E>(store: &SqliteStore<E>) -> Result<Self, SqliteStoreError> {
         let conn = store.conn();
         lock_conn(&conn).execute_batch(

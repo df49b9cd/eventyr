@@ -8,7 +8,7 @@
 //!
 //! Failure is loud by design. An upcast failure maps to
 //! [`StoreError::other`], reaching the machine as
-//! [`Failed`](eventyr_core::subscription::SubscriptionInput::Failed) —
+//! [`Failed`](eventyr_core::subscription_machine::SubscriptionInput::Failed) —
 //! so one poison event wedges the projection, the checkpoint never
 //! moves past it, and the operator fixes the upcaster or the data and
 //! rebuilds (see [`rebuild`](crate::rebuild)). A skip or dead-letter
@@ -17,7 +17,7 @@
 //! contract forbids it.
 
 use eventyr_core::error::StoreError;
-use eventyr_core::subscription::{Batch, Checkpoint};
+use eventyr_core::subscription_machine::{Batch, Checkpoint};
 use eventyr_core::upcast::RawEvent;
 use eventyr_core::vocabulary::Sequence;
 use eventyr_subscription::source::SubscriptionSource;

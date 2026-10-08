@@ -5,7 +5,7 @@
 //! subscriptions require. A store that cannot provide a global stream can
 //! still implement `EventStore` — the split keeps honesty.
 //! [`QueryAppend`] is the opt-in port for dynamic consistency
-//! boundaries (0.7.1): read by query, append under a query condition.
+//! boundaries (roadmap 0.7.1): read by query, append under a query condition.
 
 use core::future::Future;
 use std::vec::Vec;
@@ -27,6 +27,36 @@ use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 /// or none, guarded by the [`ExpectedVersion`] optimistic-concurrency
 /// expectation — a violation is reported as
 /// [`StoreError::Conflict`].
+///
+/// # Examples
+///
+/// Append under `Empty`, then read the stream back from its start —
+/// the returned envelopes carry the positions the store assigned:
+///
+/// ```
+/// # fn main() {
+/// use eventyr_core::envelope::NewEvent;
+/// use eventyr_core::vocabulary::{ExpectedVersion, StreamId, Version};
+/// use eventyr_store::memory::InMemoryStore;
+/// use eventyr_store::store::EventStore;
+/// use futures::executor::block_on;
+/// use futures::TryStreamExt;
+///
+/// let store = InMemoryStore::new();
+/// let stream = StreamId::from("account-1");
+/// let committed = block_on(store.append(
+///     &stream,
+///     ExpectedVersion::Empty,
+///     vec![NewEvent::new("Opened"), NewEvent::new("Credited")],
+/// )).expect("the stream is empty, so Empty holds");
+/// assert_eq!(committed.len(), 2);
+///
+/// // A read from `EMPTY` is exclusive: both events come back.
+/// let read = block_on(store.stream(&stream, Version::EMPTY)
+///     .try_collect::<Vec<_>>()).expect("read");
+/// assert_eq!(read.len(), 2);
+/// # }
+/// ```
 pub trait EventStore {
     /// The domain event type this store persists.
     type Event: Send;
@@ -85,6 +115,41 @@ pub trait EventStore {
 
 /// A store that can also read the global, ordered event stream — the
 /// projection and subscription backbone.
+///
+/// # Examples
+///
+/// Two streams, one global order: `stream_all` walks every stream's
+/// events by global sequence, from a bound onward:
+///
+/// ```
+/// # fn main() {
+/// use eventyr_core::envelope::NewEvent;
+/// use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId};
+/// use eventyr_store::memory::InMemoryStore;
+/// use eventyr_store::store::{EventStore, StreamsAll};
+/// use futures::executor::block_on;
+/// use futures::TryStreamExt;
+///
+/// let store = InMemoryStore::new();
+/// for id in ["a-1", "b-2"] {
+///     block_on(store.append(
+///         &StreamId::from(id),
+///         ExpectedVersion::Empty,
+///         vec![NewEvent::new(id)],
+///     )).expect("append");
+/// }
+///
+/// // From the very beginning: both events, in commit order.
+/// let all = block_on(store.stream_all(Sequence::START)
+///     .try_collect::<Vec<_>>()).expect("read");
+/// assert_eq!(all.len(), 2);
+///
+/// // From after the first: only the second remains.
+/// let rest = block_on(store.stream_all(all[0].sequence)
+///     .try_collect::<Vec<_>>()).expect("read");
+/// assert_eq!(rest.len(), 1);
+/// # }
+/// ```
 pub trait StreamsAll: EventStore {
     /// Stream all events across streams, ordered by global sequence,
     /// from `from` (exclusive) onward.
@@ -104,7 +169,7 @@ pub trait StreamsAll: EventStore {
     ) -> impl Stream<Item = Result<EventEnvelope<Self::Event>, StoreError>> + Send;
 
     /// Read up to `max` events after `from` that `filter` selects, and
-    /// report how far the read scanned (0.7.4).
+    /// report how far the read scanned (roadmap 0.7.4).
     ///
     /// The [`FilteredRead`]'s `scanned` is the highest sequence the read
     /// looked at — delivered, filtered out, or skipped as a gap — so a
@@ -151,7 +216,9 @@ pub trait StreamsAll: EventStore {
     }
 }
 
-/// Which events a filtered global read delivers (0.7.4): those whose
+/// Which events a filtered global read delivers (roadmap 0.7.4).
+///
+/// Those whose
 /// stream id starts with one of `stream_prefixes` (any stream when
 /// empty) *and* whose stored name is one of `event_types` (any type
 /// when empty).
@@ -225,7 +292,7 @@ pub struct FilteredRead<E> {
     pub scanned: Sequence,
 }
 
-/// A store that can end a stream's life (0.7.6): close it to further
+/// A store that can end a stream's life (roadmap 0.7.6): close it to further
 /// appends, or drop the oldest part of its history.
 ///
 /// Neither operation lets a decision see the wrong state. The write
@@ -270,7 +337,7 @@ pub trait StreamLifecycle: EventStore {
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
-/// A store that can serve dynamic consistency boundaries (0.7.1): read
+/// A store that can serve dynamic consistency boundaries (roadmap 0.7.1): read
 /// the events a [`Query`] selects, and append guarded by an
 /// [`AppendCondition`] instead of (only) a stream version.
 ///
@@ -316,7 +383,9 @@ where
 }
 
 /// The optimistic-concurrency check, once: whether a stream at
-/// `current` (0 = absent) satisfies the [`ExpectedVersion`]. Every store
+/// `current` (0 = absent) satisfies the [`ExpectedVersion`].
+///
+/// Every store
 /// answers the same question — the port ships the rule so no store
 /// re-derives it.
 pub fn expected_version_matches(expected: ExpectedVersion, current: u64) -> bool {
@@ -333,6 +402,11 @@ pub fn expected_version_matches(expected: ExpectedVersion, current: u64) -> bool
 /// Every store calls it before touching storage, so the refusal is the
 /// same everywhere and nothing is written. An empty batch and a batch of
 /// distinct streams pass.
+///
+/// # Errors
+///
+/// [`StoreError::Other`] naming the repeated stream when one appears
+/// more than once in the batch.
 pub fn validate_batch<E>(appends: &[StreamAppend<E>]) -> Result<(), StoreError> {
     let mut seen: Vec<&StreamId> = appends.iter().map(|append| &append.stream_id).collect();
     seen.sort_unstable();
@@ -345,11 +419,17 @@ pub fn validate_batch<E>(appends: &[StreamAppend<E>]) -> Result<(), StoreError> 
     }
 }
 
-/// The truncated-read rule (0.7.6), once: a read of `stream_id` from
-/// `from` (exclusive) fails [`StoreError::Truncated`] when it would start
-/// before `first_kept`, the stream's first remaining version (1 for a
-/// stream never truncated). A read that starts at the cut or later is
-/// served.
+/// The truncated-read rule (roadmap 0.7.6), once: a read of `stream_id` from
+/// `from` (exclusive) fails [`StoreError::Truncated`] when it would
+/// start before `first_kept`.
+///
+/// That is the stream's first remaining version (1 for a stream never
+/// truncated); a read that starts at the cut or later is served.
+///
+/// # Errors
+///
+/// [`StoreError::Truncated`] carrying the stream and its first kept
+/// version when the read would fold a partial history.
 pub fn read_starts_before_cut(
     stream_id: &StreamId,
     from: Version,
@@ -375,13 +455,18 @@ pub enum TruncatePlan {
     Cut(u64),
 }
 
-/// The truncation bounds (0.7.6), once: for a stream at `head` whose
+/// The truncation bounds (roadmap 0.7.6), once: for a stream at `head` whose
 /// first kept version is `first_kept` (1 if never truncated), truncating
 /// before `cut` is
 ///
 /// - an error past `head + 1` — there is nothing there to keep;
 /// - a no-op at or below `first_kept` — truncation never un-truncates;
 /// - otherwise a cut at `cut`.
+///
+/// # Errors
+///
+/// [`StoreError::Other`] naming the stream when `cut` lies past the
+/// stream's end — there is nothing there to keep.
 pub fn plan_truncate(
     stream_id: &StreamId,
     head: u64,
@@ -412,7 +497,9 @@ pub fn sql_position(position: u64) -> i64 {
 }
 
 /// Keep what `query` selects (and every error, so a corrupt row is never
-/// silently skipped). Tags are a pure function of the payload, so a tag
+/// silently skipped).
+///
+/// Tags are a pure function of the payload, so a tag
 /// column written at append time would be wrong for every event stored
 /// before it existed; matching the decoded event is correct on any
 /// history. The stores that prefilter by event type call this on the
@@ -437,10 +524,17 @@ pub fn all_events<E: Clone>(committed: &[CommittedStream<E>]) -> Vec<EventEnvelo
 
 /// The fallback [`EventStore::append_batch`] for stores that cannot
 /// commit atomically across streams: an empty batch commits nothing, a
-/// single-stream batch delegates to [`append`](EventStore::append), and
-/// a multi-stream batch fails [`StoreError::Other`] — a store that
+/// single-stream batch delegates to [`append`](EventStore::append).
+///
+/// A multi-stream batch fails [`StoreError::Other`] — a store that
 /// cannot commit atomically across streams says so rather than
 /// pretending.
+///
+/// # Errors
+///
+/// [`StoreError::Other`] for a batch naming a stream more than once or
+/// for a multi-stream batch (this store cannot commit one atomically);
+/// the delegated single-stream append's own errors pass through.
 pub async fn append_batch_fallback<S: EventStore + ?Sized>(
     store: &S,
     appends: Vec<StreamAppend<S::Event>>,

@@ -136,7 +136,7 @@ pub trait Decide<E, Err>: Send {
 /// the machine destructures it. Every event is paired with its stream
 /// at construction, so an event without a target cannot be expressed.
 /// The machine stamps the interaction's
-/// [`Metadata`] on every event at emit time (0.5.2): the domain decides
+/// [`Metadata`] on every event at emit time (roadmap 0.5.2): the domain decides
 /// which events, the boundary decides why.
 ///
 /// [`BatchDecision`] and
@@ -343,7 +343,7 @@ pub enum BatchOutcome<E, Err> {
         /// One entry per requested append, as the store recorded it.
         committed: Vec<CommittedStream<E>>,
     },
-    /// The batch carried an idempotency key (0.7.5) whose earlier commit
+    /// The batch carried an idempotency key (roadmap 0.7.5) whose earlier commit
     /// is already in the boundary: nothing was decided or appended.
     /// `committed` lists, per stream, the events that commit appended.
     AlreadyCommitted {
@@ -401,13 +401,13 @@ pub struct BatchMachine<E, Err, D: Decide<E, Err>> {
     /// The streams still expected to answer the current `LoadStreams`.
     pending: alloc::collections::BTreeSet<StreamId>,
     /// The metadata stamped onto every event this interaction emits
-    /// (0.5.2): set by [`with_metadata`](Self::with_metadata), applied
+    /// (roadmap 0.5.2): set by [`with_metadata`](Self::with_metadata), applied
     /// to each `StreamAppend`'s events at emit time.
     metadata: Metadata,
     /// Loaded events carrying the interaction's idempotency key, per
     /// stream: the earlier commit, when the batch has run before. A
     /// batch commits atomically, so finding its key in any boundary
-    /// stream means the whole batch committed (0.7.5).
+    /// stream means the whole batch committed (roadmap 0.7.5).
     earlier: BTreeMap<StreamId, Vec<EventEnvelope<E>>>,
 }
 
@@ -555,7 +555,7 @@ where
 
 impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
     /// Builder-style: the metadata stamped on every event this batch
-    /// emits (0.5.2), applied to each `StreamAppend` at emit time. Set
+    /// emits (roadmap 0.5.2), applied to each `StreamAppend` at emit time. Set
     /// before [`start`](Self::start); causation/correlation are boundary
     /// concerns, never the domain's.
     pub fn with_metadata(mut self, metadata: Metadata) -> Self {
@@ -949,7 +949,7 @@ mod tests {
         })
     }
 
-    // -- idempotency keys (0.7.5) -----------------------------------------
+    // -- idempotency keys (roadmap 0.7.5) -----------------------------------------
 
     #[test]
     fn for_aggregates_names_the_same_boundary_as_new() {

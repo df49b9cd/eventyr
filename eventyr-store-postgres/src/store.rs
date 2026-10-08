@@ -28,13 +28,13 @@ use std::sync::Arc;
 use eventyr_projection::inline::{InlineView, InlineViews};
 
 /// An [`EventStore`] over Postgres, via sqlx, for one event enum `E` —
-/// and, for [`Tagged`] events, [`QueryAppend`] (0.7.1).
+/// and, for [`Tagged`] events, [`QueryAppend`] (roadmap 0.7.1).
 ///
 /// Shareable and cloneable (it wraps a [`PgPool`]): the pool owns the
 /// connection count; the store holds no other state.
 pub struct PgStore<E> {
     pool: PgPool,
-    /// Views folded inside every append transaction (0.7.3).
+    /// Views folded inside every append transaction (roadmap 0.7.3).
     #[cfg(feature = "views")]
     inline_views: InlineViews<E>,
     _event: std::marker::PhantomData<fn() -> E>,
@@ -63,7 +63,7 @@ impl<E> PgStore<E> {
         }
     }
 
-    /// Maintain `views` inline (0.7.3): every append folds its committed
+    /// Maintain `views` inline (roadmap 0.7.3): every append folds its committed
     /// events into the views' rows in the `views` table, inside the
     /// append's transaction. A row that cannot be written fails the
     /// append. Read the rows with [`PgViewStore`](crate::views::PgViewStore)
@@ -114,6 +114,27 @@ impl<E> PgStore<E> {
     }
 
     /// Build a pool and run the migration.
+    ///
+    /// # Errors
+    ///
+    /// The pool could not connect (bad URL, database unreachable,
+    /// authentication refused), or a migration failed — the schema is
+    /// half-applied only in the sense sqlx records: applied migrations
+    /// stay applied, and a retry resumes where it stopped.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+    /// use eventyr_store_postgres::PgStore;
+    ///
+    /// // Connect, migrate, and the store assumes the schema.
+    /// let store: PgStore<String> = PgStore::connect(
+    ///     "postgres://eventyr:eventyr@localhost:5432/eventyr"
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn connect(url: &str) -> Result<Self, PgStoreError> {
         let pool = PgPool::connect(url).await?;
         migrate(&pool).await?;
@@ -131,6 +152,13 @@ impl<E> PgStore<E> {
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// Run the migrations against a pool.
+///
+/// # Errors
+///
+/// A migration failed against the database: a rejected DDL statement,
+/// a conflicting existing table (`_sqlx_migrations` already held by
+/// another tool — see the crate docs on schemas), or a connection
+/// failure mid-run. Applied migrations stay applied; a retry resumes.
 pub async fn migrate(pool: &PgPool) -> Result<(), PgStoreError> {
     MIGRATOR.run(pool).await?;
     Ok(())
@@ -588,7 +616,7 @@ where
         })
     }
 
-    /// Filter in the database (0.7.4). Two queries, one snapshot each:
+    /// Filter in the database (roadmap 0.7.4). Two queries, one snapshot each:
     /// the scan bound is the `scan_limit`-th row after `from` (or the
     /// head, if nearer), and the events are the matching rows up to that
     /// bound. The bound is read first, so a commit landing between the

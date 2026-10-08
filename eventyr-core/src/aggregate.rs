@@ -66,6 +66,12 @@ pub trait Aggregate {
     /// failures. Anything the decision needs from the environment (time,
     /// catalogs) belongs in the command payload or a context type, not in
     /// the environment.
+    ///
+    /// # Errors
+    ///
+    /// The aggregate's own domain rejection — `Self::Error`, the
+    /// command refused against the folded state, never a store or
+    /// transport failure.
     fn decide(
         state: &Self::State,
         command: &Self::Command,

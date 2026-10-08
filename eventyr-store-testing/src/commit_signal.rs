@@ -1,4 +1,4 @@
-//! The [`CommitSignal`] contract checks (0.7.2).
+//! The [`CommitSignal`] contract checks (roadmap 0.7.2).
 //!
 //! A store that raises a commit signal proves it here: a commit
 //! resolves an armed listener, a commit made before the wait is not

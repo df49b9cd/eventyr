@@ -10,9 +10,9 @@
 //! and [`CheckpointStore`](eventyr_subscription::checkpoint::CheckpointStore)
 //! ports).
 //!
-//! DESIGN.md §3's old stub called this crate "projector runner shell,
-//! checkpointing" — that scope shipped as `eventyr-subscription`. What
-//! remains here is what §9 makes first-class: versioning on the read
+//! DESIGN.md's crate layout gives this crate the read path's
+//! correctness layer — the projector runner itself shipped as
+//! `eventyr-subscription`. What remains here is versioning on the read
 //! path. `eventyr-core` ships [`Upcaster`](eventyr_core::upcast::Upcaster)
 //! / [`RawEvent`](eventyr_core::upcast::RawEvent) /
 //! [`UpcastError`](eventyr_core::error::UpcastError), and nothing read
@@ -36,6 +36,14 @@
 //!   (`"name@v{N}"`), so a schema bump starts fresh with zero changes
 //!   to the checkpoint port, and the old version's checkpoint remains
 //!   for rollback.
+//!
+//! ## Cargo features
+//!
+//! - `inline` — inline views (roadmap 0.7.3): the store-agnostic fold the
+//!   durable stores run inside their append transactions; JSON is the
+//!   erasure boundary.
+//! - `testing` — the `ViewStore` contract, for view-store
+//!   implementations' tests; not for production builds.
 //!
 //! ## Read models are plain `Projection` impls
 //!
@@ -122,6 +130,7 @@
 //! # }
 //! ```
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 pub mod chain;
 #[cfg(feature = "inline")]
 pub mod inline;

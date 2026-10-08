@@ -37,11 +37,17 @@
 //! the suites; the `serde` feature derives their serialization, for
 //! stores that persist events.
 //!
+//! ## Cargo features
+//!
+//! - `serde` — serde derives on the fixture events (`PayloadEvent`,
+//!   `ParityEvent`), so durable stores can run the contracts on them.
+//!
 //! The checks exercise the machine-visible protocol only — versions,
 //! sequences, expectations, ordering — because that is the contract: a
 //! machine-driven driver must be unable to tell a conforming store
 //! from the in-memory one.
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 mod batch_store;
 mod commit_signal;
 mod event_store;

@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS events (
     created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE (stream_id, stream_version)
 );
--- Stream lifecycle (0.7.6): a row only for streams that were closed or
+-- Stream lifecycle (roadmap 0.7.6): a row only for streams that were closed or
 -- truncated. `head` keeps a truncated stream's version when its rows
 -- are gone; `first_kept` is the first version left.
 CREATE TABLE IF NOT EXISTS stream_lifecycle (
@@ -54,8 +54,10 @@ const EVENT_COLUMNS: &str = "global_sequence, stream_id, stream_version, payload
 const PAGE: usize = 512;
 
 /// An embedded [`EventStore`] and [`StreamsAll`] over SQLite, via
-/// rusqlite — and, for [`Tagged`] events, [`QueryAppend`] (0.7.1),
-/// answered by scanning the log. Its [`CommitSignal`] (0.7.2) wakes
+/// rusqlite — and, for [`Tagged`] events, [`QueryAppend`] (roadmap 0.7.1),
+/// answered by scanning the log.
+///
+/// Its [`CommitSignal`] (roadmap 0.7.2) wakes
 /// subscribers on commits made through this store or its clones;
 /// another connection writing the same file is seen at the next timed
 /// poll.
@@ -72,10 +74,10 @@ const PAGE: usize = 512;
 /// one store handle to see all its writes).
 pub struct SqliteStore<E> {
     conn: Arc<Mutex<rusqlite::Connection>>,
-    /// Views folded inside every append transaction (0.7.3).
+    /// Views folded inside every append transaction (roadmap 0.7.3).
     #[cfg(feature = "views")]
     inline_views: eventyr_projection::inline::InlineViews<E>,
-    /// Raised after every commit (0.7.2); shared by clones.
+    /// Raised after every commit (roadmap 0.7.2); shared by clones.
     signal: LocalCommitSignal,
     _event: std::marker::PhantomData<fn() -> E>,
 }
@@ -94,12 +96,73 @@ impl<E> Clone for SqliteStore<E> {
 
 impl<E> SqliteStore<E> {
     /// Open (or create) a store at `path`, migrating the schema.
+    ///
+    /// The connection carries SQLite's defaults: rollback journal, no
+    /// busy timeout. For a second process touching the same file — or
+    /// any multi-threaded app with its own readers — open with
+    /// [`from_connection`](Self::from_connection) instead and set the
+    /// pragmas yourself: `journal_mode = WAL` and
+    /// `busy_timeout = <ms>` are the ones that keep a concurrent writer
+    /// from surfacing as [`StoreError::Unavailable`].
+    ///
+    /// # Errors
+    ///
+    /// The database file could not be opened (missing directory,
+    /// permissions, a corrupt or non-SQLite file), or the schema
+    /// migration failed on it.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, SqliteStoreError> {
         let conn = rusqlite::Connection::open(path)?;
         Self::from_connection(conn)
     }
 
     /// An in-memory store: tests, examples, the contract suite.
+    ///
+    /// # Examples
+    ///
+    /// Append, then read the same event back from the global stream —
+    /// the futures resolve immediately, so a plain `block_on` drives
+    /// the round trip with no runtime:
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use eventyr_core::envelope::NewEvent;
+    /// use eventyr_core::event_name::EventName;
+    /// use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
+    /// use eventyr_store::store::{EventStore, StreamsAll};
+    /// use eventyr_store_sqlite::SqliteStore;
+    /// use futures::executor::block_on;
+    /// use futures::TryStreamExt;
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// // Any serde enum; the payload column holds its JSON.
+    /// #[derive(Clone, Serialize, Deserialize)]
+    /// enum LedgerEvent { Credited { amount: u64 } }
+    /// impl EventName for LedgerEvent {
+    ///     fn event_name(&self) -> &'static str { "Credited" }
+    /// }
+    ///
+    /// let store = SqliteStore::<LedgerEvent>::open_in_memory()?;
+    /// let committed = block_on(store.append(
+    ///     &StreamId::from("ledger-1"),
+    ///     ExpectedVersion::Empty,
+    ///     vec![NewEvent::new(LedgerEvent::Credited { amount: 50 })],
+    /// ))?;
+    /// assert_eq!(committed[0].version, Version::new(1));
+    ///
+    /// // Read it back from the global stream: the same event, folded
+    /// // out of the JSON column.
+    /// let read = block_on(store.stream_all(Sequence::START)
+    ///     .try_collect::<Vec<_>>())?;
+    /// assert_eq!(read.len(), 1);
+    /// assert_eq!(read[0].version, Version::new(1));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The in-memory database could not be created — the schema
+    /// migration has nothing to fail on a fresh `:memory:` database.
     pub fn open_in_memory() -> Result<Self, SqliteStoreError> {
         let conn = rusqlite::Connection::open_in_memory()?;
         Self::from_connection(conn)
@@ -108,6 +171,12 @@ impl<E> SqliteStore<E> {
     /// Wrap an existing connection: the caller owns pragmas (WAL,
     /// busy_timeout, foreign keys); the store only owns the schema its
     /// tables stand on. Run on the same connection the app reads with.
+    ///
+    /// # Errors
+    ///
+    /// The schema migration failed on the connection's database: a
+    /// corrupt or foreign `events` table, or a database the store's
+    /// DDL was refused on (read-only file, locked by another writer).
     pub fn from_connection(conn: rusqlite::Connection) -> Result<Self, SqliteStoreError> {
         conn.execute_batch(SCHEMA)?;
         // Databases created before 0.7.5 lack the column.
@@ -130,7 +199,7 @@ impl<E> SqliteStore<E> {
         })
     }
 
-    /// Maintain `views` inline (0.7.3): every append folds its committed
+    /// Maintain `views` inline (roadmap 0.7.3): every append folds its committed
     /// events into the views' rows in the `views` table, inside the
     /// append's transaction, and a row that cannot be written fails the
     /// append. Read the rows with [`SqliteViewStore`](crate::SqliteViewStore).
@@ -548,7 +617,7 @@ where
         iter(GlobalPages::new(Arc::clone(&self.conn), from))
     }
 
-    /// Filter in the database (0.7.4): one connection, so the scan bound
+    /// Filter in the database (roadmap 0.7.4): one connection, so the scan bound
     /// and the matching rows come from the same state. The bound is the
     /// `scan_limit`-th row after `from` (or the head, if nearer).
     async fn stream_all_filtered(

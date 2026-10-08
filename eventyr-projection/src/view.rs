@@ -76,7 +76,7 @@ pub struct ViewRow<V> {
 ///
 /// `view_name` scopes the model ("balance", "statement_by_owner");
 /// `view_id` names the row inside it. The contract mirrors the
-/// snapshot port's (DESIGN §6.3): a save behind the stored sequence is
+/// snapshot port's (DESIGN §12, 0.3): a save behind the stored sequence is
 /// dropped, never written over it — out-of-order offers from
 /// overlapping rebuild-and-follow runs cannot regress a row.
 pub trait ViewStore<V>: Send + Sync {
@@ -373,6 +373,13 @@ mod tests {
 /// save is stale too: it is the same event re-folded. `value_of` maps a
 /// version to the row value the assertions expect back — one value per
 /// version, so they can tell them apart.
+///
+/// # Panics
+///
+/// When the store broke the newest-wins contract: an unknown row did
+/// not load `None`, a saved row did not load back, a newer save did not
+/// replace, or a stale save regressed a row. The message names the
+/// broken check.
 #[cfg(any(test, feature = "testing"))]
 pub fn view_store_contract<V, S>(make_store: impl Fn() -> S, value_of: impl Fn(u64) -> V)
 where

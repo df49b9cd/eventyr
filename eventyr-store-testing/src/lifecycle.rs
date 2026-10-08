@@ -1,4 +1,4 @@
-//! The [`StreamLifecycle`] contract checks (0.7.6).
+//! The [`StreamLifecycle`] contract checks (roadmap 0.7.6).
 //!
 //! A store that can close and truncate streams proves it here: a closed
 //! stream refuses every append (single, batch, empty, and — through
@@ -249,7 +249,9 @@ where
 }
 
 /// Run the lifecycle checks of the conditional append path against
-/// `make_store`'s fresh stores: a store that implements both
+/// `make_store`'s fresh stores.
+///
+/// A store that implements both
 /// [`StreamLifecycle`] and [`QueryAppend`] proves that `append_if`
 /// refuses a closed stream like every other append path, atomically.
 ///

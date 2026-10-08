@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::OptionalExtension;
 
 use eventyr_core::error::StoreError;
-use eventyr_core::subscription::Checkpoint;
+use eventyr_core::subscription_machine::Checkpoint;
 use eventyr_core::vocabulary::Sequence;
 use eventyr_store::store::sql_position;
 use eventyr_subscription::checkpoint::CheckpointStore;
@@ -35,6 +35,12 @@ pub struct SqliteCheckpointStore {
 
 impl SqliteCheckpointStore {
     /// A checkpoint store beside an event store, on its connection.
+    ///
+    /// # Errors
+    ///
+    /// The `checkpoints` schema could not be created on the shared
+    /// database (read-only file, a foreign table of the same name, or
+    /// the database locked by another writer).
     pub fn beside<E>(store: &crate::SqliteStore<E>) -> Result<Self, SqliteStoreError> {
         let conn = store.conn();
         lock_conn(&conn).execute_batch(SCHEMA)?;
@@ -42,6 +48,12 @@ impl SqliteCheckpointStore {
     }
 
     /// A checkpoint store on its own connection.
+    ///
+    /// # Errors
+    ///
+    /// The `checkpoints` schema could not be created on the
+    /// connection's database (read-only file, a foreign table of the
+    /// same name, or the database locked by another writer).
     pub fn from_connection(conn: rusqlite::Connection) -> Result<Self, SqliteStoreError> {
         conn.execute_batch(SCHEMA)?;
         Ok(Self {

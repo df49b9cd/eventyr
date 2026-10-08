@@ -22,7 +22,7 @@
 //!   it elapses.
 //! - **`Shutdown`**: graceful stop — drains the in-flight batch, acks,
 //!   and ends at [`Stopped`](SubscriptionOutcome::Stopped).
-//! - **`Park`** (0.7.7): under [`FailurePolicy::Park`], an event the
+//! - **`Park`** (roadmap 0.7.7): under [`FailurePolicy::Park`], an event the
 //!   projection keeps rejecting is handed to the driver as
 //!   [`Park`](SubscriptionAction::Park); the driver records it and
 //!   answers [`Parked`](SubscriptionInput::Parked) — the machine carries
@@ -110,7 +110,7 @@ pub struct Batch<E> {
     /// Highest sequence in `events`: the ack target. `None` exactly when
     /// `events` is empty (a caught-up poll acknowledges nothing).
     pub upper: Option<Checkpoint>,
-    /// How far a *filtered* source scanned (0.7.4): every sequence up to
+    /// How far a *filtered* source scanned (roadmap 0.7.4): every sequence up to
     /// here was delivered, filtered out, or is a permanent gap. `None`
     /// for unfiltered sources, where the scan ends at `upper`.
     ///
@@ -185,13 +185,13 @@ pub struct SubscriptionPolicy {
     /// subscription that stopped merely because it caught up would make
     /// `is_done` mean the wrong thing for the perennial case.
     pub stop_at_catch_up: bool,
-    /// What to do with an event the projection keeps rejecting (0.7.7).
+    /// What to do with an event the projection keeps rejecting (roadmap 0.7.7).
     /// [`Halt`](FailurePolicy::Halt), the default, retries it forever.
     pub on_failure: FailurePolicy,
 }
 
 /// What a subscription does with an event its projection keeps
-/// rejecting (0.7.7).
+/// rejecting (roadmap 0.7.7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FailurePolicy {
     /// Back off and redeliver forever: the projection stalls on the
@@ -265,7 +265,7 @@ pub enum SubscriptionAction<E> {
         /// The event to fold.
         envelope: EventEnvelope<E>,
     },
-    /// Record `envelope` as parked (0.7.7): the projection rejected it
+    /// Record `envelope` as parked (roadmap 0.7.7): the projection rejected it
     /// `attempts` times and the [`FailurePolicy`] gave up on it. Answer
     /// [`Parked`](SubscriptionInput::Parked) once it is durably
     /// recorded — the machine then carries on past it — or
@@ -289,7 +289,7 @@ pub enum SubscriptionAction<E> {
     ///
     /// `reason` tells the driver whether the wait may end early: an
     /// [`Idle`](SleepReason::Idle) wait exists only because nothing new
-    /// was visible, so a driver that learns of a commit (0.7.2's commit
+    /// was visible, so a driver that learns of a commit (roadmap 0.7.2's
     /// signal) may report `Slept` at once; a
     /// [`Backoff`](SleepReason::Backoff) is the retry delay after a
     /// failure and must run its course — new events are no reason to
@@ -336,14 +336,14 @@ pub enum SubscriptionInput<E> {
     /// [`FailurePolicy::Halt`] the machine sleeps and re-fetches from the
     /// last ack, so the offending (and any later) event redelivers — the
     /// at-least-once contract. Under [`FailurePolicy::Park`] the machine
-    /// counts consecutive rejections of the same event (0.7.7) and, once
+    /// counts consecutive rejections of the same event (roadmap 0.7.7) and, once
     /// the budget is spent, emits [`Park`](SubscriptionAction::Park)
     /// carrying this `error` instead of backing off.
     ApplyFailed {
         /// Why the projection rejected the event, rendered for logging.
         error: StoreError,
     },
-    /// The parked event was recorded (0.7.7).
+    /// The parked event was recorded (roadmap 0.7.7).
     Parked,
     /// Recording the parked event failed. The event is not skipped:
     /// the machine backs off and redelivers, as for a rejection. The
@@ -455,7 +455,7 @@ enum Stopping {
 }
 
 /// The event the projection last rejected, and how many times in a row
-/// (0.7.7).
+/// (roadmap 0.7.7).
 #[derive(Clone, Copy)]
 struct Failing {
     /// The rejected event's global position.
@@ -499,7 +499,7 @@ pub struct SubscriptionMachine<E> {
     /// Whether a shutdown was requested, and whether its closing
     /// attempt already failed once.
     stopping: Stopping,
-    /// The event the projection last rejected (0.7.7). Survives
+    /// The event the projection last rejected (roadmap 0.7.7). Survives
     /// redelivery; cleared once the event applies or is parked.
     failing: Option<Failing>,
 }
@@ -608,7 +608,7 @@ impl<E: Clone> SubscriptionMachine<E> {
             last = sequence;
         }
         // A filtered source may have scanned past its last delivery
-        // (0.7.4). The scan bound may not trail the deliveries, and a
+        // (roadmap 0.7.4). The scan bound may not trail the deliveries, and a
         // scan that went nowhere is no progress.
         let scanned = match (batch.scanned, batch.upper) {
             (Some(scanned), Some(upper)) if scanned < upper => {
@@ -1456,7 +1456,7 @@ mod tests {
                     batch: batch(events),
                 }
             }),
-            // Filtered polls (0.7.4): a scan bound anywhere, valid or not.
+            // Filtered polls (roadmap 0.7.4): a scan bound anywhere, valid or not.
             (arb_sequence(), 0usize..3, arb_sequence()).prop_map(|(start, len, scanned)| {
                 let events: Vec<_> = (0..len as u64).map(|i| envelope(start + i + 1)).collect();
                 SubscriptionInput::Fetched {
@@ -1482,7 +1482,7 @@ mod tests {
         .boxed()
     }
 
-    // -- filtered sources (0.7.4) ---------------------------------------
+    // -- filtered sources (roadmap 0.7.4) ---------------------------------------
 
     fn at(sequence: u64) -> Checkpoint {
         Checkpoint::new(Sequence::new(sequence))
@@ -1602,7 +1602,7 @@ mod tests {
         assert!(is_protocol_violation(&action));
     }
 
-    // -- poison events (0.7.7) ----------------------------------------
+    // -- poison events (roadmap 0.7.7) ----------------------------------------
 
     fn parking(retries: u32) -> SubscriptionMachine<AccountEvent> {
         SubscriptionMachine::new(

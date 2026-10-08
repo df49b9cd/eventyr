@@ -149,7 +149,7 @@ pub enum WriteOutcome<E, Err, S = ()> {
         /// The post-commit snapshot offer, when the policy fired.
         snapshot: Option<OfferSnapshot<S>>,
     },
-    /// The command carried an idempotency key (0.7.5) and the stream
+    /// The command carried an idempotency key (roadmap 0.7.5) and the stream
     /// already holds the events of an earlier commit with that key:
     /// nothing was decided or appended. `committed` is that earlier
     /// commit, as stored.
@@ -308,7 +308,7 @@ pub struct WriteMachine<A: Aggregate, S = ()> {
     /// The metadata stamped onto every event this interaction emits.
     /// Set once at construction (or via [`with_metadata`](Self::with_metadata));
     /// the domain's `decide` never sees it — causation/correlation are
-    /// boundary concerns, not domain ones (0.5.2).
+    /// boundary concerns, not domain ones (roadmap 0.5.2).
     metadata: Metadata,
     retries: RetryBudget,
     /// Off, or on with its baseline, cadence, and hooks.
@@ -320,7 +320,7 @@ pub struct WriteMachine<A: Aggregate, S = ()> {
     /// across an interaction.
     version: Version,
     /// Loaded events carrying this interaction's idempotency key: the
-    /// earlier commit, when the command has run before (0.7.5).
+    /// earlier commit, when the command has run before (roadmap 0.7.5).
     earlier: Vec<EventEnvelope<A::Event>>,
 }
 
@@ -395,7 +395,7 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
     /// full stream read. Idempotent until the first
     /// [`handle`](Self::handle).
     ///
-    /// A keyed interaction (0.7.5) skips the snapshot and loads the whole
+    /// A keyed interaction (roadmap 0.7.5) skips the snapshot and loads the whole
     /// stream: an earlier commit with the key may lie before the
     /// snapshot, where a delta load would never see it. The commit may
     /// still offer a snapshot.
@@ -427,7 +427,7 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
     }
 
     /// Builder-style: set the metadata stamped on every emitted event
-    /// (0.5.2). Construct with [`new`](Self::new) /
+    /// (roadmap 0.5.2). Construct with [`new`](Self::new) /
     /// [`with_snapshots`](Self::with_snapshots), then call this before
     /// [`start`](Self::start). Causation/correlation are boundary
     /// concerns — set here, never inside `decide`.
@@ -632,7 +632,7 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
                 self.phase = Phase::Appending;
                 let expected = ExpectedVersion::after(self.version);
                 // Stamp the interaction's metadata on every event the
-                // decision produced (0.5.2). The domain decided which
+                // decision produced (roadmap 0.5.2). The domain decided which
                 // events; the boundary decided *why* (correlation,
                 // causation).
                 let metadata = self.metadata.clone();
@@ -1340,7 +1340,7 @@ mod tests {
         .boxed()
     }
 
-    // -- idempotency keys (0.7.5) -----------------------------------------
+    // -- idempotency keys (roadmap 0.7.5) -----------------------------------------
 
     fn keyed(key: &str, version: u64, event: AccountEvent) -> EventEnvelope<AccountEvent> {
         EventEnvelope {

@@ -331,7 +331,7 @@ pub enum BoundaryOutcome<E, Err> {
         /// One entry per requested append, as the store recorded it.
         committed: Vec<CommittedStream<E>>,
     },
-    /// The decision carried an idempotency key (0.7.5) and the events
+    /// The decision carried an idempotency key (roadmap 0.7.5) and the events
     /// its query reads include an earlier commit with that key: nothing
     /// was decided or appended. `committed` is the earlier commit's
     /// events the query selected — only those: a boundary decision sees
@@ -381,7 +381,7 @@ pub struct BoundaryMachine<D: Decision> {
     /// re-decide that follows.
     acknowledged: Sequence,
     metadata: Metadata,
-    /// Read events carrying the interaction's idempotency key (0.7.5).
+    /// Read events carrying the interaction's idempotency key (roadmap 0.7.5).
     earlier: Vec<EventEnvelope<D::Event>>,
 }
 
@@ -404,7 +404,7 @@ impl<D: Decision> BoundaryMachine<D> {
     }
 
     /// Builder-style: the metadata stamped on every event this
-    /// interaction appends (0.5.2). Set before [`start`](Self::start).
+    /// interaction appends (roadmap 0.5.2). Set before [`start`](Self::start).
     pub fn with_metadata(mut self, metadata: Metadata) -> Self {
         self.metadata = metadata;
         self
@@ -562,8 +562,9 @@ impl<D: Decision> BoundaryMachine<D> {
     }
 }
 
-/// Reusable fixture: course enrollment — the canonical DCB example. A
-/// student may enroll in a course while the course has seats and the
+/// Reusable fixture: course enrollment — the canonical DCB example.
+///
+/// A student may enroll in a course while the course has seats and the
 /// student holds fewer than [`MAX_COURSES`](enrollment::MAX_COURSES)
 /// courses: one invariant per tag, two tags per decision, and no
 /// aggregate owning both.

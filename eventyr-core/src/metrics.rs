@@ -59,13 +59,15 @@ pub mod names {
     pub const SNAPSHOTS: &str = "eventyr_snapshots_total";
     /// Events the projector applied (the read path's forward progress).
     pub const PROJECTED_EVENTS: &str = "eventyr_projected_events_total";
-    /// Events a subscription gave up on and parked (0.7.7). Any value
+    /// Events a subscription gave up on and parked (roadmap 0.7.7). Any value
     /// above zero means a projection is missing events: alert on it.
     pub const PARKED_EVENTS: &str = "eventyr_parked_events_total";
     /// The global-sequence span one projector fetch covered: last
     /// fetched sequence minus the fetch's checkpoint, zero on an empty
-    /// (caught-up) poll (gauge). Not lag behind the store's head — the
-    /// driver never reads the head.
+    /// (caught-up) poll (gauge).
+    ///
+    /// Not lag behind the store's head — the driver never reads the
+    /// head.
     pub const PROJECTION_FETCH_SPAN: &str = "eventyr_projection_fetch_span";
     /// One append's latency (histogram).
     pub const APPEND_LATENCY: &str = "eventyr_append_seconds";

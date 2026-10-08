@@ -55,9 +55,20 @@ pub trait Cipher: Send + Sync {
     fn algorithm(&self) -> &'static str;
 
     /// A new random key.
+    ///
+    /// # Errors
+    ///
+    /// [`CipherError`] when the algorithm rejects its key size or the
+    /// random source would not produce bytes.
     fn generate_key(&self) -> Result<SubjectKey, CipherError>;
 
     /// Encrypt `plaintext` under `key`, authenticating `aad`.
+    ///
+    /// # Errors
+    ///
+    /// [`CipherError`] when `key` is malformed for this algorithm, or
+    /// the encryption itself failed (a spent random source, an
+    /// allocation failure inside the backend).
     fn encrypt(
         &self,
         key: &SubjectKey,
@@ -67,6 +78,12 @@ pub trait Cipher: Send + Sync {
 
     /// Decrypt `ciphertext` under `key`, checking `aad`. Fails on any
     /// tampering.
+    ///
+    /// # Errors
+    ///
+    /// [`CipherError`] when `key` is malformed, or the ciphertext
+    /// failed authentication under it — tampered bytes, or an `aad`
+    /// other than the one it was sealed with.
     fn decrypt(
         &self,
         key: &SubjectKey,

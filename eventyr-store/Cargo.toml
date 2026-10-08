@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 keywords = ["event-sourcing", "cqrs", "event-store"]
+repository = "https://github.com/df49b9cd/eventyr"
+readme = "README.md"
+homepage = "https://github.com/df49b9cd/eventyr"
+categories = ["database"]
+documentation = "https://docs.rs/eventyr-store"
 
 [lints]
 workspace = true
@@ -33,4 +38,8 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 # The `time` feature's tests run under plain `cargo test -p eventyr-store`.
 eventyr-store = { path = ".", features = ["time"] }
 # The snapshot contract the in-memory store's test runs.
-eventyr-store-testing = { workspace = true, features = ["serde"] }
+eventyr-store-testing = { path = "../eventyr-store-testing", features = ["serde"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

@@ -214,7 +214,7 @@ where
         })
     }
 
-    /// Filter *before* opening (0.7.4): the stream id and the stored
+    /// Filter *before* opening (roadmap 0.7.4): the stream id and the stored
     /// event name are non-sensitive by this crate's rule — neither
     /// `EventName` nor the tags may depend on a `Sensitive` field — so
     /// the filter runs on sealed envelopes and only the selected ones

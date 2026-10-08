@@ -1,4 +1,4 @@
-//! The [`StreamsAll::stream_all_filtered`] contract checks (0.7.4).
+//! The [`StreamsAll::stream_all_filtered`] contract checks (roadmap 0.7.4).
 //!
 //! A store that overrides the filtered read proves it agrees with the
 //! default: the same events selected by prefix and by name, in global

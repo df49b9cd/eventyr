@@ -172,9 +172,10 @@ where
         .await
 }
 
-/// [`drive_write_with_snapshots`] with metrics (0.5.3): appends,
-/// conflicts, and snapshot loads all report through `metrics`. The
-/// post-commit snapshot *save* does not — it is fire-and-forget by
+/// [`drive_write_with_snapshots`] with metrics (roadmap 0.5.3): appends,
+/// conflicts, and snapshot loads all report through `metrics`.
+///
+/// The post-commit snapshot *save* does not — it is fire-and-forget by
 /// design, and its result is the driver's to drop.
 pub async fn drive_write_with_snapshots_and_metrics<A, S, SS>(
     machine: &mut WriteMachine<A, A::State>,
@@ -293,7 +294,7 @@ where
     drive_write_batch_with_metrics(machine, store, &crate::metrics::NoopMetrics).await
 }
 
-/// [`drive_write_batch`] with metrics (0.5.3): the atomic batch append
+/// [`drive_write_batch`] with metrics (roadmap 0.5.3): the atomic batch append
 /// reports a latency, a conflict-tick on conflict, and the per-stream
 /// count of committed events on commit.
 pub async fn drive_write_batch_with_metrics<E, Err, D, S>(
@@ -381,7 +382,7 @@ where
 }
 
 /// Drives a [`BoundaryMachine`] against a [`QueryAppend`] store until it
-/// finishes (0.7.1):
+/// finishes (roadmap 0.7.1):
 ///
 /// - `Read` → [`read`](QueryAppend::read) the query from the bound,
 ///   reporting [`Read`](BoundaryInput::Read) or
@@ -403,10 +404,11 @@ where
     drive_boundary_with_metrics(machine, store, &crate::metrics::NoopMetrics).await
 }
 
-/// [`drive_boundary`] with metrics (0.5.3): the guarded append reports
+/// [`drive_boundary`] with metrics (roadmap 0.5.3): the guarded append reports
 /// a latency, a conflict-tick on a failed condition, and the count of
-/// committed events on commit — the same instruments as the batch
-/// driver.
+/// committed events on commit.
+///
+/// The same instruments as the batch driver.
 pub async fn drive_boundary_with_metrics<D, S>(
     machine: &mut BoundaryMachine<D>,
     store: &S,

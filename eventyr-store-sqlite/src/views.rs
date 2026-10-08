@@ -1,5 +1,5 @@
 //! Views over the same connection, behind the `views` feature: the
-//! [`ViewStore`] port (0.6.3) and inline views (0.7.3).
+//! [`ViewStore`] port (roadmap 0.6.3) and inline views (roadmap 0.7.3).
 //!
 //! One `views` table, one row per `(view_name, view_id)`, newest-wins
 //! on the folded sequence — the contract the Postgres view store

@@ -4,7 +4,7 @@
 //! [`SubscriptionSource`] is the object-safe, `Future`-returning
 //! counterpart to [`StreamsAll`]'s stream: it answers a single bounded
 //! poll, which is exactly the machine's
-//! [`Fetch`](eventyr_core::subscription::SubscriptionAction::Fetch)
+//! [`Fetch`](eventyr_core::subscription_machine::SubscriptionAction::Fetch)
 //! action. A [`StoreSubscription`] adapts any [`StreamsAll`] store,
 //! truncating `stream_all` after `max` events.
 
@@ -15,14 +15,14 @@ use futures::{StreamExt, TryStreamExt};
 use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
 use eventyr_core::event_name::EventName;
-use eventyr_core::subscription::{Batch, Checkpoint};
+use eventyr_core::subscription_machine::{Batch, Checkpoint};
 use eventyr_store::store::{EventFilter, StreamsAll};
 
 /// A pollable event source: the store-facing half of a subscription.
 ///
 /// Answers one bounded poll — "give me up to `max` events after
 /// `from`" — instead of conveying a live stream, because the machine
-/// treats a poll's answer as data ([`Fetched`](eventyr_core::subscription::SubscriptionInput::Fetched))
+/// treats a poll's answer as data ([`Fetched`](eventyr_core::subscription_machine::SubscriptionInput::Fetched))
 /// and owns its own idle/backoff timing. A push-capable source (a bus)
 /// implements the same port by buffering.
 pub trait SubscriptionSource: Send + Sync {
@@ -89,7 +89,7 @@ where
     }
 }
 
-/// A filtered subscription source (0.7.4): only the events `filter`
+/// A filtered subscription source (roadmap 0.7.4): only the events `filter`
 /// selects, with the read's scan progress reported so the checkpoint
 /// moves past events the filter skipped.
 ///

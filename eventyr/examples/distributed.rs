@@ -4,7 +4,7 @@
 //! Every node runs the same code: it accepts commands and runs a replica
 //! of the `balances` projector. Nothing routes commands; any node
 //! executes any command, and the store's optimistic concurrency settles
-//! the races. Nothing elects a leader either: the projector lease (0.7.9)
+//! the races. Nothing elects a leader either: the projector lease (roadmap 0.7.9)
 //! lets exactly one replica project at a time, and the others stand by
 //! to take over from the shared checkpoint.
 //!
@@ -13,7 +13,7 @@
 //! - **Concurrent writers** on a few hot wallets. Conflicts are normal
 //!   and retried; the domain's invariant (no overdraft) holds anyway.
 //! - **A client retry on another node**, sent to two nodes at once
-//!   under one idempotency key (0.7.5), commits exactly once.
+//!   under one idempotency key (roadmap 0.7.5), commits exactly once.
 //! - **Projector failover.** The active replica freezes mid-batch (a GC
 //!   pause, a network partition). Its lease expires, a standby resumes
 //!   from the last checkpoint, and the frozen replica wakes to find its
@@ -39,7 +39,7 @@
 //! What this example does not claim (see DESIGN.md §15.4 and §16): every
 //! commit to one store still serializes on its commit-order lock, so
 //! writers scale out but each store has a write ceiling; and replicas of
-//! one projector give failover, not parallelism, until slices (0.9).
+//! one projector give failover, not parallelism, until slices (roadmap 0.9).
 //!
 //! Run with:
 //! ```sh
@@ -128,6 +128,10 @@ fn decide(state: &WalletState, command: &WalletCommand) -> Result<Vec<WalletEven
 }
 
 #[derive(Aggregate)]
+// The umbrella's own examples live in the `eventyr` package itself,
+// where `proc-macro-crate` cannot distinguish them from the target
+// crate — a user's crate is not named `eventyr` and needs none of
+// this. (Same story as serde's own examples.)
 #[eventyr(
     crate = "eventyr",
     id = WalletId,

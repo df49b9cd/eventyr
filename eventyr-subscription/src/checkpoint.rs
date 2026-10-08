@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use core::future::Future;
 
 use eventyr_core::error::StoreError;
-use eventyr_core::subscription::Checkpoint;
+use eventyr_core::subscription_machine::Checkpoint;
 
 /// Where the runner persists last-acked checkpoints.
 ///
@@ -89,6 +89,13 @@ impl CheckpointStore for InMemoryCheckpointStore {
 /// [`ORIGIN`](Checkpoint::ORIGIN), a stored checkpoint loads back,
 /// names are independent, and the last store wins — including one that
 /// moves a name back, which is how an operator rewinds a projection.
+///
+/// # Panics
+///
+/// When the store broke the trait's contract: an unwritten name
+/// answered off the origin, a stored checkpoint did not load back,
+/// names leaked into each other, or a later store did not win. The
+/// message names the broken check.
 #[cfg(any(test, feature = "testing"))]
 pub fn checkpoint_store_contract<C: CheckpointStore>(make_store: impl Fn() -> C) {
     use eventyr_core::vocabulary::Sequence;

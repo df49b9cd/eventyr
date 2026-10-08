@@ -1,7 +1,8 @@
 //! # eventyr-core
 //!
-//! The pure sans-IO core of event sourcing: the [`Aggregate`] trait, the
-//! protocol vocabulary ([`vocabulary::StreamId`], [`vocabulary::Version`],
+//! The pure sans-IO core of event sourcing: the
+//! [`Aggregate`](aggregate::Aggregate) trait, the protocol vocabulary
+//! ([`vocabulary::StreamId`], [`vocabulary::Version`],
 //! [`vocabulary::Sequence`], [`vocabulary::ExpectedVersion`]), and the
 //! five state machines every driver runs:
 //!
@@ -10,11 +11,11 @@
 //! - [`batch::BatchMachine`] — the same across a fixed set of streams,
 //!   committed atomically;
 //! - [`boundary::BoundaryMachine`] — a decision whose consistency
-//!   boundary is a query over tagged events (0.7.1);
-//! - [`subscription::SubscriptionMachine`] — the at-least-once,
-//!   checkpointed catch-up projector, with poison-event parking (0.7.7);
+//!   boundary is a query over tagged events (roadmap 0.7.1);
+//! - [`subscription_machine::SubscriptionMachine`] — the at-least-once,
+//!   checkpointed catch-up projector, with poison-event parking (roadmap 0.7.7);
 //! - [`saga::SagaMachine`] — a process manager's reaction to one event,
-//!   dispatched as keyed commands (0.7.5).
+//!   dispatched as keyed commands (roadmap 0.7.5).
 //!
 //! Nothing here performs I/O, sleeps, or knows what a runtime is: the crate
 //! is `no_std + alloc` with zero required dependencies. Drivers (async,
@@ -28,6 +29,19 @@
 //! `#[derive(EventName)]` from `eventyr-macros` — convention wiring for
 //! the trait above. The feature stays off by default so the core keeps
 //! its zero-dependency build unless you ask for the sugar.
+//!
+//! ## Cargo features
+//!
+//! - `time` — carries `Metadata::timestamp` (`Option<OffsetDateTime>`);
+//!   off here, on in the umbrella crate — the rest of the core needs no
+//!   runtime at all.
+//! - `macros` — re-exports the derive macros from `eventyr-macros`, so
+//!   eventyr-core is the one dependency a derive user needs; off by
+//!   default: the core stays dependency-free unless you ask for the
+//!   sugar.
+//! - `serde` — derives Serialize/Deserialize on the value types (the
+//!   vocabulary, the envelopes, the metadata): the serde glue a store
+//!   needs; off by default.
 //!
 //! ## A taste
 //!
@@ -109,6 +123,7 @@
 //! };
 //! ```
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
@@ -139,7 +154,7 @@ pub mod event_name;
 pub mod metrics;
 pub mod saga;
 pub mod snapshot;
-pub mod subscription;
+pub mod subscription_machine;
 pub mod testing;
 pub mod upcast;
 pub mod version_registry;
@@ -166,7 +181,7 @@ pub mod prelude {
     pub use crate::snapshot::{
         HasSnapshotState, OfferSnapshot, Snapshot, SnapshotPolicy, WritePolicy,
     };
-    pub use crate::subscription::{
+    pub use crate::subscription_machine::{
         Batch, Checkpoint, FailurePolicy, SleepReason, SubscriptionAction, SubscriptionInput,
         SubscriptionMachine, SubscriptionOutcome, SubscriptionPolicy,
     };

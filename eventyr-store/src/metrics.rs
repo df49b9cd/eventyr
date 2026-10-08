@@ -20,9 +20,11 @@ pub use eventyr_core::metrics::{Metrics, NoopMetrics};
 pub mod names {
     pub use eventyr_core::metrics::names::*;
 
-    /// Parks the parked store refused (0.7.7): the event was not
+    /// Parks the parked store refused (roadmap 0.7.7): the event was not
     /// recorded, so the projector backs off and redelivers it instead of
-    /// moving on. Rising steadily means parking is broken — a store
+    /// moving on.
+    ///
+    /// Rising steadily means parking is broken — a store
     /// that is down, or a projector told to park with no parked store —
     /// and the projection is stalled on the event: alert on it.
     pub const PARK_FAILURES: &str = "eventyr_park_failures_total";
@@ -31,23 +33,29 @@ pub mod names {
     /// rate means the projection is not making durable progress.
     pub const ACK_FAILURES: &str = "eventyr_ack_failures_total";
 
-    /// Lease renewals a projector driver attempted (0.7.9): the rhythm
-    /// at which a held lease stays held. A drop while the projector is
+    /// Lease renewals a projector driver attempted (roadmap 0.7.9): the rhythm
+    /// at which a held lease stays held.
+    ///
+    /// A drop while the projector is
     /// running is a sign the driver has stalled between renewals.
     pub const LEASE_RENEWALS: &str = "eventyr_lease_renewals_total";
     /// Renewals the lease store failed: one is a flaky store, a run of
     /// them means the projector is about to report
-    /// [`LeaseLost`](eventyr_core::subscription::SubscriptionOutcome)-side
+    /// [`LeaseLost`](eventyr_core::subscription_machine::SubscriptionOutcome)-side
     /// loss and stop.
     pub const LEASE_RENEW_FAILURES: &str = "eventyr_lease_renew_failures_total";
     /// Leases a driver run ended without: another holder owns the name
     /// (an entry refusal or a takeover), or the holder can no longer
-    /// renew. Each one ends a driver run; a repeating one means two
+    /// renew.
+    ///
+    /// Each one ends a driver run; a repeating one means two
     /// projectors are configured on one name.
     pub const LEASE_LOST: &str = "eventyr_lease_lost_total";
     /// Releases of a completed run's lease that failed: the run's
     /// outcome is unaffected — the name frees at its grace bound
-    /// instead of at once. A steady rate means the lease store is
+    /// instead of at once.
+    ///
+    /// A steady rate means the lease store is
     /// flaky at exactly the moment runs end.
     pub const LEASE_RELEASE_FAILURES: &str = "eventyr_lease_release_failures_total";
 }

@@ -15,7 +15,7 @@
 //! - the last dispatch answered ends at [`SagaOutcome::Done`].
 //!
 //! Checkpointing and redelivery — what makes a saga *reliable* — stay
-//! with the [`SubscriptionMachine`](crate::subscription::SubscriptionMachine)
+//! with the [`SubscriptionMachine`](crate::subscription_machine::SubscriptionMachine)
 //! a saga runner composes into (see `eventyr-subscription`'s `saga`
 //! module): the subscription owns at-least-once per event, the saga owns
 //! the per-event reaction. The reaction is a pure function of the event,
@@ -23,7 +23,7 @@
 //! re-issues every command.
 //!
 //! Each command therefore carries a deterministic idempotency key
-//! (0.7.5): the triggering event's global sequence and the command's
+//! (roadmap 0.7.5): the triggering event's global sequence and the command's
 //! index in the reaction, under the saga's [`name`](Saga::name). A
 //! re-issued command carries the key it carried the first time, so a
 //! dispatcher that executes it through a keyed write (the repository's
@@ -57,7 +57,7 @@ pub trait Saga: Send {
     type Command: Send;
 
     /// The saga's stable name, scoping the idempotency keys of the
-    /// commands it issues (0.7.5). Two sagas reacting to the same event
+    /// commands it issues (roadmap 0.7.5). Two sagas reacting to the same event
     /// must have different names, or their commands' keys collide.
     /// Like a stored event name, it is part of the storage schema: a
     /// renamed saga re-issues commands for events it already handled.

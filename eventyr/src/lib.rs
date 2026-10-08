@@ -1,37 +1,35 @@
-//! # eventyr
-//!
 //! Event sourcing for Rust — pure machines, thin drivers.
 //!
 //! This umbrella crate re-exports [`eventyr_core`] (the `Aggregate` trait,
-//! the protocol vocabulary, and the `WriteMachine`) with the `time` and
-//! `macros` features enabled — the derives arrive through the prelude.
-//! With the `store` feature (default) it also re-exports the store side
-//! as [`store`]: the [`EventStore`](store::prelude::EventStore) and
+//! the protocol vocabulary, and the machines) with the `time` and
+//! `macros` features enabled — the derives arrive through the prelude,
+//! and target this crate automatically; a *renamed* dependency is the
+//! only case that needs `#[eventyr(crate = "...")]`. With the `store`
+//! feature (default) it also re-exports the store side as [`store`]:
+//! the [`EventStore`](store::prelude::EventStore) and
 //! [`StreamsAll`](store::prelude::StreamsAll) ports, the
 //! [`InMemoryStore`](store::prelude::InMemoryStore), the
 //! [`drive_write`](store::prelude::drive_write) driver, and the
 //! [`AggregateRepository`](store::prelude::AggregateRepository). The
 //! `subscription` feature re-exports the catch-up subscription side as
-//! [`subscription`]; the `bus` feature adds the `EventBus` live-push
-//! trait on top of it; the `projection` feature re-exports the read-path
-//! layer (upcaster chains, raw→typed sources, schema-versioned
-//! rebuilds) as `projection`. The workspace ships
-//! `eventyr-store-postgres` (the durable `EventStore`/`StreamsAll` over
-//! Postgres) as a standalone crate; the umbrella pulls it in as its own
-//! `postgres` feature.
-//!
-//! ## A taste
-//!
-#![doc = include_str!("../../README.md")]
-#![doc = ""]
-//! ```
-//! use eventyr::prelude::*;
-//!
-//! let policy = RetryPolicy::default();
-//! assert_eq!(policy.max_retries, 3);
-//! ```
+//! [`subscription`]; the `bus` feature adds the `EventBus` seam on top
+//! of it; the `projection` feature re-exports the read-path layer
+//! (upcaster chains, raw→typed sources, schema-versioned rebuilds) as
+//! `projection`; the `postgres`, `sqlite`, and `fjall` features pull in
+//! the durable stores. Everything else below is the workspace README.
+
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![doc = include_str!("../README.md")]
 
 pub use eventyr_core::*;
+
+/// `Vec`, for the derive macro's generated `decide`
+/// signatures — the same re-export `eventyr_core::__private` provides
+/// there (the serde `__private` pattern), so generated code targets one
+/// shape in either crate.
+pub mod __private {
+    pub use std::vec::Vec;
+}
 
 /// The store side: ports, the in-memory store, the async driver, and
 /// the repository — re-exported from `eventyr-store` behind the
@@ -70,7 +68,7 @@ pub use eventyr_store_fjall as fjall;
 #[cfg(feature = "sqlite")]
 pub use eventyr_store_sqlite as sqlite;
 
-/// Crypto-shredding (0.7.6): personal fields encrypted per data subject
+/// Crypto-shredding (roadmap 0.7.6): personal fields encrypted per data subject
 /// and erased by deleting the subject's key — behind `shred`.
 #[cfg(feature = "shred")]
 pub use eventyr_shred as shred;

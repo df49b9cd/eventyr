@@ -15,7 +15,9 @@ use crate::runner::Projection;
 
 /// A test scenario for one projection: `given` the envelopes to fold,
 /// `when` (or `when_driven` for a custom drive), then `then` the
-/// assertion on the projection itself — the read-side counterpart of
+/// assertion on the projection itself.
+///
+/// The read-side counterpart of
 /// core's `Scenario::when`.
 pub struct ProjectionScenario<P: Projection> {
     name: String,
@@ -43,6 +45,11 @@ impl<P: Projection> ProjectionScenario<P> {
 
     /// Fold the seeded history through the projection: every `apply` in
     /// order, panicking with the scenario's name on a rejection.
+    ///
+    /// # Panics
+    ///
+    /// When one `apply` rejected its envelope: the scenario's name and
+    /// the rejection identify the offending fold.
     pub async fn when(self) -> ProjectionOutcome<P>
     where
         P::Event: Send,
@@ -63,6 +70,11 @@ impl<P: Projection> ProjectionScenario<P> {
     /// direct `apply`, anything — then continue to `then`. The drive
     /// takes the projection and returns it, so arbitrary awaits may sit
     /// between its folds.
+    ///
+    /// # Panics
+    ///
+    /// When the drive returned an error: the scenario's name and the
+    /// error identify the failed drive.
     pub async fn when_driven<F, Fut, E>(self, drive: F) -> ProjectionOutcome<P>
     where
         F: FnOnce(P) -> Fut,

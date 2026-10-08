@@ -1,4 +1,4 @@
-//! The parked-store wrapper (0.7.7): seal on park, open on list.
+//! The parked-store wrapper (roadmap 0.7.7): seal on park, open on list.
 //!
 //! A parked event is kept *durable and reviewable* so a fixed projection
 //! can replay it — which is exactly why a park must not hold personal

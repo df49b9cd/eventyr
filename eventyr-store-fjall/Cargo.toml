@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 keywords = ["event-sourcing", "embedded", "fjall", "kv"]
+repository = "https://github.com/df49b9cd/eventyr"
+readme = "README.md"
+homepage = "https://github.com/df49b9cd/eventyr"
+categories = ["database"]
+documentation = "https://docs.rs/eventyr-store-fjall"
 
 [lints]
 workspace = true
@@ -29,5 +34,9 @@ futures.workspace = true
 # the feature (a crate's own --features don't reach `tests/`).
 [dev-dependencies]
 eventyr-store-fjall = { path = ".", features = ["snapshots"] }
-eventyr-store-testing = { workspace = true, features = ["serde"] }
+eventyr-store-testing = { path = "../eventyr-store-testing", features = ["serde"] }
 tempfile.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

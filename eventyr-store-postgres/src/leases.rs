@@ -1,7 +1,8 @@
 //! A [`ProjectorLease`], behind the `leases` feature: each subscription
 //! name is held by at most one driver, recorded in the
-//! `projector_leases` table (migration `0012_leases`) in the database
-//! the projection reads from.
+//! `projector_leases` table (migration `0012_leases`).
+//!
+//! The table lives in the database the projection reads from.
 
 use std::time::{Duration, Instant};
 

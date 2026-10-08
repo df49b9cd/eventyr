@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 keywords = ["event-sourcing", "event-store", "testing"]
+repository = "https://github.com/df49b9cd/eventyr"
+readme = "README.md"
+homepage = "https://github.com/df49b9cd/eventyr"
+categories = ["database"]
+documentation = "https://docs.rs/eventyr-store-testing"
 
 [lints]
 workspace = true
@@ -22,4 +27,6 @@ eventyr-store = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
 serde = { workspace = true, optional = true }
 
-
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
