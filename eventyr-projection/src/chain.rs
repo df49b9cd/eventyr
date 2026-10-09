@@ -48,6 +48,42 @@ impl<E> Clone for UpcasterChain<E> {
 ///
 /// A chain is itself an [`Upcaster`], so chains nest: a read model's
 /// terminal chain can embed a shared domain chain as one entry.
+///
+/// # Examples
+///
+/// Register a hand-written [`Upcaster`] for an event type, then feed
+/// the chain the stored shape — the workflow a versioned read path
+/// runs on every poll:
+///
+/// ```
+/// use eventyr_core::error::UpcastError;
+/// use eventyr_core::upcast::{RawEvent, Upcaster};
+/// use eventyr_projection::chain::UpcasterChain;
+///
+/// #[derive(Debug, PartialEq)]
+/// enum BankEvent { Deposited(u64) }
+///
+/// struct ParseAmount;
+/// impl Upcaster<BankEvent> for ParseAmount {
+///     fn upcast(&self, raw: RawEvent) -> Result<BankEvent, UpcastError> {
+///         let amount = core::str::from_utf8(&raw.payload)
+///             .ok()
+///             .and_then(|text| text.parse().ok())
+///             .ok_or_else(|| UpcastError {
+///                 event_type: raw.event_type.clone(),
+///                 message: "the payload is not an amount".into(),
+///             })?;
+///         Ok(BankEvent::Deposited(amount))
+///     }
+/// }
+///
+/// let chain = UpcasterChain::new().with("Deposited", ParseAmount);
+/// let upcast = chain.upcast(RawEvent::v1("Deposited", b"50")).expect("upcast");
+/// assert_eq!(upcast, BankEvent::Deposited(50));
+///
+/// // An unregistered event type is a loud miss, not a passthrough.
+/// assert!(chain.upcast(RawEvent::v1("Withdrawn", b"10")).is_err());
+/// ```
 pub struct UpcasterChain<E> {
     upcasters: Vec<(String, Arc<dyn Upcaster<E>>)>,
 }

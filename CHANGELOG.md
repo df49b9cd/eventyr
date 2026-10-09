@@ -41,6 +41,17 @@ entries go):
   now document that `max_grace` caps every lease from acquire — a
   healthy run ends `LeaseLost` after `ttl × max_grace` and the caller
   loops, as the distributed example does.
+- Documentation: a newcomer's guide (GUIDE.md — the concepts in
+  learning order, linked from the README) and a Code of Conduct
+  (Contributor Covenant v2.1, reports through the SECURITY.md channel).
+  The port traits users implement themselves — `Projection`,
+  `CheckpointStore`, `Upcaster`, `UpcasterChain`, `Cipher`, `KeyStore`,
+  `EventBus` — now carry runnable doctests stating each contract in
+  miniature (idempotent apply, the erase-stays-erased rule, the `aad`
+  binding). Also fixed while there: `EventBus`'s module doc no longer
+  says "until 0.3", `SubscriptionSource`'s doc no longer claims
+  object safety, and the subscription crate example drops an unused
+  import.
 
 Earlier milestones are documented in DESIGN.md's roadmap sections
 (§12–§14), which record each plan and what actually shipped.

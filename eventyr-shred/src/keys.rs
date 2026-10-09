@@ -15,6 +15,67 @@ use crate::cipher::SubjectKey;
 /// returns, the key is gone from this store for good. A backup or a
 /// replica that still holds it still holds the personal data, so
 /// erasure is only as complete as the key store's own retention.
+///
+/// # Examples
+///
+/// The erase contract as a store: `create` mints, `delete` erases, and
+/// a second `create` returns `None` — an erased subject stays erased,
+/// the property `key_store_contract` pins (a plain
+/// `HashMap<String, SubjectKey>` gets this wrong; `None` is the
+/// marker for "erased", and must survive re-creation attempts):
+///
+/// ```
+/// # fn main() {
+/// use std::collections::HashMap;
+/// use std::collections::hash_map::Entry;
+/// use std::sync::Mutex;
+/// use eventyr_core::error::StoreError;
+/// use eventyr_shred::{KeyStore, SubjectKey};
+/// use futures::executor::block_on;
+///
+/// struct MapKeys(Mutex<HashMap<String, Option<SubjectKey>>>);
+/// impl KeyStore for MapKeys {
+///     async fn load(&self, subject: &str)
+///         -> Result<Option<SubjectKey>, StoreError> {
+///         Ok(self.0.lock().expect("poisoned").get(subject).cloned().flatten())
+///     }
+///     async fn create(&self, subject: &str, key: SubjectKey)
+///         -> Result<Option<SubjectKey>, StoreError> {
+///         // The entry that is already there wins — the existing key
+///         // for a live subject, `None` for an erased one.
+///         match self.0.lock().expect("poisoned").entry(subject.to_owned()) {
+///             Entry::Vacant(vacant) => Ok(vacant.insert(Some(key)).clone()),
+///             Entry::Occupied(occupied) => Ok(occupied.get().clone()),
+///         }
+///     }
+///     async fn delete(&self, subject: &str)
+///         -> Result<(), StoreError> {
+///         self.0.lock().expect("poisoned")
+///             .insert(subject.to_owned(), None);
+///         Ok(())
+///     }
+/// }
+///
+/// let store = MapKeys(Mutex::new(HashMap::new()));
+/// let bytes = vec![7u8; 32];
+/// let key = SubjectKey::from_bytes(bytes.clone());
+///
+/// // A new subject gets its key; `load` hands it back.
+/// let minted = block_on(store.create("customer-1", key))
+///     .expect("create").expect("a new subject gets a key");
+/// assert_eq!(minted.as_bytes(), bytes.as_slice());
+///
+/// // Erase, and the key is gone.
+/// block_on(store.delete("customer-1")).expect("delete");
+/// assert!(matches!(block_on(store.load("customer-1")).expect("load"), None));
+///
+/// // Erased stays erased: a re-create returns `None`, so new data
+/// // can never be written in the clear for this subject.
+/// let again = block_on(store.create("customer-1", SubjectKey::from_bytes(vec![9; 32])))
+///     .expect("create");
+/// assert!(again.is_none());
+/// # }
+/// ```
 pub trait KeyStore: Send + Sync {
     /// The subject's key, or `None` when it has none — never created,
     /// or erased.

@@ -49,6 +49,62 @@ impl fmt::Debug for SubjectKey {
 ///
 /// `encrypt` must use a fresh nonce for every call and carry it inside
 /// the ciphertext it returns; `decrypt` reads it back from there.
+///
+/// # Examples
+///
+/// A stand-in cipher showing the `aad` binding the contract rests on:
+/// the same bytes decrypt under the `aad` they were sealed with, and
+/// fail under any other. The toy here is a shape demo, not encryption —
+/// a real cipher must pass `cipher_contract`, and the shipped ones are
+/// `eventyr-shred-aes-gcm` and `eventyr-shred-chacha`:
+///
+/// ```
+/// # fn main() {
+/// use eventyr_shred::{Cipher, CipherError, SubjectKey};
+///
+/// struct Toy;
+/// impl Cipher for Toy {
+///     fn algorithm(&self) -> &'static str { "toy" }
+///     fn generate_key(&self) -> Result<SubjectKey, CipherError> {
+///         Ok(SubjectKey::from_bytes(vec![7; 32]))
+///     }
+///     fn encrypt(&self, key: &SubjectKey, plaintext: &[u8], aad: &[u8])
+///         -> Result<Vec<u8>, CipherError> {
+///         // The whole `aad` folds into the mask, so two subjects'
+///         // bindings genuinely differ.
+///         let aad_mask = aad.iter().fold(0u8, |mask, byte| mask ^ byte);
+///         let mut out = plaintext.to_vec();
+///         for (i, byte) in out.iter_mut().enumerate() {
+///             *byte ^= key.as_bytes()[i % 32] ^ aad_mask;
+///         }
+///         Ok(out)
+///     }
+///     fn decrypt(&self, key: &SubjectKey, ciphertext: &[u8], aad: &[u8])
+///         -> Result<Vec<u8>, CipherError> {
+///         self.encrypt(key, ciphertext, aad) // XOR is its own inverse
+///     }
+/// }
+///
+/// let cipher = Toy;
+/// let key = cipher.generate_key().expect("generate");
+/// let subject = b"customer-1".as_slice();
+///
+/// // Roundtrip under the sealing subject.
+/// let sealed = cipher.encrypt(&key, b"ada@example.com", subject)
+///     .expect("encrypt");
+/// assert_eq!(cipher.decrypt(&key, &sealed, subject).expect("decrypt"),
+///            b"ada@example.com");
+///
+/// // The binding: the same ciphertext under another subject's `aad`
+/// // opens to garbage, not the plaintext — a sealed field moved
+/// // between subjects is unreadable, which is the point of the `aad`.
+/// // (An authenticated cipher fails outright here; a shape demo can
+/// // only show the `aad` participating in the mask.)
+/// let moved = cipher.decrypt(&key, &sealed, b"customer-2".as_slice())
+///     .expect("the toy never fails — it is not authenticated");
+/// assert_ne!(&moved[..], b"ada@example.com".as_slice());
+/// # }
+/// ```
 pub trait Cipher: Send + Sync {
     /// The algorithm's stable name, stored with every sealed field, so a
     /// log written under one cipher is never decrypted with another.

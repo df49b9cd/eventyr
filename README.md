@@ -209,6 +209,9 @@ struct Account;
 
 ## Design
 
+New here? Start with [GUIDE.md](https://github.com/df49b9cd/eventyr/blob/main/GUIDE.md)
+— the concepts in learning order, with links into everything below.
+
 The design document is the constitution of this workspace:
 
 - [DESIGN.md](https://github.com/df49b9cd/eventyr/blob/main/DESIGN.md) — the full design
