@@ -28,6 +28,15 @@ entries go):
   (own schema for the migrations table, Postgres ≥ 11, required
   privileges) and the deployment contract (single writable primary,
   synchronous replication, what rewinds safely).
+- Documentation: DESIGN.md's 0.8–0.10 phasing is made consistent — the
+  deployment contract (shipped with the Postgres docs above) is no
+  longer listed as planned work, the HLC stamp is triggered ("ships
+  when a user runs several stores") everywhere it is scheduled, the
+  Postgres parked store 0.7.7 promised is scheduled as 0.8.6, and
+  0.8.2's lock-key migration names its upgrade window (quiesce appends,
+  or take both keys for one release). The Postgres crate docs no longer
+  imply parked events rewind with the database, and the inline-view
+  comment's section pointer follows per-tag locking to §16.6.
 - `eventyr-subscription`: `LeasePolicy` and `run_leased`/`run_woken_leased`
   now document that `max_grace` caps every lease from acquire — a
   healthy run ends `LeaseLost` after `ttl × max_grace` and the caller
