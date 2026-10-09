@@ -1,7 +1,7 @@
 //! The `SubscriptionSource` port and the §6 adapter over any
 //! [`StreamsAll`] store.
 //!
-//! [`SubscriptionSource`] is the object-safe, `Future`-returning
+//! [`SubscriptionSource`] is the pollable, `Future`-returning
 //! counterpart to [`StreamsAll`]'s stream: it answers a single bounded
 //! poll, which is exactly the machine's
 //! [`Fetch`](eventyr_core::subscription_machine::SubscriptionAction::Fetch)

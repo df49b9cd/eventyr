@@ -8,8 +8,8 @@
 //! runner talks to [`SubscriptionSource`](crate::source::SubscriptionSource)),
 //! while this trait is push; both deliver [`EventEnvelope`]s both
 //! times, and a bridging adapter is where the two meet once a
-//! transport ships. Until 0.3 the trait exists so user projections can
-//! already target the spec's signature.
+//! transport ships. No transport ships in this workspace — the trait
+//! is the seam a user's own transport targets.
 
 use core::future::Future;
 
@@ -24,6 +24,52 @@ use eventyr_core::subscription_machine::Checkpoint;
 /// Publish only persists-to-committed envelopes, and on best-effort
 /// terms: the projector's checkpoint poll stays authoritative — a lost
 /// notification only costs an idle sleep.
+///
+/// # Examples
+///
+/// A channel-based bus, the shape a transport sits behind: publish one
+/// envelope, a subscribed receiver sees it. Push here is only a hint —
+/// a projection consuming this bus still checkpoints through its
+/// [`SubscriptionSource`](crate::source::SubscriptionSource).
+///
+/// ```
+/// # fn main() {
+/// use eventyr_core::envelope::{EventEnvelope, Metadata};
+/// use eventyr_core::vocabulary::{Sequence, StreamId, Version};
+/// use eventyr_subscription::bus::EventBus;
+/// use futures::executor::block_on;
+/// use std::sync::mpsc;
+///
+/// struct ChannelBus {
+///     senders: Vec<mpsc::Sender<EventEnvelope<u64>>>,
+/// }
+/// impl EventBus for ChannelBus {
+///     type Event = u64;
+///     async fn publish(&self, envelope: &EventEnvelope<u64>)
+///         -> Result<(), eventyr_core::error::StoreError> {
+///         for sender in &self.senders {
+///             // Best-effort: a gone receiver costs the hint, nothing else.
+///             let _ = sender.send(envelope.clone());
+///         }
+///         Ok(())
+///     }
+/// }
+///
+/// let (tx, rx) = mpsc::channel();
+/// let bus = ChannelBus { senders: vec![tx] };
+/// let envelope = EventEnvelope {
+///     sequence: Sequence::new(1),
+///     stream_id: StreamId::from("account-1"),
+///     version: Version::new(1),
+///     event: 50,
+///     metadata: Metadata::default(),
+/// };
+/// block_on(bus.publish(&envelope)).expect("publish");
+/// let received = rx.recv().expect("the subscriber got the envelope");
+/// assert_eq!(received.event, 50);
+/// assert_eq!(received.stream_id.as_str(), "account-1");
+/// # }
+/// ```
 pub trait EventBus: Send + Sync {
     /// The domain event type published.
     type Event: Send;

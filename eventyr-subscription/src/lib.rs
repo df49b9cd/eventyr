@@ -35,7 +35,6 @@
 //!
 //! ```
 //! # async fn demo() {
-//! use std::fmt;
 //! use eventyr_core::prelude::*;
 //! use eventyr_store::prelude::*;
 //! use eventyr_subscription::prelude::*;

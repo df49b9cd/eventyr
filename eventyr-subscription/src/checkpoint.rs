@@ -20,6 +20,50 @@ use eventyr_core::subscription_machine::Checkpoint;
 /// `store` is called only after a full batch applied — the at-least-once
 /// boundary — so a crash mid-batch restarts after the last persisted
 /// checkpoint and re-delivers what followed it.
+///
+/// # Examples
+///
+/// A hand-rolled store over process memory — the shape any real store
+/// follows (lock scoped inside the method, never held across an
+/// `.await`; `load` of a name nobody wrote answers
+/// [`ORIGIN`](Checkpoint::ORIGIN)):
+///
+/// ```
+/// # fn main() {
+/// use std::collections::HashMap;
+/// use std::sync::Mutex;
+/// use eventyr_core::error::StoreError;
+/// use eventyr_core::subscription_machine::Checkpoint;
+/// use eventyr_core::vocabulary::Sequence;
+/// use eventyr_subscription::checkpoint::CheckpointStore;
+/// use futures::executor::block_on;
+///
+/// struct MapCheckpoints(Mutex<HashMap<String, Checkpoint>>);
+/// impl CheckpointStore for MapCheckpoints {
+///     async fn load(&self, name: &str)
+///         -> Result<Checkpoint, StoreError> {
+///         Ok(self.0.lock().expect("poisoned")
+///             .get(name).copied().unwrap_or(Checkpoint::ORIGIN))
+///     }
+///     async fn store(&self, name: &str, checkpoint: Checkpoint)
+///         -> Result<(), StoreError> {
+///         self.0.lock().expect("poisoned")
+///             .insert(name.to_owned(), checkpoint);
+///         Ok(())
+///     }
+/// }
+///
+/// let store = MapCheckpoints(Mutex::new(HashMap::new()));
+/// // A name nobody wrote is at the origin.
+/// assert_eq!(block_on(store.load("ledger")).expect("load"),
+///            Checkpoint::ORIGIN);
+/// // Store, then load it back.
+/// block_on(store.store("ledger", Checkpoint::new(Sequence::new(9))))
+///     .expect("store");
+/// assert_eq!(block_on(store.load("ledger")).expect("load").as_sequence(),
+///            Sequence::new(9));
+/// # }
+/// ```
 pub trait CheckpointStore: Send + Sync {
     /// The persisted position of `name`,
     /// [`ORIGIN`](Checkpoint::ORIGIN) if never written.

@@ -37,6 +37,57 @@ use crate::source::SubscriptionSource;
 ///
 /// §6 verbatim. At-least-once: `apply` may see the same envelope twice
 /// (the ack moves only after a batch applies), so it must be idempotent.
+///
+/// # Examples
+///
+/// Idempotence, shown rather than told: a projection keyed by
+/// `(stream, version)` redelivers for free — applying the same envelope
+/// twice leaves the map untouched. Projections that cannot key their
+/// state that way get the same guard from [`SkipRedelivered`]:
+///
+/// ```
+/// # fn main() {
+/// use std::collections::HashMap;
+/// use core::convert::Infallible;
+/// use eventyr_core::envelope::{EventEnvelope, Metadata};
+/// use eventyr_core::vocabulary::{Sequence, StreamId, Version};
+/// use eventyr_subscription::runner::Projection;
+/// use futures::executor::block_on;
+///
+/// // Balances per account, keyed by (stream, version) so a redelivered
+/// // envelope writes the same entry it wrote the first time.
+/// struct Balances(HashMap<(StreamId, Version), u64>);
+/// impl Projection for Balances {
+///     type Event = u64;
+///     type Error = Infallible;
+///     async fn apply(&mut self, event: &EventEnvelope<u64>)
+///         -> Result<(), Infallible> {
+///         let key = (event.stream_id.clone(), event.version);
+///         let seat = self.0.entry(key).or_insert(0);
+///         *seat = event.event; // an overwrite, not an add: idempotent
+///         Ok(())
+///     }
+/// }
+///
+/// fn envelope(amount: u64, version: Version) -> EventEnvelope<u64> {
+///     EventEnvelope {
+///         sequence: Sequence::new(1),
+///         stream_id: StreamId::from("account-1"),
+///         version,
+///         event: amount,
+///         metadata: Metadata::default(),
+///     }
+/// }
+///
+/// let mut projection = Balances(HashMap::new());
+/// // The same envelope, delivered twice (a retry after a failed ack):
+/// let envelope = envelope(50, Version::new(1));
+/// block_on(projection.apply(&envelope)).expect("apply");
+/// block_on(projection.apply(&envelope)).expect("apply");
+/// assert_eq!(projection.0.len(), 1);
+/// assert_eq!(projection.0[&("account-1".into(), Version::new(1))], 50);
+/// # }
+/// ```
 pub trait Projection: Send {
     /// The domain event folded into the projection.
     type Event: Send;

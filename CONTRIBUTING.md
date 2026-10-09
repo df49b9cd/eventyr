@@ -6,6 +6,9 @@
   rules) and the §12 roadmap before proposing a subsystem; several
   tempting features are deliberate non-goals (§2), and the roadmap
   records what was tried and withdrawn with the reasons.
+- [GUIDE.md](GUIDE.md) is the newcomer's path through the concepts, in
+  learning order — when an API moves, its links move too, so keep the
+  sections you touch pointing at the right places.
 - Rust 1.99+, edition 2024, `#![forbid(unsafe_code)]` workspace-wide.
 - One version of every shared dependency, set in the root
   `[workspace.dependencies]`; per-crate manifests inherit and add only
@@ -62,3 +65,9 @@ wire the contract suites in `tests/`.
 
 Bugs and design discussions go to the GitHub issue tracker. Security
 issues go to [SECURITY.md](SECURITY.md) — never a public issue.
+
+## Code of conduct
+
+This workspace follows the Contributor Covenant; see
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md). Conduct reports go through
+the private channel it names — never a public issue.

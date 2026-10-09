@@ -40,6 +40,50 @@ impl RawEvent {
 /// The chain (roadmap 0.2) selects upcasters by event
 /// type; a selected upcaster that cannot parse its payload is an
 /// [`Err`](UpcastError) — never a silent drop.
+///
+/// # Examples
+///
+/// The contract in miniature: a `V1` payload upcast into the current
+/// event, and a payload this upcaster does not recognize failing
+/// loudly instead of dropping the event:
+///
+/// ```
+/// use eventyr_core::error::UpcastError;
+/// use eventyr_core::upcast::{RawEvent, Upcaster};
+///
+/// #[derive(Debug, PartialEq)]
+/// enum BankEvent { Deposited(u64) }
+///
+/// struct ParseAmount;
+/// impl Upcaster<BankEvent> for ParseAmount {
+///     fn upcast(&self, raw: RawEvent) -> Result<BankEvent, UpcastError> {
+///         match raw.event_type.as_str() {
+///             "Deposited" => {
+///                 let amount = core::str::from_utf8(&raw.payload)
+///                     .ok()
+///                     .and_then(|text| text.parse().ok())
+///                     .ok_or_else(|| UpcastError {
+///                         event_type: raw.event_type.clone(),
+///                         message: "the payload is not an amount".into(),
+///                     })?;
+///                 Ok(BankEvent::Deposited(amount))
+///             }
+///             other => Err(UpcastError {
+///                 event_type: other.to_owned(),
+///                 message: "not this upcaster's event type".into(),
+///             }),
+///         }
+///     }
+/// }
+///
+/// let upcaster = ParseAmount;
+/// let upcast = upcaster.upcast(RawEvent::v1("Deposited", b"50")).expect("upcast");
+/// assert_eq!(upcast, BankEvent::Deposited(50));
+///
+/// // A type this upcaster does not know: a loud miss, never a drop.
+/// let miss = upcaster.upcast(RawEvent::v1("Withdrawn", b"10"));
+/// assert!(miss.is_err());
+/// ```
 pub trait Upcaster<E>: Send + Sync {
     /// Transform `raw` into the current event shape.
     ///
