@@ -33,7 +33,7 @@ use crate::{PgStore, PgStoreError};
 /// (migration 0006) by the time it gets here, until commit, so view
 /// folds are already serialized — two appends to different streams
 /// folding into one row cannot both read its old value. If that lock is
-/// ever relaxed (per-tag locking, §14), these rows need their own;
+/// ever relaxed (per-tag locking, §16.6), these rows need their own;
 /// `concurrent_folds_into_one_row_lose_nothing` fails without either.
 pub(crate) async fn write_inline_views<E>(
     conn: &mut sqlx::PgConnection,

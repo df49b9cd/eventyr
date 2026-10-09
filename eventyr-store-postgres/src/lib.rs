@@ -68,10 +68,14 @@
 //! standby) when a failover must lose no acknowledged commit — an
 //! asynchronous failover can reuse sequence numbers for *different*
 //! events, which silently breaks consumers holding positions from
-//! before the rewind. Checkpoints, views, parked events, and leases kept
-//! in the event store's database rewind together with the log and stay
-//! correct; anything outside it (other-database read models, broker
-//! messages, client-held positions) needs its own rewind detection.
+//! before the rewind. Checkpoints, views, and leases kept in the event
+//! store's database rewind together with the log and stay correct;
+//! parked events do so on SQLite, the only store with a durable parked
+//! store today — a `Park` policy here parks in-process (0.7.7), and a
+//! crash loses the record while the checkpoint has moved past the event
+//! (0.8.6 gives Postgres the same table). Anything outside the database
+//! (other-database read models, broker messages, client-held positions)
+//! needs its own rewind detection.
 //! `LISTEN`/`NOTIFY` do not work on a standby: [`notify::PgCommitSignal`]
 //! must reach the primary, and projectors reading from a replica poll.
 //! The full contract is DESIGN.md §16.2.
