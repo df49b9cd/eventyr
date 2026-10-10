@@ -219,6 +219,12 @@ The design document is the constitution of this workspace:
 - [§7 · machine modeling rules](https://github.com/df49b9cd/eventyr/blob/main/DESIGN.md#7-machine-modeling-rules-sans-io-discipline) — the sans-IO discipline and the machine table
 - [§12 · roadmap](https://github.com/df49b9cd/eventyr/blob/main/DESIGN.md#12-roadmap) — what is shipped, what is pending
 
+The as-built architecture record lives in
+[docs/](https://github.com/df49b9cd/eventyr/blob/main/docs/README.md) — one page per
+crate plus
+[ARCHITECTURE.md](https://github.com/df49b9cd/eventyr/blob/main/docs/ARCHITECTURE.md)
+for the workspace as a whole.
+
 ## License
 
 Licensed under either of [MIT](LICENSE-MIT) or
