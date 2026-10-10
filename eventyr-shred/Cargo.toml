@@ -43,7 +43,11 @@ aead = { version = "0.6", default-features = false, features = ["alloc", "getran
 zeroize = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
 
 [dev-dependencies]
-eventyr-store-testing = { path = "../eventyr-store-testing" }
+# Core's serde feature turns the fixtures the query-append contracts
+# use (`EnrollmentEvent`) into wire types; `serde` on store-testing
+# backs the filtered-read contract's `ParityEvent`.
+eventyr-core = { workspace = true, features = ["serde"] }
+eventyr-store-testing = { path = "../eventyr-store-testing", features = ["serde"] }
 # The contracts live behind `testing`; the in-crate suite runs them
 # (self-feature so dev-deps see them).
 eventyr-shred = { path = ".", features = ["testing"] }

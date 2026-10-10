@@ -237,7 +237,15 @@ impl<E> FjallStore<E> {
                 let first = first
                     .first_chunk::<8>()
                     .ok_or_else(|| corrupt("a lifecycle record without its cut"))?;
-                Ok((*closed != 0, u64::from_be_bytes(*first)))
+                let first = u64::from_be_bytes(*first);
+                // Versions start at 1; a zero cut is corrupt data (a
+                // truncated record, a hand edit), not a number to
+                // read — `truncate_before` computes `first - 1` and a
+                // zero would underflow into a reversed key range.
+                if first == 0 {
+                    return Err(corrupt("a lifecycle record with a zero cut"));
+                }
+                Ok((*closed != 0, first))
             }
         }
     }
@@ -354,9 +362,16 @@ impl<E> FjallStore<E> {
                 let bytes = serde_json::to_vec(&row).map_err(corrupt)?;
                 let key = Self::stream_key(&stream_id, version);
                 tx.insert(&self.streams, key, bytes);
+                let global_key = format!("{:016}", sequence.as_u64());
+                // The key layout is fixed-width lexicographic: beyond
+                // 16 digits (10^16 events) bytewise order diverges
+                // from numeric — the same unreachable magnitude the
+                // `sql_position` doc argues from, made loud here
+                // rather than silently mis-sorted.
+                debug_assert_eq!(global_key.len(), 16, "the global key layout is 16 digits");
                 tx.insert(
                     &self.global,
-                    format!("{:016}", sequence.as_u64()),
+                    global_key,
                     Self::stream_key(&stream_id, version),
                 );
                 envelopes.push(EventEnvelope {
@@ -437,7 +452,10 @@ where
         }
     }
 
-    /// The `global` key range after `from` (exclusive).
+    /// The `global` key range after `from` (exclusive). The keys are
+    /// `{:016}`-formatted sequences — a *minimum* width, so bytewise
+    /// order matches numeric only below 10^16; the write path asserts
+    /// the width stays what the layout assumes.
     fn global_range(from: Sequence) -> core::ops::Range<Vec<u8>> {
         let lower = format!("{:016}", from.as_u64().saturating_add(1)).into_bytes();
         let mut upper = format!("{:016}", u64::MAX).into_bytes();

@@ -202,9 +202,12 @@ fn a_short_global_read_stops_at_its_page() {
     let first: Vec<_> = block_on(store.stream_all(Sequence::START).take(3).collect());
     assert_eq!(first.len(), 3);
     let decoded = Counted::decodes();
-    assert!(
-        decoded < EVENTS as usize / 2,
-        "a read of three events decoded {decoded} rows"
+    // The store's page is 512: a `take(3)` reads exactly one page, and
+    // a page-size regression doubles this without failing a looser
+    // bound. (The mechanism's constant, pinned, not a heuristic.)
+    assert_eq!(
+        decoded, 512,
+        "a read of three events decodes one page ({decoded} rows)"
     );
     // The full read still pages through everything, in order.
     let all: Vec<_> = block_on(store.stream_all(Sequence::START).collect());

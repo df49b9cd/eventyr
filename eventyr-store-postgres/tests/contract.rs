@@ -3,7 +3,10 @@
 //!
 //! `#[ignore]`d like every Postgres test here — run with
 //! `cargo test -p eventyr-store-postgres -- --ignored` and
-//! `EVENTYR_TEST_PG_URL` pointing at a real Postgres.
+//! `EVENTYR_TEST_PG_URL` pointing at a real Postgres (each test's
+//! schemas live in its own `SchemaScope`, so a parallel run is safe;
+//! CI pins `--test-threads=1` anyway, because the contract suites'
+//! open transactions would exhaust a 100-connection container).
 
 mod common;
 
@@ -18,6 +21,7 @@ static HEAVY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 fn pg_store_passes_the_contract() {
     let url = common::url();
     let runtime = common::runtime();
+    let schemas = common::SchemaScope::open();
     let make_store = || common::fresh_store(&runtime, &url, "contract");
     // Entered for the sync suite so the sqlx futures it polls find this
     // runtime's reactor; dropped before `block_on`, which an entered
@@ -28,12 +32,13 @@ fn pg_store_passes_the_contract() {
         eventyr_store_testing::streams_all_contract::<PayloadEvent, _>(make_store);
         eventyr_store_testing::event_store_batch_contract::<PayloadEvent, _>(make_store);
     }
-    runtime.block_on(common::cleanup_schemas());
+    runtime.block_on(schemas.finish());
 }
 
 #[test]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 fn pg_store_passes_the_query_append_contract() {
+    let schemas = common::SchemaScope::open();
     let url = common::url();
     let runtime = common::runtime();
     {
@@ -42,12 +47,13 @@ fn pg_store_passes_the_query_append_contract() {
             common::fresh_store(&runtime, &url, "contract")
         });
     }
-    runtime.block_on(common::cleanup_schemas());
+    runtime.block_on(schemas.finish());
 }
 
 #[test]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 fn pg_store_passes_the_lifecycle_contracts() {
+    let schemas = common::SchemaScope::open();
     let url = common::url();
     let runtime = common::runtime();
     {
@@ -59,12 +65,13 @@ fn pg_store_passes_the_lifecycle_contracts() {
             common::fresh_store(&runtime, &url, "contract")
         });
     }
-    runtime.block_on(common::cleanup_schemas());
+    runtime.block_on(schemas.finish());
 }
 
 #[test]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 fn pg_store_passes_the_filtered_read_contract() {
+    let schemas = common::SchemaScope::open();
     let url = common::url();
     let runtime = common::runtime();
     {
@@ -73,12 +80,13 @@ fn pg_store_passes_the_filtered_read_contract() {
             common::fresh_store(&runtime, &url, "contract")
         });
     }
-    runtime.block_on(common::cleanup_schemas());
+    runtime.block_on(schemas.finish());
 }
 
 #[test]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 fn pg_snapshot_store_passes_the_snapshot_contract() {
+    let schemas = common::SchemaScope::open();
     let url = common::url();
     let runtime = common::runtime();
     {
@@ -88,12 +96,13 @@ fn pg_snapshot_store_passes_the_snapshot_contract() {
             eventyr_store_postgres::snapshots::PgSnapshotStore::new(&store)
         });
     }
-    runtime.block_on(common::cleanup_schemas());
+    runtime.block_on(schemas.finish());
 }
 
 #[test]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 fn pg_checkpoint_store_passes_the_checkpoint_store_contract() {
+    let schemas = common::SchemaScope::open();
     let url = common::url();
     let runtime = common::runtime();
     {
@@ -103,7 +112,7 @@ fn pg_checkpoint_store_passes_the_checkpoint_store_contract() {
             eventyr_store_postgres::PgCheckpointStore::new(&store)
         });
     }
-    runtime.block_on(common::cleanup_schemas());
+    runtime.block_on(schemas.finish());
 }
 
 /// A smoke test under real concurrency: many boundary decisions race
@@ -119,6 +128,7 @@ fn pg_checkpoint_store_passes_the_checkpoint_store_contract() {
 #[test]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 fn pg_store_serializes_racing_boundary_decisions() {
+    let schemas = common::SchemaScope::open();
     use eventyr_core::boundary::enrollment::{Enroll, EnrollmentEvent};
     use eventyr_core::boundary::{BoundaryMachine, BoundaryOutcome, Decision};
     use eventyr_core::envelope::NewEvent;
@@ -188,7 +198,7 @@ fn pg_store_serializes_racing_boundary_decisions() {
             .filter(|e| matches!(e.event, EnrollmentEvent::Enrolled { .. }))
             .count();
         assert_eq!(enrolled, SEATS as usize, "no seat was oversold");
-        common::cleanup_schemas().await;
+        schemas.finish().await;
     });
 }
 
@@ -273,6 +283,7 @@ async fn wait_for_a_waiting_lock(pool: &sqlx::PgPool) {
 #[test]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 fn a_conditional_append_waits_out_an_in_flight_writer() {
+    let schemas = common::SchemaScope::open();
     use eventyr_core::batch::StreamAppend;
     use eventyr_core::boundary::enrollment::{Enroll, EnrollmentEvent};
     use eventyr_core::boundary::{AppendCondition, Decision};
@@ -352,7 +363,7 @@ fn a_conditional_append_waits_out_an_in_flight_writer() {
             Err(StoreError::QueryConflict { sequence }) => assert!(sequence > read_position),
             other => panic!("expected a query conflict after the rival commits, got {other:?}"),
         }
-        common::cleanup_schemas().await;
+        schemas.finish().await;
     });
 }
 
@@ -368,6 +379,7 @@ fn a_conditional_append_waits_out_an_in_flight_writer() {
 #[test]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 fn a_later_sequence_never_commits_before_an_earlier_one() {
+    let schemas = common::SchemaScope::open();
     use eventyr_core::envelope::NewEvent;
     use eventyr_core::vocabulary::{ExpectedVersion, Sequence};
     use eventyr_store::store::{EventStore, StreamsAll};
@@ -438,6 +450,6 @@ fn a_later_sequence_never_commits_before_an_earlier_one() {
         assert_eq!(sequences[0].0, "stream-a");
         assert_eq!(sequences[1].0, "stream-b");
         assert!(sequences[0].1 < sequences[1].1);
-        common::cleanup_schemas().await;
+        schemas.finish().await;
     });
 }

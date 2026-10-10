@@ -342,6 +342,14 @@ mod tests {
         assert!(ProjectionRow::load(&view, "gingerbread-1").await.is_none());
     }
 
+    /// The reference implementation runs its own contract: the in-memory
+    /// store is what the port's newest-wins guarantees are pinned
+    /// against, so it must pass the checks the durable stores run.
+    #[test]
+    fn the_in_memory_view_store_passes_the_contract() {
+        view_store_contract(InMemoryViewStore::new, Balance);
+    }
+
     /// Test-side handle for reading what a [`ViewProjection`] wrote.
     struct ProjectionRow;
 

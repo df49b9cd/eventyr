@@ -39,6 +39,12 @@ Feature powersets are checked with `cargo-hack`
 (`cargo hack check --workspace --each-feature --no-dev-deps`), and miri
 covers `eventyr-core` on nightly.
 
+A weekly scheduled workflow (`.github/workflows/audit.yml`) runs
+`cargo audit` over the committed Cargo.lock against the RustSec
+advisory database; a new advisory is a PR like any other, not an
+emergency — but a crypto or TLS advisory is worth acting on before
+its release notes say you should have.
+
 ## Conventions that matter
 
 - **Machines are pure** (§7): no clocks, randomness, or I/O inside;

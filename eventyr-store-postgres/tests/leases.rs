@@ -3,7 +3,10 @@
 //!
 //! `#[ignore]`d like every Postgres test here — run with
 //! `cargo test -p eventyr-store-postgres -- --ignored` and
-//! `EVENTYR_TEST_PG_URL` pointing at a real Postgres.
+//! `EVENTYR_TEST_PG_URL` pointing at a real Postgres (each test's
+//! schemas live in its own `SchemaScope`, so a parallel run is safe;
+//! CI pins `--test-threads=1` anyway, because the contract suites'
+//! open transactions would exhaust a 100-connection container).
 
 #![cfg(feature = "leases")]
 
@@ -19,6 +22,7 @@ use eventyr_subscription::lease::{LeaseError, LeasePolicy, ProjectorLease, lease
 fn pg_lease_store_passes_the_lease_store_contract() {
     let url = common::url();
     let runtime = common::runtime();
+    let schemas = common::SchemaScope::open();
     {
         let _guard = runtime.enter();
         let lease_store = PgLeaseStore::new(&common::fresh_store::<
@@ -26,7 +30,7 @@ fn pg_lease_store_passes_the_lease_store_contract() {
         >(&runtime, &url, "leases"));
         lease_store_contract(|| lease_store.clone());
     }
-    runtime.block_on(common::cleanup_schemas());
+    runtime.block_on(schemas.finish());
 }
 
 #[test]
@@ -64,12 +68,11 @@ fn two_pools_cannot_hold_one_name() {
     };
     runtime.block_on(async {
         let first = one
-            .acquire("balance", policy.ttl, policy.grace, policy.max_grace)
+            .acquire("balance", policy)
             .await
             .expect("the first acquire claims the name");
         assert!(matches!(
-            two.acquire("balance", policy.ttl, policy.grace, policy.max_grace)
-                .await,
+            two.acquire("balance", policy).await,
             Err(LeaseError::Taken)
         ));
         one.release(first).await.expect("release");

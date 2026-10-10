@@ -1,0 +1,26 @@
+name: Advisories
+
+# Weekly scan of the committed Cargo.lock against the RustSec advisory
+# database. The workspace links crypto and TLS primitives (aes-gcm,
+# chacha20poly1305, rustls via sqlx's tls-rustls, bundled rusqlite), so
+# an advisory in the tree is worth a deliberate decision, not a
+# surprise. Failures land as an alert to act on; the lock moves through
+# the same PR flow as any code.
+on:
+  schedule:
+    # Mondays 04:13 UTC, off the whole-hour mark.
+    - cron: "13 4 * * 1"
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Any toolchain works: cargo-audit reads the lock, it does not
+      # build the tree. Pinned so the job itself never moves.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: taiki-e/install-action@bad6587a7e671af4d2ca6b0e7622335ec69f28de # cargo-audit
+      - name: Cargo audit
+        run: cargo audit

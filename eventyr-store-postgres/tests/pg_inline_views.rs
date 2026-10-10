@@ -3,11 +3,13 @@
 //!
 //! `#[ignore]`d like every Postgres test here — run with
 //! `cargo test -p eventyr-store-postgres -- --ignored` and
-//! `EVENTYR_TEST_PG_URL` pointing at a real Postgres.
+//! `EVENTYR_TEST_PG_URL` pointing at a real Postgres (each test's
+//! schemas live in its own `SchemaScope`, so a parallel run is safe;
+//! CI pins `--test-threads=1` anyway, because the contract suites'
+//! open transactions would exhaust a 100-connection container).
 
 use std::sync::Arc;
 
-use eventyr_core::batch::StreamAppend;
 use eventyr_core::envelope::{EventEnvelope, NewEvent};
 use eventyr_core::event_name::EventName;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId};
@@ -91,57 +93,51 @@ async fn row(views: &PgViewStore<Balance>, name: &str, id: &str) -> Option<(u64,
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
-async fn the_row_is_there_when_the_append_returns() {
-    let pool = common::fresh_pool(&common::url(), "inline", 2).await;
-    let store = PgStore::<Event>::new(pool).with_inline_views(vec![balance(), total()]);
-    let views = PgViewStore::<Balance>::new(&store);
-
-    let committed = store
-        .append(
-            &StreamId::from("account-1"),
-            ExpectedVersion::Empty,
-            vec![deposit(10), deposit(5)],
-        )
-        .await
-        .expect("append");
-    // No projector ran: the rows were written by the append itself.
-    assert_eq!(
-        row(&views, "balance", "account-1").await,
-        Some((15, committed[1].sequence))
+async fn the_store_passes_the_inline_view_contract() {
+    let url = common::url();
+    let schemas = common::SchemaScope::open();
+    // The contract's reads are `block_on`-driven: this runtime is
+    // entered, and its workers drive the sqlx I/O while the executor
+    // parks this thread (common::runtime's documented shape).
+    let _entered = tokio::runtime::Handle::current().enter();
+    eventyr_projection::inline::inline_view_contract(
+        || vec![balance(), total()],
+        |views| {
+            let pool = futures::executor::block_on(common::fresh_pool(&url, "inline", 2));
+            PgStore::<Event>::new(pool).with_inline_views(views)
+        },
+        || {
+            let pool = futures::executor::block_on(common::fresh_pool(&url, "inline", 2));
+            PgStore::<Event>::new(pool)
+        },
+        |store, stream, events| {
+            futures::executor::block_on(store.append(&stream, ExpectedVersion::Empty, events))
+                .expect("append")
+        },
+        |store, appends| {
+            let committed =
+                futures::executor::block_on(store.append_batch(appends)).expect("batch");
+            let mut envelopes = Vec::new();
+            for stream in committed {
+                envelopes.extend(stream.events);
+            }
+            envelopes
+        },
+        |store, name, id| {
+            futures::executor::block_on(PgViewStore::<Balance>::new(store).load(name, id))
+                .expect("load")
+                .map(|row| (Balance(row.value.0), row.version))
+        },
+        |amount| Event::Deposited { amount },
+        Balance,
     );
-    assert_eq!(row(&views, "total", "all").await.map(|r| r.0), Some(15));
-
-    // Batches and every later append fold on top.
-    store
-        .append_batch(vec![
-            StreamAppend {
-                stream_id: StreamId::from("account-1"),
-                expected: ExpectedVersion::Any,
-                events: vec![deposit(1)],
-            },
-            StreamAppend {
-                stream_id: StreamId::from("account-2"),
-                expected: ExpectedVersion::Empty,
-                events: vec![deposit(100)],
-            },
-        ])
-        .await
-        .expect("batch");
-    assert_eq!(
-        row(&views, "balance", "account-1").await.map(|r| r.0),
-        Some(16)
-    );
-    assert_eq!(
-        row(&views, "balance", "account-2").await.map(|r| r.0),
-        Some(100)
-    );
-    assert_eq!(row(&views, "total", "all").await.map(|r| r.0), Some(116));
-    common::cleanup_schemas().await;
+    schemas.finish().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 async fn a_view_that_cannot_fold_fails_the_append() {
+    let schemas = common::SchemaScope::open();
     let pool = common::fresh_pool(&common::url(), "inline", 2).await;
     let plain = PgStore::<Event>::new(pool.clone());
     // A stored row the view's type cannot decode.
@@ -175,7 +171,7 @@ async fn a_view_that_cannot_fold_fails_the_append() {
     .await
     .expect("read");
     assert!(events.is_empty(), "no event outlives its failed view write");
-    common::cleanup_schemas().await;
+    schemas.finish().await;
 }
 
 /// Many appends to *different* streams race to fold into one shared
@@ -188,6 +184,7 @@ async fn a_view_that_cannot_fold_fails_the_append() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 async fn concurrent_folds_into_one_row_lose_nothing() {
+    let schemas = common::SchemaScope::open();
     const WRITERS: u64 = 24;
     let pool = common::fresh_pool(&common::url(), "inline", WRITERS as u32).await;
     let store = PgStore::<Event>::new(pool).with_inline_views(vec![total()]);
@@ -214,24 +211,5 @@ async fn concurrent_folds_into_one_row_lose_nothing() {
         row(&views, "total", "all").await.map(|r| r.0),
         Some(WRITERS)
     );
-    common::cleanup_schemas().await;
-}
-
-/// A plain store (no inline views) still writes no view rows.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
-async fn without_inline_views_nothing_is_written() {
-    let pool = common::fresh_pool(&common::url(), "inline", 2).await;
-    let store = PgStore::<Event>::new(pool);
-    let views = PgViewStore::<Balance>::new(&store);
-    store
-        .append(
-            &StreamId::from("account-1"),
-            ExpectedVersion::Empty,
-            vec![deposit(1)],
-        )
-        .await
-        .expect("append");
-    assert!(row(&views, "balance", "account-1").await.is_none());
-    common::cleanup_schemas().await;
+    schemas.finish().await;
 }

@@ -1,18 +1,20 @@
 //! The shared schema lifecycle for the Postgres test binaries: one
-//! fresh schema per store, registered for cleanup, so a dev database
-//! does not fill with test schemas.
+//! fresh schema per store, each owned by the test thread that created
+//! it, so a dev database does not fill with test schemas.
 //!
 //! Every `#[ignore]`d test file here runs against a real Postgres
 //! (`EVENTYR_TEST_PG_URL`); each store it builds lives in its own
-//! schema, and [`cleanup_schemas`] drops them all at the test's end.
+//! schema. [`SchemaScope`] owns the schemas one test creates and drops
+//! them — at [`finish`](SchemaScope::finish), on the test's own
+//! runtime — so tests in one binary may run in parallel: a finishing
+//! test drops only its own schemas, never another test's live ones.
 //!
 //! Each test binary compiles this module and uses the subset of
 //! helpers its tests need — the rest stay for the next file.
 
 use std::time::Duration;
 
-/// A created schema, kept around until [`cleanup_schemas`] drops it at
-/// the test's end, so a dev database does not fill with test schemas.
+/// A created schema: the pools and the name, until its scope drops it.
 pub struct Schema {
     /// The pool bound to the schema (the store's).
     pub pool: sqlx::PgPool,
@@ -21,10 +23,88 @@ pub struct Schema {
     pub name: String,
 }
 
-static SCHEMAS: std::sync::Mutex<Vec<Schema>> = std::sync::Mutex::new(Vec::new());
+impl Schema {
+    /// Close the schema's pools and drop it. Awaited on the caller's
+    /// runtime at the test's end; a failure is the test's failure.
+    pub async fn drop(self) {
+        self.pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {} CASCADE",
+            self.name
+        )))
+        .execute(&self.admin)
+        .await
+        .expect("drop schema");
+        self.admin.close().await;
+    }
+}
+
+/// The schemas one test created. The helpers register into the
+/// *current thread's* scope, and libtest runs each test on one thread,
+/// so parallel tests in one binary never see each other's schemas.
+///
+/// [`finish`](Self::finish) drops exactly this scope's schemas and
+/// must be awaited inside the test's runtime. A test that fails
+/// before its `finish` leaves its scope behind on the thread; the
+/// next `open` on that thread (the next test, in a serial run) takes
+/// the slot over and drops the leftover pools — its schemas stay as
+/// clutter in the dev database until the next run against it prunes,
+/// which is the lesser evil to a suite that cannot run in parallel.
+pub struct SchemaScope {
+    schemas: Vec<Schema>,
+}
+
+thread_local! {
+    static SCOPE: std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<Vec<Schema>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl SchemaScope {
+    /// Open the scope the current thread's schema creations register
+    /// into. One per test: a leftover scope (its test failed before
+    /// finishing) is replaced — its pools close, best-effort — so a
+    /// failed test never breaks the next one's run.
+    pub fn open() -> Self {
+        SCOPE.with(|scope| {
+            *scope.borrow_mut() = Some(std::rc::Rc::new(std::cell::RefCell::new(Vec::new())));
+        });
+        Self {
+            schemas: Vec::new(),
+        }
+    }
+
+    fn register(schema: Schema) {
+        SCOPE.with(|scope| {
+            let slot = scope.borrow();
+            if let Some(registry) = slot.as_ref() {
+                registry.borrow_mut().push(schema);
+            } else {
+                panic!("a schema was created outside a schema scope");
+            }
+        });
+    }
+
+    /// Take this scope's schemas back from the thread's registry and
+    /// drop them all, awaited on the test's runtime. Call once, at the
+    /// test's end.
+    pub async fn finish(mut self) {
+        let mut schemas = Vec::new();
+        SCOPE.with(|scope| {
+            let mut slot = scope.borrow_mut();
+            if let Some(registry) = slot.take() {
+                schemas = std::mem::take(&mut *registry.borrow_mut());
+            }
+        });
+        self.schemas.append(&mut schemas);
+        for schema in self.schemas.drain(..) {
+            schema.drop().await;
+        }
+    }
+}
 
 /// Create a fresh schema named `{prefix}_{uuid}`, pin a pool's
-/// `search_path` to it, and migrate into it.
+/// `search_path` to it, migrate into it, and register it in the
+/// current thread's scope.
 ///
 /// One connection on the admin pool, closed promptly when idle: a
 /// contract run holds one of these per check until its test's cleanup,
@@ -61,7 +141,8 @@ pub async fn make_schema(url: &str, prefix: &str, connections: u32) -> Schema {
     Schema { pool, admin, name }
 }
 
-/// A store over a fresh, empty schema, registered for cleanup.
+/// A store over a fresh, empty schema, registered into the current
+/// thread's scope.
 ///
 /// The suite calls this once per check and expects an empty store each
 /// time — `stream_all` reads the whole log, so a shared database would
@@ -80,7 +161,7 @@ pub fn fresh_store<E>(
 ) -> eventyr_store_postgres::PgStore<E> {
     let schema = futures::executor::block_on(make_schema(url, prefix, 1));
     let store = eventyr_store_postgres::PgStore::new(schema.pool.clone());
-    SCHEMAS.lock().expect("registry").push(schema);
+    SchemaScope::register(schema);
     store
 }
 
@@ -94,35 +175,19 @@ pub async fn fresh_store_async<E>(
 ) -> eventyr_store_postgres::PgStore<E> {
     let schema = make_schema(url, prefix, connections).await;
     let store = eventyr_store_postgres::PgStore::new(schema.pool.clone());
-    SCHEMAS.lock().expect("registry").push(schema);
+    SchemaScope::register(schema);
     store
 }
 
-/// A fresh, empty schema's pool, registered for cleanup — for tests
-/// that build more than a store over it (view stores, lease stores).
+/// A fresh, empty schema's pool, registered into the current thread's
+/// scope — for tests that build more than a store over it (view
+/// stores, lease stores).
 #[allow(dead_code)] // each test binary uses a subset of the helpers
 pub async fn fresh_pool(url: &str, prefix: &str, connections: u32) -> sqlx::PgPool {
     let schema = make_schema(url, prefix, connections).await;
     let pool = schema.pool.clone();
-    SCHEMAS.lock().expect("registry").push(schema);
+    SchemaScope::register(schema);
     pool
-}
-
-/// Drop every schema a test created; call at the test's end.
-#[allow(dead_code)] // each test binary uses a subset of the helpers
-pub async fn cleanup_schemas() {
-    let schemas: Vec<Schema> = std::mem::take(&mut *SCHEMAS.lock().expect("registry"));
-    for schema in schemas {
-        schema.pool.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {} CASCADE",
-            schema.name
-        )))
-        .execute(&schema.admin)
-        .await
-        .expect("drop schema");
-        schema.admin.close().await;
-    }
 }
 
 /// The sync-driven suites run under this runtime, entered for the

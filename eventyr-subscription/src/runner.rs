@@ -175,11 +175,6 @@ impl<P> SkipRedelivered<P> {
             applied: std::collections::BTreeMap::new(),
         }
     }
-
-    /// The wrapped projection.
-    pub fn into_inner(self) -> P {
-        self.inner
-    }
 }
 
 impl<P> Projection for SkipRedelivered<P>
@@ -689,6 +684,7 @@ pub async fn drive_projector_leased<E, S, C, P, F, Fut, W, K, Le>(
     ports: DriverPorts<'_, W, K>,
     leases: &Le,
     policy: LeasePolicy,
+    resume: eventyr_core::subscription_machine::Checkpoint,
 ) -> Result<SubscriptionOutcome, RunError>
 where
     S: SubscriptionSource<Event = E>,
@@ -702,10 +698,7 @@ where
     Le: ProjectorLease,
     E: Clone + Send,
 {
-    let mut lease = match leases
-        .acquire(name, policy.ttl, policy.grace, policy.max_grace)
-        .await
-    {
+    let mut lease = match leases.acquire(name, policy).await {
         Ok(lease) => lease,
         Err(LeaseError::Taken) => {
             ports.metrics.counter(LEASE_LOST, 1);
@@ -733,8 +726,13 @@ where
     // successful renewal, or the store's own presumed-held deadline
     // when a renewal failed against a live store — renew AT that
     // deadline, not a ttl past it.
-    let mut due_at = std::time::Instant::now() + policy.ttl;
-    let mut last_acked = checkpoints.load(name).await.map_err(RunError::Store)?;
+    // `checked_add`: an extreme ttl must not panic the driver — a
+    // deadline the monotonic clock cannot represent is due now.
+    let now = std::time::Instant::now();
+    let mut due_at = now.checked_add(policy.ttl).unwrap_or(now);
+    // The seed the machine was built from is also this run's starting
+    // `last acked`: one checkpoint read per run, not two.
+    let mut last_acked = resume;
     let mut action = machine.start();
     let mut batch_started: Option<std::time::Instant> = None;
     loop {
@@ -839,13 +837,13 @@ async fn renew_lease<Le: ProjectorLease>(
     policy: LeasePolicy,
     metrics: &dyn Metrics,
 ) -> RenewOutcome {
-    match leases
-        .renew(lease, policy.ttl, policy.grace, policy.max_grace)
-        .await
-    {
+    match leases.renew(lease, policy).await {
         Ok(at) => {
             metrics.counter(LEASE_RENEWALS, 1);
-            RenewOutcome::Due(at + policy.ttl)
+            // A `ttl` past the store's clock that overflows the
+            // monotonic range renews immediately next due-check — the
+            // far side of the range is unreachable at real ttls.
+            RenewOutcome::Due(at.checked_add(policy.ttl).unwrap_or(at))
         }
         Err(LeaseError::Lost) => {
             metrics.counter(LEASE_LOST, 1);
@@ -1103,11 +1101,17 @@ impl<S, C, P, W: CommitSignal, K> Projector<S, C, P, W, K> {
     /// between polls, or less when a commit arrives first.
     ///
     /// The listener is armed before the first poll, so no commit can
-    /// fall between a poll and the wait that follows it.
+    /// fall between a poll and the wait that follows it. Arming the
+    /// listener is the one exception to "the signal is a hint": a
+    /// listener that fails to arm does not fail the run — it degrades
+    /// to [`NoSignal`] and the timer, exactly as a listener that
+    /// errors mid-run does (see [`DriverPorts::wake_on`]), so a broken hint path
+    /// costs wake-ups, never the projection.
     ///
     /// # Errors
     ///
-    /// As [`run`](Projector::run), or arming the listener failed.
+    /// As [`run`](Projector::run): loading the checkpoint failed, or
+    /// the policy parks with no parked store.
     pub async fn run_woken<F, Fut>(self, sleep: F) -> Result<SubscriptionOutcome, StoreError>
     where
         S: SubscriptionSource<Event = P::Event>,
@@ -1119,8 +1123,13 @@ impl<S, C, P, W: CommitSignal, K> Projector<S, C, P, W, K> {
         P::Event: Clone + Send,
         K: ParkedStore<P::Event>,
     {
-        let listener = self.wake.subscribe().await?;
-        self.drive(sleep, listener).await
+        match self.wake.subscribe().await {
+            Ok(listener) => self.drive(sleep, listener).await,
+            // The hint path is broken; the timer was authoritative all
+            // along. Degrade, exactly as `wait` degrades on a listener
+            // that errors mid-run.
+            Err(_) => self.drive(sleep, NoSignal).await,
+        }
     }
 }
 
@@ -1231,11 +1240,6 @@ impl<S, C, P, W, K, Le> LeasedProjector<S, C, P, W, K, Le> {
         self
     }
 
-    /// The projector's name — the lease's name.
-    pub fn name(&self) -> &str {
-        self.projector.name()
-    }
-
     /// Signal `catch` on every idle sleep of the leased run (§14's
     /// catch-up pulse): the leased driver fires it exactly as the
     /// plain one does.
@@ -1292,36 +1296,32 @@ impl<S, C, P, W, K, Le> LeasedProjector<S, C, P, W, K, Le> {
         K: ParkedStore<P::Event>,
         Le: ProjectorLease,
     {
-        if matches!(self.projector.policy.on_failure, FailurePolicy::Park { .. })
-            && !<K as ParkedStore<P::Event>>::RECORDS
-        {
-            return Err(RunError::Store(self.projector.park_refusal()));
-        }
-        let mut machine = SubscriptionMachine::new(
-            self.projector.policy,
-            self.projector
-                .checkpoints
-                .load(&self.projector.name)
-                .await
-                .map_err(RunError::Store)?,
-        );
-        let mut ports = DriverPorts::new()
-            .wake_on(listener)
-            .park_into(self.projector.parked)
-            .with_metrics(metrics_or_noop(&self.projector.metrics));
-        if let Some(catch) = self.catch.as_deref() {
-            ports = ports.caught_up_on(catch);
-        }
+        let metrics = self.projector.metrics.clone();
+        let metrics = metrics_or_noop(&metrics);
+        let PreparedRun {
+            mut machine,
+            ports,
+            name,
+            source,
+            checkpoints,
+            projection,
+            resume,
+        } = self
+            .projector
+            .prepared(listener, self.catch.as_deref(), metrics)
+            .await
+            .map_err(RunError::Store)?;
         drive_projector_leased(
             &mut machine,
-            &self.projector.name,
-            &self.projector.source,
-            &self.projector.checkpoints,
-            self.projector.projection,
+            &name,
+            &source,
+            &checkpoints,
+            projection,
             sleep,
             ports,
             &self.leases,
             self.policy,
+            resume,
         )
         .await
     }
@@ -1334,9 +1334,11 @@ impl<S, C, P, W: CommitSignal, K, Le> LeasedProjector<S, C, P, W, K, Le> {
     ///
     /// # Errors
     ///
-    /// As [`LeasedProjector::run_leased`], or arming the listener
-    /// failed: [`RunError::Taken`], [`RunError::LeaseLost`], or
-    /// [`RunError::Store`].
+    /// As [`LeasedProjector::run_leased`]: the name was
+    /// [`Taken`](RunError::Taken), expired mid-run
+    /// ([`LeaseLost`](RunError::LeaseLost)), or the store failed. A
+    /// listener that fails to arm is not one of them — it degrades to
+    /// [`NoSignal`] and the timer, as in the plain run.
     pub async fn run_woken_leased<F, Fut>(self, sleep: F) -> Result<SubscriptionOutcome, RunError>
     where
         S: SubscriptionSource<Event = P::Event>,
@@ -1349,17 +1351,77 @@ impl<S, C, P, W: CommitSignal, K, Le> LeasedProjector<S, C, P, W, K, Le> {
         K: ParkedStore<P::Event>,
         Le: ProjectorLease,
     {
-        let listener = self
-            .projector
-            .wake
-            .subscribe()
-            .await
-            .map_err(RunError::Store)?;
-        self.drive_leased(sleep, listener).await
+        match self.projector.wake.subscribe().await {
+            Ok(listener) => self.drive_leased(sleep, listener).await,
+            // As the plain run: a broken hint path degrades to the
+            // timer, it does not end the run before the machine starts.
+            Err(_) => self.drive_leased(sleep, NoSignal).await,
+        }
     }
 }
 
+/// Everything the drive methods need, prepared once: the park-refusal
+/// gate passed, the checkpoint loaded into the machine, the ports
+/// built, and the projector's own pieces moved out — so the free
+/// drivers take no `self` and every drive path runs the same
+/// preparation.
+struct PreparedRun<'m, E, S, C, P, L, K> {
+    machine: SubscriptionMachine<E>,
+    ports: DriverPorts<'m, L, K>,
+    name: String,
+    source: S,
+    checkpoints: C,
+    projection: P,
+    /// The checkpoint the machine seeded from — the leased driver's
+    /// initial `last acked`, so it reads the checkpoint once per run.
+    resume: eventyr_core::subscription_machine::Checkpoint,
+}
+
 impl<S, C, P, W, K> Projector<S, C, P, W, K> {
+    /// The one preparation path every drive method shares: the
+    /// park-refusal gate, the checkpoint load that seeds the machine,
+    /// and the ports the driver runs with. The gate is a correctness
+    /// check — the leased and plain paths must refuse the same
+    /// misconfiguration — so it lives once, here.
+    async fn prepared<'m, L>(
+        self,
+        listener: L,
+        catch: Option<&'m dyn Catch>,
+        metrics: &'m dyn Metrics,
+    ) -> Result<PreparedRun<'m, P::Event, S, C, P, L, K>, StoreError>
+    where
+        S: SubscriptionSource<Event = P::Event>,
+        C: CheckpointStore,
+        P: Projection,
+        P::Event: Clone + Send,
+        L: CommitListener,
+        K: ParkedStore<P::Event>,
+    {
+        if matches!(self.policy.on_failure, FailurePolicy::Park { .. })
+            && !<K as ParkedStore<P::Event>>::RECORDS
+        {
+            return Err(self.park_refusal());
+        }
+        let resume = self.checkpoints.load(&self.name).await?;
+        let machine = SubscriptionMachine::new(self.policy, resume);
+        let mut ports = DriverPorts::new()
+            .wake_on(listener)
+            .park_into(self.parked)
+            .with_metrics(metrics);
+        if let Some(catch) = catch {
+            ports = ports.caught_up_on(catch);
+        }
+        Ok(PreparedRun {
+            machine,
+            ports,
+            name: self.name,
+            source: self.source,
+            checkpoints: self.checkpoints,
+            projection: self.projection,
+            resume,
+        })
+    }
+
     /// The misconfiguration answer: a parking policy with no parked
     /// store refuses to run rather than retry the event forever
     /// against [`NoParking`].
@@ -1380,30 +1442,30 @@ impl<S, C, P, W, K> Projector<S, C, P, W, K> {
         S: SubscriptionSource<Event = P::Event>,
         C: CheckpointStore,
         P: Projection,
+        P::Event: Clone + Send,
         P::Error: core::fmt::Display,
         F: FnMut(core::time::Duration) -> Fut,
         Fut: Future<Output = ()>,
-        P::Event: Clone + Send,
         L: CommitListener,
         K: ParkedStore<P::Event>,
     {
-        if matches!(self.policy.on_failure, FailurePolicy::Park { .. })
-            && !<K as ParkedStore<P::Event>>::RECORDS
-        {
-            return Err(self.park_refusal());
-        }
-        let resume = self.checkpoints.load(&self.name).await?;
-        let mut machine = SubscriptionMachine::new(self.policy, resume);
-        let ports = DriverPorts::new()
-            .wake_on(listener)
-            .park_into(self.parked)
-            .with_metrics(metrics_or_noop(&self.metrics));
+        let metrics = self.metrics.clone();
+        let metrics = metrics_or_noop(&metrics);
+        let PreparedRun {
+            mut machine,
+            ports,
+            name,
+            source,
+            checkpoints,
+            projection,
+            ..
+        } = self.prepared(listener, None, metrics).await?;
         Ok(drive_projector(
             &mut machine,
-            &self.name,
-            &self.source,
-            &self.checkpoints,
-            self.projection,
+            &name,
+            &source,
+            &checkpoints,
+            projection,
             sleep,
             ports,
         )
@@ -1422,31 +1484,30 @@ impl<S, C, P, W, K> Projector<S, C, P, W, K> {
         S: SubscriptionSource<Event = P::Event>,
         C: CheckpointStore,
         P: Projection,
+        P::Event: Clone + Send,
         P::Error: core::fmt::Display,
         F: FnMut(core::time::Duration) -> Fut,
         Fut: Future<Output = ()>,
-        P::Event: Clone + Send,
         L: CommitListener,
         K: ParkedStore<P::Event>,
     {
-        if matches!(self.policy.on_failure, FailurePolicy::Park { .. })
-            && !<K as ParkedStore<P::Event>>::RECORDS
-        {
-            return Err(self.park_refusal());
-        }
-        let resume = self.checkpoints.load(&self.name).await?;
-        let mut machine = SubscriptionMachine::new(self.policy, resume);
-        let ports = DriverPorts::new()
-            .wake_on(listener)
-            .park_into(self.parked)
-            .with_metrics(metrics_or_noop(&self.metrics))
-            .caught_up_on(catch);
+        let metrics = self.metrics.clone();
+        let metrics = metrics_or_noop(&metrics);
+        let PreparedRun {
+            mut machine,
+            ports,
+            name,
+            source,
+            checkpoints,
+            projection,
+            ..
+        } = self.prepared(listener, Some(catch), metrics).await?;
         Ok(drive_projector(
             &mut machine,
-            &self.name,
-            &self.source,
-            &self.checkpoints,
-            self.projection,
+            &name,
+            &source,
+            &checkpoints,
+            projection,
             sleep,
             ports,
         )

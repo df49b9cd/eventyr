@@ -1,8 +1,10 @@
 //! End-to-end against a real Postgres: append, conflict, read-back.
 //!
-//! Requires a database; `EVENTYR_TEST_PG_URL` points at it. The test is
-//! `#[ignore]`d by default — run it with `cargo test -- --ignored` once a
-//! Postgres is reachable (CI runs a disposable container and does this).
+//! Requires a database; `EVENTYR_TEST_PG_URL` points at it. The tests
+//! are `#[ignore]`d by default — run them with
+//! `cargo test -- --ignored` once a Postgres is reachable (each
+//! test's schemas live in its own `SchemaScope`, so a parallel run is
+//! safe).
 
 use futures::TryStreamExt;
 use uuid::Uuid;
@@ -37,14 +39,13 @@ fn new_stream() -> StreamId {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
-async fn append_read_conflict_stream_all() {
+async fn expectations_match_and_conflict() {
     let url = common::url();
-    // A fresh schema, not the default one: this test writes streams,
-    // and a dev database should not keep them.
-    let store = common::fresh_store_async::<BankEvent>(&url, "roundtrip", 2).await;
+    let schemas = common::SchemaScope::open();
+    let store = common::fresh_store_async::<BankEvent>(&url, "expectations", 2).await;
     let stream = new_stream();
 
-    // 1. ExpectEmpty on a brand-new stream.
+    // ExpectEmpty on a brand-new stream.
     let committed = store
         .append(
             &stream,
@@ -56,8 +57,8 @@ async fn append_read_conflict_stream_all() {
     assert_eq!(committed.len(), 1);
     assert_eq!(committed[0].version, Version::new(1));
 
-    // 2. Retry the empty expectation: the advisory lock + live-max
-    //    check surface a conflict against the row we just wrote.
+    // Retry the empty expectation: the advisory lock + live-max
+    // check surface a conflict against the row we just wrote.
     let conflict = store
         .append(
             &stream,
@@ -71,7 +72,7 @@ async fn append_read_conflict_stream_all() {
         eventyr_core::error::StoreError::Conflict { current, .. } if current == Version::new(1)
     ));
 
-    // 3. Exact matches the live max; the wrong exact value conflicts.
+    // Exact matches the live max; the wrong exact value conflicts.
     let conflict = store
         .append(
             &stream,
@@ -108,9 +109,32 @@ async fn append_read_conflict_stream_all() {
         .expect("`Any` appends unconditionally");
     assert_eq!(committed.len(), 1);
     assert_eq!(committed[0].version, Version::new(4));
+    schemas.finish().await;
+}
 
-    // 4. Read the stream: only events after the exclusive bound come
-    //    back, in stream order, with versions and sequences intact.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
+async fn stream_reads_honor_the_exclusive_bound() {
+    let url = common::url();
+    let schemas = common::SchemaScope::open();
+    let store = common::fresh_store_async::<BankEvent>(&url, "reads", 2).await;
+    let stream = new_stream();
+    store
+        .append(
+            &stream,
+            ExpectedVersion::Empty,
+            vec![
+                NewEvent::new(BankEvent::Opened { owner: "me".into() }),
+                NewEvent::new(BankEvent::Deposited { amount: 10 }),
+                NewEvent::new(BankEvent::Deposited { amount: 20 }),
+                NewEvent::new(BankEvent::Deposited { amount: 30 }),
+            ],
+        )
+        .await
+        .expect("seed four events");
+
+    // Only events after the exclusive bound come back, in stream
+    // order, with versions and sequences intact.
     let tail = store
         .stream(&stream, Version::new(2))
         .try_collect::<Vec<EventEnvelope<BankEvent>>>()
@@ -121,7 +145,7 @@ async fn append_read_conflict_stream_all() {
     assert_eq!(tail[1].event, BankEvent::Deposited { amount: 30 });
     assert!(tail[1].metadata.causation_id.is_none());
 
-    // 5. The whole history, from the start.
+    // The whole history, from the start.
     let all = store
         .stream(&stream, Version::EMPTY)
         .try_collect::<Vec<EventEnvelope<BankEvent>>>()
@@ -145,11 +169,34 @@ async fn append_read_conflict_stream_all() {
             &BankEvent::Deposited { amount: 30 }
         ]
     );
+    schemas.finish().await;
+}
 
-    // 6. A second stream proves the global sequence orders across
-    //    streams and the advisory locks don't hold them back. The
-    //    sequence numbers are monotonic across runs, so we assert on
-    //    relative order, not absolute values.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
+async fn the_global_stream_orders_across_streams() {
+    let url = common::url();
+    let schemas = common::SchemaScope::open();
+    let store = common::fresh_store_async::<BankEvent>(&url, "global", 2).await;
+    let stream = new_stream();
+    store
+        .append(
+            &stream,
+            ExpectedVersion::Empty,
+            vec![
+                NewEvent::new(BankEvent::Opened { owner: "me".into() }),
+                NewEvent::new(BankEvent::Deposited { amount: 10 }),
+                NewEvent::new(BankEvent::Deposited { amount: 20 }),
+                NewEvent::new(BankEvent::Deposited { amount: 30 }),
+            ],
+        )
+        .await
+        .expect("seed one stream");
+
+    // A second stream proves the global sequence orders across
+    // streams and the advisory locks don't hold them back. The
+    // sequence numbers are monotonic across runs, so we assert on
+    // relative order, not absolute values.
     let other = new_stream();
     store
         .append(
@@ -188,8 +235,15 @@ async fn append_read_conflict_stream_all() {
     assert!(events[0].sequence < events[1].sequence);
     assert!(events[1].sequence < events[2].sequence);
     assert!(events[2].sequence < events[3].sequence);
+    schemas.finish().await;
+}
 
-    // 7. Correlation/causation ids ride the metadata through and back.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
+async fn correlation_and_causation_ids_ride_the_metadata() {
+    let url = common::url();
+    let schemas = common::SchemaScope::open();
+    let store = common::fresh_store_async::<BankEvent>(&url, "metadata", 2).await;
     let stream = new_stream();
     store
         .append(
@@ -225,5 +279,5 @@ async fn append_read_conflict_stream_all() {
     assert_eq!(back[0].metadata.correlation_id, Some("corr-7".into()));
     #[cfg(feature = "time")]
     assert!(back[0].metadata.timestamp.is_some());
-    common::cleanup_schemas().await;
+    schemas.finish().await;
 }

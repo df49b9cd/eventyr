@@ -28,6 +28,12 @@ pub struct ParkedEvent<E> {
 
 /// Where parked events are recorded.
 ///
+/// The `subscription` parameter and field are the checkpoint name —
+/// the same key [`CheckpointStore`](crate::checkpoint::CheckpointStore)
+/// and [`ProjectorLease`](crate::lease::ProjectorLease) key by their
+/// `name`. (The field predates the shared vocabulary; a breaking round
+/// renames it.)
+///
 /// [`park`](Self::park) must be durable before it returns: the
 /// subscription acks past the event right after, so a park that is lost
 /// is an event that is silently skipped.

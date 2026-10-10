@@ -196,75 +196,8 @@ mod tests {
     use eventyr_subscription::parked::{InMemoryParkedStore, ParkedEvent, ParkedStore};
     use futures::executor::block_on;
 
-    use crate::{
-        Cipher, CipherError, InMemoryKeyStore, Sensitive, Shredder, ShreddingParkedStore,
-        SubjectKey,
-    };
-
-    /// The same *not-encryption* toy the integration tests use (the
-    /// shredder's guarantees tested here don't depend on the cipher),
-    /// duplicated: cross-file test sharing is not worth a public seam.
-    struct Toy;
-
-    fn checksum(parts: &[&[u8]]) -> u8 {
-        parts
-            .iter()
-            .flat_map(|p| p.iter())
-            .fold(0u8, |acc, b| acc.wrapping_mul(31).wrapping_add(*b))
-    }
-
-    impl Cipher for Toy {
-        fn algorithm(&self) -> &'static str {
-            "toy"
-        }
-
-        fn generate_key(&self) -> Result<SubjectKey, CipherError> {
-            use std::sync::atomic::{AtomicU8, Ordering};
-            static NEXT: AtomicU8 = AtomicU8::new(1);
-            Ok(SubjectKey::from_bytes(vec![
-                NEXT.fetch_add(
-                    37,
-                    Ordering::Relaxed
-                ) | 1;
-                4
-            ]))
-        }
-
-        fn encrypt(
-            &self,
-            key: &SubjectKey,
-            plaintext: &[u8],
-            aad: &[u8],
-        ) -> Result<Vec<u8>, CipherError> {
-            let k = key.as_bytes();
-            let mut out: Vec<u8> = plaintext
-                .iter()
-                .enumerate()
-                .map(|(i, b)| b ^ k[i % k.len()])
-                .collect();
-            out.push(checksum(&[k, plaintext, aad]));
-            Ok(out)
-        }
-
-        fn decrypt(
-            &self,
-            key: &SubjectKey,
-            ciphertext: &[u8],
-            aad: &[u8],
-        ) -> Result<Vec<u8>, CipherError> {
-            let (body, tag) = ciphertext.split_at(ciphertext.len() - 1);
-            let k = key.as_bytes();
-            let plain: Vec<u8> = body
-                .iter()
-                .enumerate()
-                .map(|(i, b)| b ^ k[i % k.len()])
-                .collect();
-            if checksum(&[k, &plain, aad]) != tag[0] {
-                return Err(CipherError("authentication failed".into()));
-            }
-            Ok(plain)
-        }
-    }
+    use crate::test_support::Toy;
+    use crate::{InMemoryKeyStore, Sensitive, Shredder, ShreddingParkedStore};
 
     #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
     #[serde(transparent)]

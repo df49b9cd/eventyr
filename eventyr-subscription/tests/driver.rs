@@ -293,7 +293,9 @@ async fn a_commit_wakes_an_idle_projector() {
     .wake_on(Arc::clone(&store));
     let run = tokio::spawn(projector.run_woken(tokio::time::sleep));
 
-    wait_until(&seen, 1).await;
+    tokio::time::timeout(Duration::from_secs(5), wait_until(&seen, 1))
+        .await
+        .expect("the first event reaches the projection");
     store
         .append(
             &StreamId::from("account-2"),
@@ -332,7 +334,9 @@ async fn without_a_signal_an_idle_projector_waits_out_its_sleep() {
     ));
     let run = tokio::spawn(projector.run(tokio::time::sleep));
 
-    wait_until(&seen, 1).await;
+    tokio::time::timeout(Duration::from_secs(5), wait_until(&seen, 1))
+        .await
+        .expect("the first event reaches the projection");
     store
         .append(
             &StreamId::from("account-2"),
@@ -1016,4 +1020,171 @@ async fn a_failed_ack_is_counted() {
 
     assert!(matches!(outcome, SubscriptionOutcome::CaughtUp { .. }));
     assert_eq!(counters.get(ACK_FAILURES), 1);
+}
+
+// -- Fanout: one projection over many ---------------------------------------
+
+/// A projection that records what it applies into its own vec, so a
+/// fan-out's members can be told apart.
+#[derive(Clone, Default)]
+struct Recording(Arc<Mutex<Vec<u64>>>);
+impl Projection for Recording {
+    type Event = u64;
+    type Error = &'static str;
+    async fn apply(&mut self, event: &EventEnvelope<u64>) -> Result<(), Self::Error> {
+        self.0.lock().expect("poisoned").push(event.event);
+        Ok(())
+    }
+}
+
+/// The fan-out applies each event to every member, in order.
+#[tokio::test]
+async fn a_fanout_applies_every_event_to_every_member_in_order() {
+    let store = Arc::new(InMemoryStore::new());
+    populate(&store, &[11, 12]).await;
+    let left = Recording::default();
+    let right = Recording::default();
+    let outcome = Projector::new(
+        "fanned",
+        StoreSubscription::new(Arc::clone(&store)),
+        InMemoryCheckpointStore::new(),
+        Fanout::new(vec![left.clone(), right.clone()]),
+    )
+    .with_policy(
+        SubscriptionPolicy::new(64, std::time::Duration::ZERO, std::time::Duration::ZERO)
+            .stop_at_catch_up(),
+    )
+    .run(|_| future::ready(()))
+    .await
+    .expect("run");
+    assert!(matches!(outcome, SubscriptionOutcome::CaughtUp { .. }));
+    assert_eq!(*left.0.lock().expect("poisoned"), vec![11, 12]);
+    assert_eq!(*right.0.lock().expect("poisoned"), vec![11, 12]);
+}
+
+/// Rejects the 4 — once. The second delivery of the batch must reach
+/// every member again (the at-least-once contract applies to the
+/// fan-out as one projection), which is what `Recording`'s per-member
+/// vecs show.
+struct RejectOnce {
+    inner: Recording,
+    /// The event this member rejects on its first sight of it; a
+    /// value that never appears makes a member that never rejects.
+    reject_on: u64,
+    rejected: std::sync::atomic::AtomicBool,
+}
+
+/// The steady member's recording handle, for the assertion after the
+/// run: it never rejects, so its vec shows the redelivery too.
+fn recording_of(member: &RejectOnce) -> Arc<Mutex<Vec<u64>>> {
+    member.inner.0.clone()
+}
+impl Projection for RejectOnce {
+    type Event = u64;
+    type Error = &'static str;
+    async fn apply(&mut self, event: &EventEnvelope<u64>) -> Result<(), Self::Error> {
+        if event.event == self.reject_on
+            && !self
+                .rejected
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err("not this time");
+        }
+        self.inner.apply(event).await
+    }
+}
+
+/// A rejection from one fan-out member rejects the batch, and the
+/// redelivered batch reaches *every* member again — the doc's exact
+/// at-least-once claim.
+#[tokio::test]
+async fn a_fanout_rejection_redelivers_to_every_member() {
+    let store = Arc::new(InMemoryStore::new());
+    populate(&store, &[1, 4, 9]).await;
+    let steady = RejectOnce {
+        inner: Recording::default(),
+        reject_on: u64::MAX, // never appears: this member never rejects
+        rejected: std::sync::atomic::AtomicBool::new(false),
+    };
+    let picky = RejectOnce {
+        inner: Recording::default(),
+        reject_on: 4,
+        rejected: std::sync::atomic::AtomicBool::new(false),
+    };
+    let steady_inner = recording_of(&steady);
+    let picky_inner = recording_of(&picky);
+    let outcome = Projector::new(
+        "retried",
+        StoreSubscription::new(Arc::clone(&store)),
+        InMemoryCheckpointStore::new(),
+        Fanout::new(vec![steady, picky]),
+    )
+    .with_policy(
+        SubscriptionPolicy::new(64, std::time::Duration::ZERO, std::time::Duration::ZERO)
+            .stop_at_catch_up(),
+    )
+    .run(|_| future::ready(()))
+    .await
+    .expect("run");
+
+    assert!(matches!(outcome, SubscriptionOutcome::CaughtUp { .. }));
+    // The steady member saw the batch up to the rejection, then the
+    // full redelivery from the last ack — the fan-out is one
+    // at-least-once unit, not per-member retries. (The rejection stops
+    // the batch mid-flight at event 4; the redelivery replays [1, 4,
+    // 9] from the origin.)
+    assert_eq!(
+        *steady_inner.lock().expect("poisoned"),
+        vec![1, 4, 1, 4, 9],
+        "the redelivery reaches the member that never rejected"
+    );
+    // The picky member folded 1, rejected 4, then on the redelivery
+    // folded 1 again (at-least-once), then 4 (accepted this time) and
+    // 9. Its vec is the redelivery's witness, the steady member's is
+    // the fan-out's.
+    assert_eq!(*picky_inner.lock().expect("poisoned"), vec![1, 1, 4, 9]);
+}
+
+// -- the blocking driver ----------------------------------------------------
+
+/// The blocking projector driver runs without an async runtime and
+/// returns the same outcome the async one does, persisting the
+/// checkpoint it reached.
+#[test]
+fn the_blocking_projector_driver_reaches_catch_up() {
+    use eventyr_subscription::prelude::SubscriptionOutcome;
+
+    let store = Arc::new(InMemoryStore::new());
+    let events: Vec<_> = (1..=3u64).map(NewEvent::new).collect();
+    futures::executor::block_on(store.append(
+        &StreamId::from("account-1"),
+        ExpectedVersion::Empty,
+        events,
+    ))
+    .expect("seed");
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let checkpoints = InMemoryCheckpointStore::new();
+    let mut machine = eventyr_core::subscription_machine::SubscriptionMachine::new(
+        SubscriptionPolicy::new(64, std::time::Duration::ZERO, std::time::Duration::ZERO)
+            .stop_at_catch_up(),
+        eventyr_core::subscription_machine::Checkpoint::ORIGIN,
+    );
+    let projection = Seen(seen.clone());
+    let ports = DriverPorts::new();
+    let outcome = drive_projector_blocking(
+        &mut machine,
+        "blocked",
+        &StoreSubscription::new(Arc::clone(&store)),
+        &checkpoints,
+        projection,
+        |_| future::ready(()),
+        ports,
+    );
+
+    assert!(matches!(outcome, SubscriptionOutcome::CaughtUp { .. }));
+    assert_eq!(*seen.lock().expect("poisoned"), vec![1, 2, 3]);
+    // The checkpoint the blocking run persisted is where it stopped.
+    let saved = futures::executor::block_on(checkpoints.load("blocked")).expect("checkpoint saved");
+    assert_eq!(saved.as_sequence().as_u64(), 3);
 }

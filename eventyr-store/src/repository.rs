@@ -11,7 +11,7 @@ use eventyr_core::envelope::EventEnvelope;
 use eventyr_core::error::StoreError;
 use eventyr_core::snapshot::{HasSnapshotState, OfferSnapshot, Snapshot, WritePolicy};
 use eventyr_core::vocabulary::{StreamId, Version};
-use eventyr_core::write::{RetryPolicy, WriteMachine, WriteOutcome};
+use eventyr_core::write::{RetryPolicy, WriteMachine, WriteOutcome, envelope_continues};
 
 use crate::driver::{drive_write, drive_write_with_snapshots};
 use crate::snapshot_store::SnapshotStore;
@@ -127,23 +127,6 @@ where
             store,
             snapshots: (),
             policy: WritePolicy::retries(retry_policy),
-            _aggregate: core::marker::PhantomData,
-        }
-    }
-
-    /// A repository over `store` whose whole write path — retry budget
-    /// and (like [`new`](AggregateRepository::new), absent) snapshot
-    /// cadence — comes from the combined
-    /// [`WritePolicy`].
-    ///
-    /// Snapshot cadence on a snapshots-off repository is a no-op (`with_snapshots`
-    /// reads the same field); build from a policy already carrying one
-    /// only if the repository is about to be turned on.
-    pub fn from_policy(store: S, policy: WritePolicy) -> Self {
-        Self {
-            store,
-            snapshots: (),
-            policy,
             _aggregate: core::marker::PhantomData,
         }
     }
@@ -349,8 +332,12 @@ where
     /// The two machine invariants are re-checked here — the events are
     /// for the expected stream, and versions are contiguous from the
     /// seed — so a misbehaving store fails the fold loudly instead of
-    /// silently producing a wrong state (the same checks `WriteMachine`
-    /// makes on load).
+    /// silently producing a wrong state. [`envelope_continues`] is the
+    /// rule itself, shared with `WriteMachine`'s load fold: one
+    /// predicate, one pair of messages. It runs before `keep` (the
+    /// check reads the envelope, it does not fold it), and the version
+    /// it advances is committed only when the event is folded — so
+    /// `load_until` still reports the version it stopped at.
     async fn fold_while(
         &self,
         id: &A::Id,
@@ -371,19 +358,15 @@ where
         futures::pin_mut!(events);
         while let Some(envelope) = futures::StreamExt::next(&mut events).await {
             let envelope = envelope?;
-            if envelope.stream_id != stream_id {
-                return Err(StoreError::protocol("the store read another stream"));
-            }
-            if envelope.version.as_u64() != version.as_u64().saturating_add(1) {
-                return Err(StoreError::protocol(
-                    "the store read a non-contiguous sequence",
-                ));
-            }
+            // The predicate advances a scratch of the reached version;
+            // it becomes the fold's version only if the event is kept.
+            let mut reached = version;
+            envelope_continues(&stream_id, &mut reached, &envelope)?;
             if !keep(&envelope)? {
                 break;
             }
             A::apply(&mut state, &envelope.event);
-            version = envelope.version;
+            version = reached;
         }
         Ok(Loaded { state, version })
     }
@@ -452,10 +435,7 @@ where
         AggregateRepository {
             store: self.store,
             snapshots,
-            policy: WritePolicy {
-                retry: self.policy.retry,
-                snapshot: Some(policy),
-            },
+            policy: self.policy.with_snapshots(policy),
             _aggregate: core::marker::PhantomData,
         }
     }
@@ -569,9 +549,8 @@ where
     ///
     /// When the repository carries no snapshot cadence policy — the
     /// constructor [`with_snapshots`](Self::with_snapshots) sets one
-    /// before this method is reachable, so a plain repository built
-    /// with [`from_policy`](Self::from_policy) cannot get here (the
-    /// `SS: SnapshotStore` bound rules it out at the type level).
+    /// before this method is reachable (the `SS: SnapshotStore` bound
+    /// rules a plain repository out at the type level).
     pub async fn execute_with_snapshots_and_metadata(
         &self,
         id: A::Id,

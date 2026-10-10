@@ -103,9 +103,11 @@ pub trait EventStore {
     /// Stream the events of one stream, from `from` (exclusive) onward.
     ///
     /// The stream is the async boundary: the method itself is
-    /// synchronous (it only constructs the stream), and the store does
-    /// its I/O as the stream is polled. An unknown stream yields an
-    /// empty stream, not an error.
+    /// synchronous (it only constructs the stream), and the reads page
+    /// as the stream is polled — the global reads one page at a time,
+    /// and a per-stream read that collects does so under its store's
+    /// own paging discipline. An unknown stream yields an empty
+    /// stream, not an error.
     fn stream(
         &self,
         stream_id: &StreamId,
@@ -290,6 +292,22 @@ pub struct FilteredRead<E> {
     /// The highest sequence the read looked at (the read's `from` when
     /// it looked at nothing). At least the last event's sequence.
     pub scanned: Sequence,
+}
+
+impl<E> FilteredRead<E> {
+    /// Build the answer of a filtered read that looked from `bound`
+    /// (exclusive) up to at most `max` events: a read that filled
+    /// `max` stopped at its last event — that is how far it looked —
+    /// and one that did not looked at everything up to the bound.
+    /// Both SQL backends derive this; one rule, once.
+    pub fn scanned_to(events: Vec<EventEnvelope<E>>, bound: Sequence, max: usize) -> Self {
+        let full = events.len() == max;
+        let scanned = match events.last() {
+            Some(last) if full => last.sequence,
+            _ => bound,
+        };
+        Self { events, scanned }
+    }
 }
 
 /// A store that can end a stream's life (roadmap 0.7.6): close it to further
