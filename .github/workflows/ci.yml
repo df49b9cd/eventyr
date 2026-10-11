@@ -104,7 +104,10 @@ jobs:
       - name: cargo-hack (feature powersets)
         uses: taiki-e/install-action@a561ea09b94560aba5b8b2b78e1562ec242dc5f8 # cargo-hack
       - name: Feature checks
-        run: cargo hack check --workspace --each-feature --no-dev-deps --locked
+        # No `--locked` here: `--no-dev-deps` rewrites each manifest
+        # while it runs, and the rewrite legitimately changes what the
+        # lock resolves — every other cargo step pins the lock.
+        run: cargo hack check --workspace --each-feature --no-dev-deps
 
   # The crates must stay publishable: path-only dev-deps between
   # workspace members, the packaged README, and the metadata the
