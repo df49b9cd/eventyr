@@ -79,8 +79,9 @@ Five shipped examples, each behind exactly the features it uses so
   include_str!("../README.md")]`) and the crate/table features table is the
   user-facing map; every per-crate `README.md` in the workspace is a symlink to
   it.
-* CI runs `cargo hack --each-feature --no-dev-deps` against this crate to
-  prove every feature combination builds standalone.
+* CI runs `cargo hack --each-feature --no-dev-deps` across the whole
+  workspace, this crate included, to prove every feature combination
+  builds standalone.
 
 ## Limits
 

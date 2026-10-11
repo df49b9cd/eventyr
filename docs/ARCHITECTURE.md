@@ -517,10 +517,14 @@ other crate adds capability features that only pull their dependencies in:
   `futures::executor::block_on`, not a runtime thread.
 
 CI verifies the matrix: fmt, `clippy -D warnings`, `doc -D warnings` on
-all-features; `cargo hack --each-feature --no-dev-deps` on the umbrella;
+all-features; `cargo hack --each-feature --no-dev-deps` across the workspace;
 a `no_std` build for core on `thumbv7em-none-eabihf` (with `serde` and
-`time` on); MSRV 1.99 check; miri on core's machine proptests; and the
-Postgres-backed contract tests against a real Postgres 17 service.
+`time` on); MSRV 1.99 check; miri on core's machine proptests; a packaging
+dry run that builds every crate from its tarball against a throwaway
+registry of the packaged siblings; the Postgres-backed contract tests
+against a real Postgres 17 service; and, weekly, `cargo audit` over the
+committed `Cargo.lock` — the workspace links crypto and TLS primitives,
+so an advisory is a deliberate decision, not a surprise.
 
 ## 13. Testing architecture
 
@@ -538,7 +542,7 @@ pays off:
    `projector_scripted`, …) without any runtime.
 3. **Scenario harness** (core's `testing`): `Scenario::<A>::given(..).when(..)`
    for aggregate-level BDD-style tests, plus the canonical `account`
-   fixture and the `enrollment` fixture in core's boundary module.
+   fixture and the `enrollment` fixture in core's `testing` module.
 4. **Store contracts** (eventyr-store-testing; detail:
    [crates/eventyr-store-testing.md](crates/eventyr-store-testing.md)):
    suites — `event_store_contract`, `event_store_batch_contract`,
