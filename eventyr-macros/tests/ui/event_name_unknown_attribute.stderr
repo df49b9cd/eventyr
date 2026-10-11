@@ -1,0 +1,5 @@
+error: unknown eventyr attribute; expected `name` or `crate`
+ --> tests/ui/event_name_unknown_attribute.rs:6:11
+  |
+6 | #[eventyr(nme = "x")]
+  |           ^^^

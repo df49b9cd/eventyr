@@ -207,11 +207,82 @@ mod catches {
                 .await
             })
         };
-        // Condition-based wait: the pulse fires at the first idle
-        // boundary, whenever that lands.
-        while *pulse.fired.lock().expect("poisoned") == 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        // Condition-based wait, bounded: the pulse fires at the first
+        // idle boundary, whenever that lands — and a regression that
+        // never fires is a red test, not a hung one.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while *pulse.fired.lock().expect("poisoned") == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the pulse fires at the first idle");
+        run.abort();
+        assert_eq!(*seen.0.lock().expect("poisoned"), vec![11, 12]);
+    }
+
+    /// An owned pulse handle: `LeasedProjector::caught_up_on` takes the
+    /// pulse by value, and the shared observable stays behind the Arc.
+    struct SharedPulse(Arc<Pulse>);
+    impl Catch for SharedPulse {
+        fn caught_up(&self) {
+            self.0.caught_up();
         }
+    }
+
+    /// The leased driver fires the same pulse (§14): a perennial run
+    /// under a lease reaches its first idle boundary and signals it,
+    /// through the `LeasedProjector::caught_up_on` wiring the plain
+    /// runs above do not cover. A wiring that dropped the pulse would
+    /// leave the count at zero and fail the bounded wait.
+    #[tokio::test]
+    async fn a_leased_run_fires_the_pulse_at_its_first_idle() {
+        use eventyr_subscription::lease::{InMemoryLeaseStore, LeasePolicy};
+
+        let store = Arc::new(InMemoryStore::new());
+        store
+            .append(
+                &StreamId::from("account-1"),
+                ExpectedVersion::Empty,
+                vec![NewEvent::new(11), NewEvent::new(12)],
+            )
+            .await
+            .expect("seed");
+
+        let seen = Seen::default();
+        let pulse = Arc::new(Pulse {
+            fired: Mutex::new(0),
+        });
+        // As the plain perennial run: spawned because it never ends,
+        // yield on every idle sleep so the single-threaded runtime
+        // runs the waiter, leased so the pulse travels the
+        // LeasedProjector path.
+        let run = {
+            let store = Arc::clone(&store);
+            let seen = seen.clone();
+            let pulse = Arc::clone(&pulse);
+            tokio::spawn(async move {
+                Projector::new(
+                    "leased-seen",
+                    StoreSubscription::new(store),
+                    InMemoryCheckpointStore::new(),
+                    seen,
+                )
+                .with_policy(SubscriptionPolicy::new(64, Duration::ZERO, Duration::ZERO))
+                .lease_with(Arc::new(InMemoryLeaseStore::new()))
+                .with_policy(LeasePolicy::default())
+                .caught_up_on(SharedPulse(Arc::clone(&pulse)))
+                .run_leased(|_| tokio::task::yield_now())
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while *pulse.fired.lock().expect("poisoned") == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the leased run fires the pulse at its first idle");
         run.abort();
         assert_eq!(*seen.0.lock().expect("poisoned"), vec![11, 12]);
     }

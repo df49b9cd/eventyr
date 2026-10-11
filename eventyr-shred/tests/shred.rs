@@ -9,76 +9,14 @@ use std::sync::Arc;
 use eventyr_core::envelope::NewEvent;
 use eventyr_core::vocabulary::{ExpectedVersion, Sequence, StreamId, Version};
 use eventyr_shred::{
-    Cipher, CipherError, InMemoryKeyStore, Sensitive, ShredError, Shredder, ShreddingStore,
-    SubjectKey,
+    InMemoryKeyStore, Sensitive, ShredError, Shredder, ShreddingStore, SubjectKey,
+    test_support::Toy,
 };
 use eventyr_store::memory::InMemoryStore;
 use eventyr_store::store::{EventStore, StreamsAll};
 use futures::TryStreamExt;
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
-
-struct Toy;
-
-fn checksum(parts: &[&[u8]]) -> u8 {
-    parts
-        .iter()
-        .flat_map(|p| p.iter())
-        .fold(0u8, |acc, b| acc.wrapping_mul(31).wrapping_add(*b))
-}
-
-impl Cipher for Toy {
-    fn algorithm(&self) -> &'static str {
-        "toy"
-    }
-
-    fn generate_key(&self) -> Result<SubjectKey, CipherError> {
-        use std::sync::atomic::{AtomicU8, Ordering};
-        static NEXT: AtomicU8 = AtomicU8::new(1);
-        Ok(SubjectKey::from_bytes(vec![
-            NEXT.fetch_add(
-                37,
-                Ordering::Relaxed
-            ) | 1;
-            4
-        ]))
-    }
-
-    fn encrypt(
-        &self,
-        key: &SubjectKey,
-        plaintext: &[u8],
-        aad: &[u8],
-    ) -> Result<Vec<u8>, CipherError> {
-        let k = key.as_bytes();
-        let mut out: Vec<u8> = plaintext
-            .iter()
-            .enumerate()
-            .map(|(i, b)| b ^ k[i % k.len()])
-            .collect();
-        out.push(checksum(&[k, plaintext, aad]));
-        Ok(out)
-    }
-
-    fn decrypt(
-        &self,
-        key: &SubjectKey,
-        ciphertext: &[u8],
-        aad: &[u8],
-    ) -> Result<Vec<u8>, CipherError> {
-        let (body, tag) = ciphertext.split_at(ciphertext.len() - 1);
-        let k = key.as_bytes();
-        let plain: Vec<u8> = body
-            .iter()
-            .enumerate()
-            .map(|(i, b)| b ^ k[i % k.len()])
-            .collect();
-        if checksum(&[k, &plain, aad]) != tag[0] {
-            return Err(CipherError("authentication failed".into()));
-        }
-        Ok(plain)
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum CustomerEvent {
@@ -273,7 +211,9 @@ fn the_in_memory_key_store_passes_the_key_store_contract() {
 
 /// The wrapper must be indistinguishable from the store it wraps for
 /// events with no sensitive fields: the whole store contract, run
-/// through it.
+/// through it — including the two ports whose wrapper impls carry real
+/// logic, `QueryAppend` (each opened stream decrypt-on-read) and
+/// `stream_all_filtered` (the filter-before-open optimization).
 #[test]
 fn a_shredding_store_passes_the_store_contracts() {
     let make = || ShreddingStore::new(InMemoryStore::<u64>::new(), shredder());
@@ -281,6 +221,18 @@ fn a_shredding_store_passes_the_store_contracts() {
     eventyr_store_testing::streams_all_contract::<u64, _>(make);
     eventyr_store_testing::event_store_batch_contract::<u64, _>(make);
     eventyr_store_testing::lifecycle_contract::<u64, _>(make);
+    // The two ports with wrapper logic of their own.
+    let make_enrollment = || {
+        ShreddingStore::new(
+            InMemoryStore::<eventyr_core::boundary::enrollment::EnrollmentEvent>::new(),
+            shredder(),
+        )
+    };
+    eventyr_store_testing::query_append_contract(make_enrollment);
+    eventyr_store_testing::lifecycle_query_append_contract(make_enrollment);
+    use eventyr_store_testing::ParityEvent;
+    let make_parity = || ShreddingStore::new(InMemoryStore::<ParityEvent>::new(), shredder());
+    eventyr_store_testing::filtered_read_contract::<ParityEvent, _>(make_parity);
 }
 
 /// End to end through the write machine: commands decide against plain

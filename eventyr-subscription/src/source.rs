@@ -58,11 +58,6 @@ impl<S> StoreSubscription<S> {
     pub fn new(store: S) -> Self {
         Self { store }
     }
-
-    /// The wrapped store.
-    pub fn into_inner(self) -> S {
-        self.store
-    }
 }
 
 /// Errors streaming past the returned batch are dropped with it: the
@@ -123,11 +118,6 @@ impl<S> FilteredSubscription<S> {
     pub fn scan_limit(mut self, scan_limit: usize) -> Self {
         self.scan_limit = scan_limit.max(1);
         self
-    }
-
-    /// The wrapped store.
-    pub fn into_inner(self) -> S {
-        self.store
     }
 }
 

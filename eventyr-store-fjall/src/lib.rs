@@ -62,6 +62,9 @@ mod store;
 
 pub use store::FjallStore;
 
+#[cfg(feature = "snapshots")]
+pub use snapshots::FjallSnapshotStore;
+
 /// The error type the store maps into
 /// [`StoreError::Other`](eventyr_core::error::StoreError::Other) at the
 /// port boundary — exposed so callers correlating logs can recover the

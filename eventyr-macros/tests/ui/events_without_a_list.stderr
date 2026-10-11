@@ -1,0 +1,5 @@
+error: expected a parenthesized list, like events(Opened, Deposited)
+ --> tests/ui/events_without_a_list.rs:6:21
+  |
+6 | #[eventyr(id = u64, events)]
+  |                     ^^^^^^

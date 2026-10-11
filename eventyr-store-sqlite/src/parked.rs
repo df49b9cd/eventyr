@@ -159,6 +159,11 @@ where
                             "a parked payload does not decode: {e}"
                         )))
                     })?;
+                    let attempts = u32::try_from(attempts).map_err(|_| {
+                        StoreError::from(SqliteStoreError::CorruptRow(format!(
+                            "a parked row's attempts is negative: {attempts}"
+                        )))
+                    })?;
                     Ok(ParkedEvent {
                         subscription: subscription.to_owned(),
                         envelope: EventEnvelope {
@@ -168,7 +173,7 @@ where
                             event,
                             metadata: Metadata::stored(cause, corr, key),
                         },
-                        attempts: u32::try_from(attempts).unwrap_or(u32::MAX),
+                        attempts,
                         error,
                     })
                 },

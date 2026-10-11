@@ -31,30 +31,29 @@ pub trait ProjectorLease: Send + Sync {
     /// returns. Renewed between batches, released on stop.
     type Lease: Send;
 
-    /// Take the lease for `name`: exclusive for `ttl * grace` past the
-    /// last renewal, never past `ttl * max_grace` from acquire (a stuck
-    /// renewer cannot jail the name forever). Returns
-    /// [`LeaseError::Taken`] when another holder owns it.
+    /// Take the lease for `name` under `policy`: exclusive for
+    /// `ttl * grace` past the last renewal, never past
+    /// `ttl * max_grace` from acquire (a stuck renewer cannot jail the
+    /// name forever). Returns [`LeaseError::Taken`] when another holder
+    /// owns it. A degenerate policy — the struct literals
+    /// [`LeasePolicy::new`](LeasePolicy::new) refuses — is refused
+    /// loudly with [`LeaseError::Store`], never silently applied.
     fn acquire(
         &self,
         name: &str,
-        ttl: Duration,
-        grace: u32,
-        max_grace: u32,
+        policy: LeasePolicy,
     ) -> impl Future<Output = Result<Self::Lease, LeaseError>> + Send;
 
-    /// Extend `lease`, due again `ttl` after this call. The returned
-    /// `Instant` is the store's own renewal clock — the anchor the next
-    /// due-ness is computed against, never the caller's wall clock.
-    /// [`LeaseError::Lost`] means the lease is gone (expired or taken
-    /// over): the run stops, and the checkpoint store is not written
-    /// again.
+    /// Extend `lease` under `policy`, due again `ttl` after this call.
+    /// The returned [`Instant`] is the store's own renewal clock — the
+    /// anchor the next due-ness is computed against, never the caller's
+    /// wall clock. [`LeaseError::Lost`] means the lease is gone
+    /// (expired or taken over): the run stops, and the checkpoint
+    /// store is not written again.
     fn renew(
         &self,
         lease: &mut Self::Lease,
-        ttl: Duration,
-        grace: u32,
-        max_grace: u32,
+        policy: LeasePolicy,
     ) -> impl Future<Output = Result<Instant, LeaseError>> + Send;
 
     /// Give `lease` up: the name is claimable at once, not at expiry.
@@ -170,8 +169,18 @@ struct LeaseRow {
 
 impl LeaseRow {
     fn held_at(&self, now: Instant) -> bool {
-        now.duration_since(self.renewed_at) < self.ttl * self.grace
-            && now.duration_since(self.acquired_at) < self.ttl * self.max_grace
+        // A window past the `Duration` arithmetic's range is an
+        // unbounded one — saturating to "held" keeps exclusivity, the
+        // property the lease exists for.
+        let within_grace = self
+            .ttl
+            .checked_mul(self.grace)
+            .is_some_and(|window| now.duration_since(self.renewed_at) < window);
+        let within_max = self
+            .ttl
+            .checked_mul(self.max_grace)
+            .is_some_and(|bound| now.duration_since(self.acquired_at) < bound);
+        within_grace && within_max
     }
 }
 
@@ -202,21 +211,28 @@ impl InMemoryLeaseStore {
             .is_some_and(|row| row.held_at(Instant::now()))
     }
 
-    /// Force `name` past its grace — the test seam for "the holder
-    /// stalled": the next renewal or acquire sees the lease as expired.
-    ///
-    /// # Panics
-    ///
-    /// When the monotonic clock's uptime is shorter than the lease
-    /// window being backdated past — impossible on any real machine,
-    /// but the `checked_sub` must say so rather than wrap.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn expire(&self, name: &str) {
-        if let Some(row) = self.lock().get_mut(name) {
-            row.renewed_at = Instant::now()
-                .checked_sub(row.ttl * row.grace + Duration::from_secs(1))
-                .expect("the monotonic clock predates the lease window");
+    /// The exclusivity floor: refuse exactly the policies that would
+    /// silently void exclusivity — a zero `grace` (or `max_grace`
+    /// below it) makes every lease instantly claimable, so a second
+    /// acquire succeeds over a live holder. A zero `ttl` stays legal
+    /// in-process: it expires the lease at once, which the tests (and
+    /// the contract) use as the "never renewed" seam; Postgres's
+    /// CHECKs are stricter. Errors as [`LeaseError::Store`] the way a
+    /// rejected SQL insert does.
+    fn validate(policy: LeasePolicy) -> Result<(), LeaseError> {
+        let broken = policy.grace < 1 || policy.max_grace < policy.grace;
+        if broken {
+            return Err(LeaseError::Store {
+                error: StoreError::other(format!(
+                    "a degenerate lease policy (ttl {:?}, grace {}, max_grace {}) \
+                     cannot hold a lease: ttl must be positive, grace at least 1, \
+                     and max_grace above grace",
+                    policy.ttl, policy.grace, policy.max_grace
+                )),
+                renewed_until: None,
+            });
         }
+        Ok(())
     }
 
     /// Force `name` past its `max_grace` while renewed within its
@@ -252,13 +268,13 @@ pub struct InMemoryLease {
 impl ProjectorLease for InMemoryLeaseStore {
     type Lease = InMemoryLease;
 
-    async fn acquire(
-        &self,
-        name: &str,
-        ttl: Duration,
-        grace: u32,
-        max_grace: u32,
-    ) -> Result<Self::Lease, LeaseError> {
+    async fn acquire(&self, name: &str, policy: LeasePolicy) -> Result<Self::Lease, LeaseError> {
+        // The same floor the SQL stores enforce with CHECKs (Postgres
+        // requires `ttl > 0`, `grace > 0`, `max_grace > grace`): a
+        // degenerate literal would void exclusivity here — a zero
+        // grace makes every lease instantly claimable — so it is
+        // refused like the database refuses it, not silently applied.
+        Self::validate(policy)?;
         let mut rows = self.lock();
         let now = Instant::now();
         if let Some(row) = rows.get(name)
@@ -273,9 +289,9 @@ impl ProjectorLease for InMemoryLeaseStore {
                 holder,
                 renewed_at: now,
                 acquired_at: now,
-                ttl,
-                grace,
-                max_grace,
+                ttl: policy.ttl,
+                grace: policy.grace,
+                max_grace: policy.max_grace,
             },
         );
         Ok(InMemoryLease {
@@ -287,10 +303,9 @@ impl ProjectorLease for InMemoryLeaseStore {
     async fn renew(
         &self,
         lease: &mut Self::Lease,
-        ttl: Duration,
-        grace: u32,
-        max_grace: u32,
+        policy: LeasePolicy,
     ) -> Result<Instant, LeaseError> {
+        Self::validate(policy)?;
         let mut rows = self.lock();
         let now = Instant::now();
         let Some(row) = rows.get_mut(&lease.name) else {
@@ -300,9 +315,9 @@ impl ProjectorLease for InMemoryLeaseStore {
             return Err(LeaseError::Lost);
         }
         row.renewed_at = now;
-        row.ttl = ttl;
-        row.grace = grace;
-        row.max_grace = max_grace;
+        row.ttl = policy.ttl;
+        row.grace = policy.grace;
+        row.max_grace = policy.max_grace;
         Ok(now)
     }
 
@@ -325,21 +340,17 @@ macro_rules! impl_lease_delegation {
             fn acquire(
                 &self,
                 name: &str,
-                ttl: Duration,
-                grace: u32,
-                max_grace: u32,
+                policy: LeasePolicy,
             ) -> impl Future<Output = Result<Self::Lease, LeaseError>> + Send {
-                (**self).acquire(name, ttl, grace, max_grace)
+                (**self).acquire(name, policy)
             }
 
             fn renew(
                 &self,
                 lease: &mut Self::Lease,
-                ttl: Duration,
-                grace: u32,
-                max_grace: u32,
+                policy: LeasePolicy,
             ) -> impl Future<Output = Result<Instant, LeaseError>> + Send {
-                (**self).renew(lease, ttl, grace, max_grace)
+                (**self).renew(lease, policy)
             }
 
             fn release(
@@ -387,37 +398,29 @@ pub fn lease_store_contract<L: ProjectorLease>(make_store: impl Fn() -> L) {
 
     // One name, one holder.
     let store = make_store();
-    let lease = block_on(store.acquire("ledger", policy.ttl, policy.grace, policy.max_grace))
-        .expect("a fresh name acquires");
+    let lease = block_on(store.acquire("ledger", policy)).expect("a fresh name acquires");
     let contested = LeasePolicy {
         ttl: Duration::from_millis(1),
         grace: policy.grace,
         max_grace: policy.max_grace,
     };
     assert!(matches!(
-        block_on(store.acquire(
-            "ledger",
-            contested.ttl,
-            contested.grace,
-            contested.max_grace
-        )),
+        block_on(store.acquire("ledger", contested)),
         Err(LeaseError::Taken)
     ));
     block_on(store.release(lease)).expect("release");
 
     // A released name is claimable.
-    let lease = block_on(store.acquire("ledger", policy.ttl, policy.grace, policy.max_grace))
-        .expect("released is claimable");
+    let lease = block_on(store.acquire("ledger", policy)).expect("released is claimable");
     block_on(store.release(lease)).expect("release");
 
     // Renewal keeps a lease; a never-renewed lease expires after
     // ttl * grace — wait the short arm out, then renew is lost.
     let store = make_store();
-    let mut lease =
-        block_on(store.acquire("ledger", zero.ttl, zero.grace, zero.max_grace)).expect("acquire");
+    let mut lease = block_on(store.acquire("ledger", zero)).expect("acquire");
     std::thread::sleep(Duration::from_millis(10));
     assert!(matches!(
-        block_on(store.renew(&mut lease, zero.ttl, zero.grace, zero.max_grace)),
+        block_on(store.renew(&mut lease, zero)),
         Err(LeaseError::Lost)
     ));
 
@@ -434,15 +437,12 @@ pub fn lease_store_contract<L: ProjectorLease>(make_store: impl Fn() -> L) {
         grace: 3,
         max_grace: 4,
     };
-    let mut lease =
-        block_on(store.acquire("max-grace", bounded.ttl, bounded.grace, bounded.max_grace))
-            .expect("acquire");
+    let mut lease = block_on(store.acquire("max-grace", bounded)).expect("acquire");
     std::thread::sleep(Duration::from_millis(200)); // within grace (300 ms)
-    block_on(store.renew(&mut lease, bounded.ttl, bounded.grace, bounded.max_grace))
-        .expect("renewed in time");
+    block_on(store.renew(&mut lease, bounded)).expect("renewed in time");
     std::thread::sleep(Duration::from_millis(260)); // past max_grace (400 ms)
     assert!(matches!(
-        block_on(store.renew(&mut lease, bounded.ttl, bounded.grace, bounded.max_grace)),
+        block_on(store.renew(&mut lease, bounded)),
         Err(LeaseError::Lost)
     ));
 
@@ -453,14 +453,12 @@ pub fn lease_store_contract<L: ProjectorLease>(make_store: impl Fn() -> L) {
     // the final check — `Taken` there can only mean the stale release
     // left the row alone.
     let store = make_store();
-    let stale =
-        block_on(store.acquire("stale", zero.ttl, zero.grace, zero.max_grace)).expect("acquire");
+    let stale = block_on(store.acquire("stale", zero)).expect("acquire");
     std::thread::sleep(Duration::from_millis(10)); // past ttl * grace
-    let current = block_on(store.acquire("stale", policy.ttl, policy.grace, policy.max_grace))
-        .expect("the expired name is claimable");
+    let current = block_on(store.acquire("stale", policy)).expect("the expired name is claimable");
     block_on(store.release(stale)).expect("releasing a stale handle is Ok");
     assert!(matches!(
-        block_on(store.acquire("stale", policy.ttl, policy.grace, policy.max_grace)),
+        block_on(store.acquire("stale", policy)),
         Err(LeaseError::Taken) // the new holder was not disturbed
     ));
     block_on(store.release(current)).expect("release");

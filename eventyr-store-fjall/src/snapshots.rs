@@ -61,7 +61,13 @@ impl<S> FjallSnapshotStore<S> {
         let mut key = Vec::with_capacity(stream_id.as_str().len() + 1 + 16);
         key.extend_from_slice(stream_id.as_str().as_bytes());
         key.push(0);
-        key.extend_from_slice(format!("{version:016}").as_bytes());
+        // Fixed-width for lexicographic order (the load path parses the
+        // version back from the last 16 bytes); beyond 10^16 versions
+        // the width grows and both break — asserted loud, per the
+        // store's own `sql_position` unreachable-magnitude argument.
+        let tail = format!("{version:016}");
+        debug_assert_eq!(tail.len(), 16, "the snapshot key layout is 16 digits");
+        key.extend_from_slice(tail.as_bytes());
         key
     }
 }

@@ -44,7 +44,7 @@ mod parked;
 mod snapshots;
 mod store;
 #[cfg(feature = "views")]
-pub mod views;
+mod views;
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 

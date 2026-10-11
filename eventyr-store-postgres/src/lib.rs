@@ -57,6 +57,13 @@
 //! *transaction-scoped advisory locks* and commits raise `NOTIFY`, which
 //! need no extra grants.
 //!
+//! **TLS.** Connections use sqlx's `tls-rustls` (rustls 0.23, the ring
+//! provider) — no native-tls or OpenSSL is linked into an Eventyr
+//! application, through Eventyr or through sqlx. The sqlx workspace
+//! dependency is `default-features = false`, so an application
+//! bringing its own sqlx pool gets `tls-none` unless it picks a TLS
+//! feature itself.
+//!
 //! **One writable primary per store.** Eventyr's `global_sequence` is
 //! gap-free and in commit order because every append holds one
 //! database-wide advisory lock from drawing its sequence number until
@@ -121,7 +128,11 @@ pub use checkpoints::PgCheckpointStore;
 #[cfg(feature = "leases")]
 pub use leases::PgLeaseStore;
 pub use notify::PgCommitSignal;
+#[cfg(feature = "snapshots")]
+pub use snapshots::PgSnapshotStore;
 pub use store::PgStore;
+#[cfg(feature = "views")]
+pub use views::PgViewStore;
 
 /// The crate-level error: store failures are [`StoreError`] once they
 /// leave the store; this is what those `Other` variants wrap.

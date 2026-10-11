@@ -77,10 +77,10 @@ enum AccountError {
 impl fmt::Display for AccountError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::AlreadyOpen => "already open",
-            Self::NotOpen => "not open",
+            Self::AlreadyOpen => "account is already open",
+            Self::NotOpen => "account is not open",
             Self::InsufficientFunds => "insufficient funds",
-            Self::Closing => "closing",
+            Self::Closing => "account is closing",
         })
     }
 }

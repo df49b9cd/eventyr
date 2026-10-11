@@ -675,15 +675,15 @@ where
                 .fetch_all(&pool)
                 .await
                 .map_err(PgStoreError::into_store)?;
-            let full = rows.len() as i64 == max;
             let events = decode_rows::<E>(rows)?;
             // A read that filled `max` stopped at its last event; one
-            // that did not looked at everything up to the bound.
-            let scanned = match events.last() {
-                Some(last) if full => last.sequence,
-                _ => Sequence::new(u64::try_from(bound).unwrap_or(0)),
-            };
-            Ok(FilteredRead { events, scanned })
+            // that did not looked at everything up to the bound — the
+            // shared rule, one derivation.
+            Ok(FilteredRead::scanned_to(
+                events,
+                Sequence::new(u64::try_from(bound).unwrap_or(0)),
+                usize::try_from(max).unwrap_or(usize::MAX),
+            ))
         }
     }
 }

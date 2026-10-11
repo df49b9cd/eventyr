@@ -113,9 +113,11 @@ impl WritePolicy {
         }
     }
 
-    /// Turn snapshots on with `every` versions between them.
-    pub const fn with_snapshots(mut self, every: NonZeroU64) -> Self {
-        self.snapshot = Some(SnapshotPolicy::new(every));
+    /// Turn snapshots on under `policy`. Takes the whole
+    /// [`SnapshotPolicy`] (not a bare
+    /// cadence) so a policy carrying extra knobs stays one argument.
+    pub const fn with_snapshots(mut self, policy: SnapshotPolicy) -> Self {
+        self.snapshot = Some(policy);
         self
     }
 }

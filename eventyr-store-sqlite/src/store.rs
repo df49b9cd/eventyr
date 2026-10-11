@@ -490,6 +490,91 @@ impl<E: serde::de::DeserializeOwned> Iterator for GlobalPages<E> {
     }
 }
 
+/// One stream's events after a version, read a page at a time — the
+/// per-stream twin of [`GlobalPages`], so a long history never holds
+/// the connection while the caller folds (the repository's
+/// per-command load path runs through here; an unpage read would
+/// serialize the whole database behind every command's full-history
+/// collect and decode).
+///
+/// The lifecycle is re-checked on every page: a truncate between pages
+/// turns a read that would start below the new cut into the same
+/// [`StoreError::Truncated`] the pre-check produces, never a silent
+/// gap.
+struct StreamPages<E> {
+    conn: Arc<Mutex<rusqlite::Connection>>,
+    stream_id: StreamId,
+    cursor: i64,
+    buffer: VecDeque<Result<EventEnvelope<E>, StoreError>>,
+    done: bool,
+}
+
+impl<E> StreamPages<E> {
+    fn new(conn: Arc<Mutex<rusqlite::Connection>>, stream_id: StreamId, from: Version) -> Self {
+        Self {
+            conn,
+            stream_id,
+            cursor: sql_position(from.as_u64()),
+            buffer: VecDeque::new(),
+            done: false,
+        }
+    }
+}
+
+impl<E: serde::de::DeserializeOwned> Iterator for StreamPages<E> {
+    type Item = Result<EventEnvelope<E>, StoreError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.buffer.is_empty() && !self.done {
+            let guard = lock_conn(&self.conn);
+            let checked = lifecycle(&guard, &self.stream_id).and_then(|life| {
+                read_starts_before_cut(
+                    &self.stream_id,
+                    Version::new(self.cursor.unsigned_abs()),
+                    life.first_kept,
+                )
+            });
+            match checked.and_then(|()| {
+                let sql = format!(
+                    "SELECT {EVENT_COLUMNS} FROM events \
+                         WHERE stream_id = ?1 AND stream_version > ?2 \
+                         ORDER BY stream_version LIMIT ?3"
+                );
+                guard
+                    .prepare(&sql)
+                    .map_err(SqliteStoreError::into_store)
+                    .and_then(|mut stmt| {
+                        stmt.query_map(
+                            rusqlite::params![
+                                self.stream_id.as_str(),
+                                self.cursor,
+                                i64::try_from(PAGE).unwrap_or(i64::MAX)
+                            ],
+                            read_row,
+                        )
+                        .map_err(SqliteStoreError::into_store)?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map_err(SqliteStoreError::into_store)
+                    })
+            }) {
+                Ok(rows) => {
+                    // A short page is the end of the stream.
+                    self.done = rows.len() < PAGE;
+                    for row in rows {
+                        self.cursor = row.stream_version;
+                        self.buffer.push_back(EventEnvelope::try_from(row));
+                    }
+                }
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+            }
+        }
+        self.buffer.pop_front()
+    }
+}
+
 /// The highest sequence after `after` that `query` selects, read inside
 /// the conditional append's transaction. Rows are decoded one at a time
 /// and only the answer is kept.
@@ -575,31 +660,11 @@ where
         stream_id: &StreamId,
         from: Version,
     ) -> impl Stream<Item = Result<EventEnvelope<E>, StoreError>> + Send {
-        let conn = self.lock();
-        let checked = lifecycle(&conn, stream_id)
-            .and_then(|life| read_starts_before_cut(stream_id, from, life.first_kept));
-        if let Err(error) = checked {
-            return iter(vec![Err(error)]);
-        }
-        let sql = format!(
-            "SELECT {EVENT_COLUMNS} FROM events WHERE stream_id = ?1 AND stream_version > ?2 \
-             ORDER BY stream_version"
-        );
-        let events: Vec<Result<EventEnvelope<E>, StoreError>> = conn
-            .prepare(&sql)
-            .map_err(SqliteStoreError::into_store)
-            .and_then(|mut stmt| {
-                stmt.query_map(
-                    rusqlite::params![stream_id.as_str(), sql_position(from.as_u64())],
-                    read_row,
-                )
-                .map_err(SqliteStoreError::into_store)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(SqliteStoreError::into_store)
-            })
-            .map(|rows| rows.into_iter().map(EventEnvelope::try_from).collect())
-            .unwrap_or_else(|error| vec![Err(error)]);
-        iter(events)
+        iter(StreamPages::new(
+            Arc::clone(&self.conn),
+            stream_id.clone(),
+            from,
+        ))
     }
 }
 
@@ -692,16 +757,17 @@ where
                     .collect::<rusqlite::Result<Vec<_>>>()
             })
             .map_err(SqliteStoreError::into_store)?;
-        let full = rows.len() == max;
         let events = rows
             .into_iter()
             .map(EventEnvelope::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        let scanned = match events.last() {
-            Some(last) if full => last.sequence,
-            _ => Sequence::new(position(bound)?),
-        };
-        Ok(FilteredRead { events, scanned })
+        // The shared filtered-read rule: a full page stops at its last
+        // event, a short one looked at everything up to the bound.
+        Ok(FilteredRead::scanned_to(
+            events,
+            Sequence::new(position(bound)?),
+            max,
+        ))
     }
 }
 

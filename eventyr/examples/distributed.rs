@@ -53,12 +53,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use eventyr::postgres::views::PgViewStore;
-use eventyr::postgres::{PgCheckpointStore, PgCommitSignal, PgLeaseStore, PgStore};
+use eventyr::postgres::{PgCheckpointStore, PgCommitSignal, PgLeaseStore, PgStore, PgViewStore};
 use eventyr::prelude::*;
 use eventyr::projection::prelude::{View, ViewProjection, ViewStore};
 use eventyr::sqlite::{SqliteCheckpointStore, SqliteStore, SqliteViewStore};
-use eventyr::store::driver::drive_write_with_metrics;
 use eventyr::store::metrics::names;
 use eventyr::store::prelude::*;
 use eventyr::subscription::prelude::{

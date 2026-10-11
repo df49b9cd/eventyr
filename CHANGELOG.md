@@ -52,6 +52,73 @@ entries go):
   says "until 0.3", `SubscriptionSource`'s doc no longer claims
   object safety, and the subscription crate example drops an unused
   import.
+- Refactoring review (sixth round), build: CI pins its actions to
+  commit SHAs, runs every cargo step `--locked`, sets per-job timeouts
+  and a cancel-superseded concurrency group, and the packaging dry run
+  now verifies — it builds every crate from its tarball against a
+  throwaway registry of the packaged siblings; the previous
+  `--no-verify` could not tell a publishable tarball from a broken
+  one. A weekly `.github/workflows/audit.yml` runs `cargo audit` over
+  the committed Cargo.lock; `CONTRIBUTING.md` documents it. Line
+  endings are pinned (`.gitattributes`), so a CRLF checkout cannot
+  desynchronize the embedded sqlx migration checksums, and `.claude/`
+  local state is ignored. The workspace manifest's inert
+  `eventyr-store-testing` entry is dropped: no consumer inherited it
+  (each dev-dependency on it stays path-only, deliberately — a
+  versioned dev-dependency would point the packaged manifests at a
+  registry that does not carry the crate yet).
+- Review fixes, `eventyr-core`: the load-continuity rule (same
+  stream, contiguous sequence) is one shared check used by the write
+  machine, the batch machine, and the repository fold, which had
+  hand-rolled it three times with drifting messages; the `enrollment`
+  DCB fixture moves beside `account` in `testing` (re-exported from
+  `boundary` for the documented path); `NoFold` (no callers) is
+  deleted.
+- Review fixes, ports: `ProjectorLease::acquire`/`renew` take
+  `LeasePolicy` instead of a raw `(ttl, grace, max_grace)` clump;
+  `ViewStore` and `KeyStore` gain the blanket `&T`/`Arc<T>` delegation
+  impls every other port ships; the upcasting source adapters preserve
+  the inner source's scan bound instead of discarding it.
+- Review fixes, stores: the in-memory lease store validates
+  degenerate policies like Postgres's CHECKs do (a `grace: 0` literal
+  no longer silently voids exclusivity); lease-window arithmetic is
+  checked instead of panicking on representable extremes; SQLite's
+  per-stream read pages under the connection mutex like the global
+  read does, instead of holding it through the full collect and
+  decode; the pg/sqlite `FilteredRead` scanned-bound derivation is
+  one shared constructor; a corrupt parked row's negative `attempts`
+  is a `CorruptRow` like every other malformed number in the crate,
+  not a silent `u32::MAX`; fjall's lifecycle record validates its cut
+  before `first - 1` can underflow, and the 16-digit key-layout bound
+  is documented; the store prelude re-exports the four
+  `*_with_metrics` drivers.
+- Review fixes, subscriptions: the three projector drive prologues
+  (plain, caught-up, leased) share one preparation path, so the
+  park-refusal gate cannot drift between the plain and leased paths,
+  and a leased run stops loading its checkpoint twice; a listener
+  that fails to arm degrades to the timer like a listener that errors
+  mid-run, instead of aborting the run; the lease grace window and
+  all four lease metrics gain tests (the review-5 headline fix had
+  zero coverage); `LeasedProjector::caught_up_on`'s pulse, `Fanout`'s
+  at-least-once redelivery, and `drive_projector_blocking` gain
+  tests; the dead `InMemoryLeaseStore::expire` seam and the
+  zero-caller `into_inner`/`name` accessors are deleted; the three
+  unbounded test waits take the timeout their siblings use; the
+  `ParkedStore` vocabulary gap (the key the other ports call `name`)
+  is documented at the trait until a breaking round can rename it.
+- Review fixes, tests: `ShreddingStore` runs the query-append and
+  filtered-read contracts, making its "whole store contract" claim
+  true; the in-memory `ViewStore` reference runs its own contract;
+  the shredded toy cipher is one copy behind the `testing` feature;
+  the inline-view behavior tests share one contract between sqlite
+  and pg; the pg `append_read_conflict_stream_all` eager test splits
+  by scenario; the sqlite page-bound assertion pins the page size
+  exactly; two macro error paths gain trybuild cases. The Postgres
+  suites' shared schema registry is replaced by a per-test
+  `SchemaScope` — a finishing test drops only its own schemas, so a
+  parallel `-- --ignored` run is safe (verified against a live
+  Postgres); CI keeps `--test-threads=1` for the contract suites'
+  open transactions, not for schema safety.
 
 Earlier milestones are documented in DESIGN.md's roadmap sections
 (§12–§14), which record each plan and what actually shipped.

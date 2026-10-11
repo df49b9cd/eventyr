@@ -5,7 +5,10 @@
 //!
 //! `#[ignore]`d like every Postgres test here — run with
 //! `cargo test -p eventyr-store-postgres -- --ignored` and
-//! `EVENTYR_TEST_PG_URL` pointing at a real Postgres.
+//! `EVENTYR_TEST_PG_URL` pointing at a real Postgres (each test's
+//! schemas live in its own `SchemaScope`, so a parallel run is safe;
+//! CI pins `--test-threads=1` anyway, because the contract suites'
+//! open transactions would exhaust a 100-connection container).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -121,6 +124,7 @@ impl CommitListener for BufferedListener {
 #[test]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 fn pg_commit_signal_passes_the_contract() {
+    let schemas = common::SchemaScope::open();
     // Multi-thread, not current-thread: the contract drives each future
     // with `futures::executor::block_on`, which parks this thread, so
     // the I/O reactor has to run on the runtime's own worker thread.
@@ -143,12 +147,13 @@ fn pg_commit_signal_passes_the_contract() {
             PgWithSignal { store, signal }
         });
     }
-    runtime.block_on(common::cleanup_schemas());
+    runtime.block_on(schemas.finish());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 async fn a_rolled_back_append_does_not_notify() {
+    let schemas = common::SchemaScope::open();
     let _quiet = QUIET.lock().await;
     let store = common::fresh_store_async::<PayloadEvent>(&common::url(), "notify", 4).await;
     let mut listener = PgCommitSignal::new(&store)
@@ -173,7 +178,7 @@ async fn a_rolled_back_append_does_not_notify() {
             .is_err(),
         "a rollback must not wake listeners"
     );
-    common::cleanup_schemas().await;
+    schemas.finish().await;
 }
 
 /// End to end: a caught-up projector over Postgres with a one-hour idle
@@ -181,6 +186,7 @@ async fn a_rolled_back_append_does_not_notify() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs EVENTYR_TEST_PG_URL pointing at a real Postgres"]
 async fn a_commit_wakes_an_idle_projector_over_postgres() {
+    let schemas = common::SchemaScope::open();
     let _quiet = QUIET.lock().await;
     #[derive(Clone, Default)]
     struct Seen(Arc<Mutex<Vec<u64>>>);
@@ -229,5 +235,5 @@ async fn a_commit_wakes_an_idle_projector_over_postgres() {
         .expect("the NOTIFY woke the projector well before its idle sleep");
     assert_eq!(*seen.0.lock().expect("poisoned"), vec![1, 2]);
     run.abort();
-    common::cleanup_schemas().await;
+    schemas.finish().await;
 }

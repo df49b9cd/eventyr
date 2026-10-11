@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use eventyr_core::error::StoreError;
-use eventyr_subscription::lease::{LeaseError, ProjectorLease};
+use eventyr_subscription::lease::{LeaseError, LeasePolicy, ProjectorLease};
 
 use crate::{PgStore, PgStoreError};
 
@@ -47,15 +47,9 @@ impl PgLeaseStore {
 impl ProjectorLease for PgLeaseStore {
     type Lease = PgLease;
 
-    async fn acquire(
-        &self,
-        name: &str,
-        ttl: Duration,
-        grace: u32,
-        max_grace: u32,
-    ) -> Result<Self::Lease, LeaseError> {
+    async fn acquire(&self, name: &str, policy: LeasePolicy) -> Result<Self::Lease, LeaseError> {
         let holder = uuid::Uuid::new_v4();
-        let ttl_ms = millis(ttl);
+        let ttl_ms = millis(policy.ttl);
         // Claim the row only if it does not exist or its previous holder
         // has expired past its grace.
         let row: Option<(i64,)> = sqlx::query_as(
@@ -79,8 +73,8 @@ impl ProjectorLease for PgLeaseStore {
         .bind(name)
         .bind(holder)
         .bind(ttl_ms)
-        .bind(i64::from(grace))
-        .bind(i64::from(max_grace))
+        .bind(i64::from(policy.grace))
+        .bind(i64::from(policy.max_grace))
         .fetch_optional(&self.pool)
         .await
         .map_err(|error| LeaseError::Store {
@@ -100,11 +94,9 @@ impl ProjectorLease for PgLeaseStore {
     async fn renew(
         &self,
         lease: &mut Self::Lease,
-        ttl: Duration,
-        grace: u32,
-        max_grace: u32,
+        policy: LeasePolicy,
     ) -> Result<Instant, LeaseError> {
-        let ttl_ms = millis(ttl);
+        let ttl_ms = millis(policy.ttl);
         // Bump version only if this holder still owns the row; an
         // empty row set means the lease is gone.
         let row = sqlx::query_as(
@@ -122,8 +114,8 @@ impl ProjectorLease for PgLeaseStore {
         .bind(&lease.name)
         .bind(lease.holder)
         .bind(ttl_ms)
-        .bind(i64::from(grace))
-        .bind(i64::from(max_grace))
+        .bind(i64::from(policy.grace))
+        .bind(i64::from(policy.max_grace))
         .bind(lease.version)
         .fetch_optional(&self.pool)
         .await;

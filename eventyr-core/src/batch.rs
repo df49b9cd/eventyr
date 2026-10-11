@@ -41,7 +41,7 @@ use core::any::Any;
 use crate::envelope::{EventEnvelope, Metadata, NewEvent};
 use crate::error::StoreError;
 use crate::vocabulary::{ExpectedVersion, StreamId, Version};
-use crate::write::{RetryBudget, RetryPolicy};
+use crate::write::{RetryBudget, RetryPolicy, fold_loaded};
 
 /// The per-stream fold: the batch analogue of computing an
 /// [`Aggregate::State`](crate::aggregate::Aggregate::State).
@@ -86,19 +86,6 @@ where
             .expect("the machine typed this state at `initial`");
         A::apply(state, event);
     }
-}
-
-/// A write-only [`Fold`]: for boundary streams that are guarded and
-/// appended to but never folded or decided on, the state is `()`.
-#[derive(Clone, Copy, Debug)]
-pub struct NoFold;
-
-impl<E> Fold<E> for NoFold {
-    fn initial(&self) -> Box<dyn Any + Send> {
-        Box::new(())
-    }
-
-    fn apply(&self, _: &mut dyn Any, _: &E) {}
 }
 
 /// The batch decision: pure, against every folded state of the
@@ -627,45 +614,39 @@ impl<E, Err, D: Decide<E, Err>> BatchMachine<E, Err, D> {
         }
         // Validate while folding: events must belong to this stream and
         // continue its sequence contiguously from the folded version —
-        // the same guard the write machine states. Every boundary
-        // stream has a `versions` and a `folded` entry (established in
-        // `new`); §7 rule 4's debug_assert is the guard, the index is
-        // the read.
+        // the same guard the write machine states, through the same
+        // shared load fold. Every boundary stream has a `versions` and
+        // a `folded` entry (established in `new`); §7 rule 4's
+        // debug_assert is the guard, the index is the read.
         debug_assert!(
             self.versions.contains_key(&stream_id) && self.folded.contains_key(&stream_id),
             "every boundary stream has a versions and a fold state"
         );
-        let mut expected = self
-            .versions
-            .get(&stream_id)
-            .map(|version| version.as_u64())
-            .unwrap_or_default()
-            .saturating_add(1);
         let fold = self.folds.get(&stream_id);
         let state = self
             .folded
             .get_mut(&stream_id)
             .expect("every boundary stream has a fold state");
-        for envelope in events {
-            if envelope.stream_id != stream_id {
-                return self.violation("`Loaded` delivered events from another stream");
-            }
-            if envelope.version.as_u64() != expected {
-                return self.violation("`Loaded` delivered a non-contiguous sequence");
-            }
-            expected = expected.saturating_add(1);
-            if let Some(fold) = fold {
-                fold.apply(&mut **state, &envelope.event);
-            }
-            self.versions.insert(stream_id.clone(), envelope.version);
-            if self.metadata.idempotency_key.is_some()
-                && envelope.metadata.idempotency_key == self.metadata.idempotency_key
-            {
-                self.earlier
-                    .entry(stream_id.clone())
-                    .or_default()
-                    .push(envelope);
-            }
+        let reached = self
+            .versions
+            .entry(stream_id.clone())
+            .or_insert(Version::EMPTY);
+        let matched = match fold_loaded(
+            &stream_id,
+            reached,
+            events,
+            self.metadata.idempotency_key.as_deref(),
+            |envelope| {
+                if let Some(fold) = fold {
+                    fold.apply(&mut **state, &envelope.event);
+                }
+            },
+        ) {
+            Ok(matched) => matched,
+            Err(message) => return self.violation(message),
+        };
+        if !matched.is_empty() {
+            self.earlier.entry(stream_id).or_default().extend(matched);
         }
         if !self.pending.is_empty() {
             // The rest of the boundary is still out: stay in Loading,

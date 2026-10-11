@@ -59,7 +59,9 @@
 //!   seals an event's `Sensitive` fields before they are parked
 //!   (roadmap 0.7.7).
 //! - `testing` — exports `cipher_contract` and `key_store_contract`,
-//!   for adapter-crate and key store tests; not for production builds.
+//!   for adapter-crate and key store tests; and [`test_support`], the
+//!   shared toy cipher the in-crate and integration tests use; not for
+//!   production builds.
 //!
 //! Erasure covers the event log. Anything that copied personal data out
 //! of it — a snapshot of folded state, a view row, a *parked* event
@@ -86,6 +88,8 @@ mod parked;
 mod sensitive;
 mod shredder;
 mod store;
+#[cfg(any(test, feature = "testing"))]
+pub mod test_support;
 
 pub use cipher::{Cipher, CipherError, SubjectKey};
 #[cfg(any(test, feature = "testing"))]

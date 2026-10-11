@@ -143,23 +143,32 @@ impl KeyStore for InMemoryKeyStore {
     }
 }
 
-impl<K: KeyStore + ?Sized> KeyStore for std::sync::Arc<K> {
-    fn load(
-        &self,
-        subject: &str,
-    ) -> impl Future<Output = Result<Option<SubjectKey>, StoreError>> + Send {
-        (**self).load(subject)
-    }
+/// Blanket impls so references and `Arc` work wherever a key store
+/// does — the same delegation pattern the store ports use.
+macro_rules! impl_key_store_delegation {
+    ($pointer:ty) => {
+        impl<K: KeyStore + ?Sized> KeyStore for $pointer {
+            fn load(
+                &self,
+                subject: &str,
+            ) -> impl Future<Output = Result<Option<SubjectKey>, StoreError>> + Send {
+                (**self).load(subject)
+            }
 
-    fn create(
-        &self,
-        subject: &str,
-        key: SubjectKey,
-    ) -> impl Future<Output = Result<Option<SubjectKey>, StoreError>> + Send {
-        (**self).create(subject, key)
-    }
+            fn create(
+                &self,
+                subject: &str,
+                key: SubjectKey,
+            ) -> impl Future<Output = Result<Option<SubjectKey>, StoreError>> + Send {
+                (**self).create(subject, key)
+            }
 
-    fn delete(&self, subject: &str) -> impl Future<Output = Result<(), StoreError>> + Send {
-        (**self).delete(subject)
-    }
+            fn delete(&self, subject: &str) -> impl Future<Output = Result<(), StoreError>> + Send {
+                (**self).delete(subject)
+            }
+        }
+    };
 }
+
+impl_key_store_delegation!(&K);
+impl_key_store_delegation!(std::sync::Arc<K>);

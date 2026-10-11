@@ -255,3 +255,98 @@ async fn a_planned_projector_runs_through_the_subscription_runner_unchanged() {
     assert!(matches!(outcome, SubscriptionOutcome::CaughtUp { .. }));
     assert_eq!(total.get(), 5);
 }
+
+// -- the scan bound through the upcasting adapters (0.7.4 + this fix) --
+
+/// A scripted raw source whose batches carry a scan bound — the shape
+/// a filtered store read reports (roadmap 0.7.4), which the upcasting
+/// adapters must not discard.
+struct ScannedSource {
+    events: Vec<RawEvent>,
+    scanned: u64,
+}
+
+impl SubscriptionSource for ScannedSource {
+    type Event = RawEvent;
+
+    async fn fetch(&self, from: Checkpoint, max: usize) -> Result<Batch<Self::Event>, StoreError> {
+        let events: Vec<_> = self
+            .events
+            .iter()
+            .enumerate()
+            .skip(from.as_sequence().as_u64() as usize)
+            .take(max)
+            .map(|(index, event)| EventEnvelope {
+                sequence: eventyr_core::vocabulary::Sequence::new(index as u64 + 1),
+                stream_id: StreamId::from("scripted"),
+                version: eventyr_core::vocabulary::Version::new(index as u64 + 1),
+                event: event.clone(),
+                metadata: Default::default(),
+            })
+            .collect();
+        Ok(
+            Batch::of(events).scanned_to(Checkpoint::new(eventyr_core::vocabulary::Sequence::new(
+                self.scanned,
+            ))),
+        )
+    }
+}
+
+/// The upcasting adapters preserve the inner source's scan bound: a
+/// filtered read's checkpoint progress survives the upcast, so a
+/// restart does not re-scan the unmatched run the inner source looked
+/// through.
+#[tokio::test]
+async fn the_scan_bound_survives_the_upcasting_source() {
+    use eventyr_core::vocabulary::Sequence;
+
+    let inner = ScannedSource {
+        events: vec![RawEvent {
+            event_type: "AmountV1".into(),
+            schema_version: eventyr_core::version_registry::EventSchemaVersion::V1,
+            payload: b"10".to_vec(),
+        }],
+        // The source scanned far past the event it delivered.
+        scanned: 500,
+    };
+    let source = UpcastingSource::new(inner, parse_amount_chain());
+    let batch = source.fetch(Checkpoint::ORIGIN, 64).await.expect("fetch");
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.events[0].event, 10);
+    assert_eq!(
+        batch.scanned,
+        Some(Checkpoint::new(Sequence::new(500))),
+        "the scan bound passes through the upcast"
+    );
+}
+
+/// The registry's adapter (the 0.5.1 read side) keeps the bound too.
+#[tokio::test]
+async fn the_scan_bound_survives_the_versioned_source() {
+    use eventyr_core::vocabulary::Sequence;
+
+    let inner = ScannedSource {
+        events: vec![RawEvent {
+            event_type: "AmountV1".into(),
+            schema_version: eventyr_core::version_registry::EventSchemaVersion::V1,
+            payload: b"10".to_vec(),
+        }],
+        scanned: 500,
+    };
+    // The registry upcasts V1 bytes through its ladder and returns the
+    // current version's bytes. One pass-through rung is enough here:
+    // the point is the scan bound, not the walk.
+    let (registry, _) = UpcasterRegistry::new().with(
+        "AmountV1",
+        eventyr_core::version_registry::EventSchemaVersion::V1,
+        VersionRung::new(Ok),
+    );
+    let source = VersionedSource::new(inner, registry);
+    let batch = source.fetch(Checkpoint::ORIGIN, 64).await.expect("fetch");
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(
+        batch.scanned,
+        Some(Checkpoint::new(Sequence::new(500))),
+        "the scan bound passes through the registry"
+    );
+}

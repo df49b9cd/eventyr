@@ -218,6 +218,83 @@ impl RetryBudget {
     }
 }
 
+/// The load-continuity rule the write machine's load fold and the store
+/// repository's fold share: one envelope read from a stream must belong
+/// to that stream and continue the version sequence contiguously — its
+/// version is exactly one past the version the fold has reached.
+///
+/// `reached` is the version the fold has folded up to — the loaded
+/// snapshot's version first, then each folded event's. On success it
+/// advances to the envelope's version, so folding a stream is passing
+/// each envelope through this rule in read order; on failure it is left
+/// untouched.
+///
+/// # Errors
+///
+/// A [`StoreError::protocol`](StoreError::protocol) violation naming the
+/// broken invariant: an envelope from another stream, or one whose
+/// version does not continue the sequence.
+pub fn envelope_continues<E>(
+    expected_stream: &StreamId,
+    reached: &mut Version,
+    envelope: &EventEnvelope<E>,
+) -> Result<(), StoreError> {
+    continues_at(expected_stream, reached, envelope).map_err(StoreError::protocol)
+}
+
+/// The core of [`envelope_continues`]: the same two checks, returning the
+/// violation message instead of a [`StoreError`] so each machine reports
+/// it through its own violation channel — the one place the two
+/// messages live.
+pub(crate) fn continues_at<E>(
+    expected_stream: &StreamId,
+    reached: &mut Version,
+    envelope: &EventEnvelope<E>,
+) -> Result<(), &'static str> {
+    if envelope.stream_id != *expected_stream {
+        return Err("`Loaded` delivered events from another stream");
+    }
+    if envelope.version.as_u64() != reached.as_u64().saturating_add(1) {
+        return Err("`Loaded` delivered a non-contiguous sequence");
+    }
+    *reached = envelope.version;
+    Ok(())
+}
+
+/// The load fold the write and batch machines' `Loaded` arms share:
+/// validate each envelope with [`continues_at`] while folding it, and
+/// collect the envelopes carrying the interaction's idempotency key
+/// (the earlier commit, when the interaction has run before — roadmap
+/// 0.7.5).
+///
+/// `reached` is the version the fold starts from — the loaded
+/// snapshot's, or where the last conflict retry left off — and advances
+/// with each accepted envelope, so a violation part-way through leaves
+/// it at the last version the fold can defend. `fold` applies each
+/// accepted envelope's event to the caller's state. Returns the matched
+/// envelopes, or the violation message of the first envelope that broke
+/// the rule, for the caller to report through its own violation
+/// channel.
+pub(crate) fn fold_loaded<E>(
+    stream: &StreamId,
+    reached: &mut Version,
+    events: impl IntoIterator<Item = EventEnvelope<E>>,
+    idempotency_key: Option<&str>,
+    mut fold: impl FnMut(&EventEnvelope<E>),
+) -> Result<Vec<EventEnvelope<E>>, &'static str> {
+    let mut matched = Vec::new();
+    for envelope in events {
+        continues_at(stream, reached, &envelope)?;
+        fold(&envelope);
+        if idempotency_key
+            .is_some_and(|key| envelope.metadata.idempotency_key.as_deref() == Some(key))
+        {
+            matched.push(envelope);
+        }
+    }
+    Ok(matched)
+}
+
 /// Which input the machine is waiting for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -507,22 +584,16 @@ impl<A: Aggregate, S> WriteMachine<A, S> {
         // simply has fewer events than the snapshot claims fails later
         // at the append expectation — never as silently folded-over
         // state: the machine only decides on folds it can defend.
-        let mut expected = self.version.as_u64().saturating_add(1);
-        for envelope in events {
-            if envelope.stream_id != self.stream_id {
-                return self.violation("`Loaded` delivered events from another stream");
-            }
-            if envelope.version.as_u64() != expected {
-                return self.violation("`Loaded` delivered a non-contiguous sequence");
-            }
-            expected = expected.saturating_add(1);
-            A::apply(&mut self.folded, &envelope.event);
-            self.version = envelope.version;
-            if self.metadata.idempotency_key.is_some()
-                && envelope.metadata.idempotency_key == self.metadata.idempotency_key
-            {
-                self.earlier.push(envelope);
-            }
+        let folded = &mut self.folded;
+        match fold_loaded(
+            &self.stream_id,
+            &mut self.version,
+            events,
+            self.metadata.idempotency_key.as_deref(),
+            |envelope| A::apply(folded, &envelope.event),
+        ) {
+            Ok(matched) => self.earlier.extend(matched),
+            Err(message) => return self.violation(message),
         }
         if !self.earlier.is_empty() {
             // The command has committed before: return that commit

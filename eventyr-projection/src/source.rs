@@ -57,6 +57,10 @@ where
 
     async fn fetch(&self, from: Checkpoint, max: usize) -> Result<Batch<E>, StoreError> {
         let batch = self.inner.fetch(from, max).await?;
+        // The scan bound is the inner source's (0.7.4): upcasting must
+        // not discard how far a filtered read looked, or the checkpoint
+        // would re-scan every unmatched run after a restart.
+        let scanned = batch.scanned;
         let mut events = Vec::with_capacity(batch.events.len());
         for envelope in batch.events {
             // Loud, never skip (see the module docs): a poison payload
@@ -69,7 +73,9 @@ where
                     .map_err(|error| upcast_failed(sequence, error))
             })?);
         }
-        Ok(Batch::new(events, batch.upper))
+        let mut batch = Batch::new(events, batch.upper);
+        batch.scanned = scanned;
+        Ok(batch)
     }
 }
 
@@ -118,6 +124,9 @@ where
 
     async fn fetch(&self, from: Checkpoint, max: usize) -> Result<Batch<Self::Event>, StoreError> {
         let batch = self.inner.fetch(from, max).await?;
+        // As for `UpcastingSource`: the inner source's scan bound (0.7.4)
+        // survives the registry's walk.
+        let scanned = batch.scanned;
         let mut events = Vec::with_capacity(batch.events.len());
         for envelope in batch.events {
             // Loud, never skip: a poison payload aborts the fetch, the
@@ -130,7 +139,9 @@ where
                     .map_err(|error| upcast_failed(sequence, error))
             })?);
         }
-        Ok(Batch::new(events, batch.upper))
+        let mut batch = Batch::new(events, batch.upper);
+        batch.scanned = scanned;
+        Ok(batch)
     }
 }
 

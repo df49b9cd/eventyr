@@ -220,6 +220,120 @@ pub fn fold_inline<E>(
         .collect())
 }
 
+/// Run the inline-view contract over one store pair: the shared
+/// behaviors every inline-view store must have, so the sqlite and pg
+/// suites stop hand-copying them.
+///
+/// The fixtures are the caller's, because both the fold and the
+/// store's own drive are the caller's: `event` builds one event from
+/// a `u64` amount and `folded` the row value the assertions expect
+/// after folding those amounts; `append` and `append_batch` drive the
+/// store's appends (they panic on failure — a contract's failure
+/// mode); `read` loads one row — `(value, version)` — from the
+/// store's own view store. `views` registers the contract's two
+/// views (per-account `balance`, global `total`) over the
+/// `event`/`folded` pair, for the caller to hand its store.
+///
+/// The contract checks: the rows are there the moment the append
+/// returns (a read needs no projector), an `append_batch` folds every
+/// stream's events into its own rows plus the totals, and a store
+/// without views writes nothing. The fold-failure case (a view that
+/// cannot decode a stored row fails the append atomically) stays in
+/// each store's suite — it seeds through that store's view-store
+/// channel, which the contract cannot reach.
+///
+/// # Panics
+///
+/// When the store broke the inline contract: a committed append's rows
+/// were not readable, a batch left a row unfolded, or a plain store
+/// grew rows. The message names the broken check.
+#[cfg(any(test, feature = "testing"))]
+// Eight named closures, one per seam of a store's own harness — the
+// fold, the drive, and the read are each the caller's; fewer
+// parameters mean bundling (a trait the backends then implement),
+// which is more machinery than the two call sites justify.
+#[allow(clippy::too_many_arguments)]
+pub fn inline_view_contract<E, S, V>(
+    views: impl Fn() -> Vec<Arc<dyn InlineView<E>>>,
+    make_store_with: impl Fn(Vec<Arc<dyn InlineView<E>>>) -> S,
+    make_plain: impl Fn() -> S,
+    append: impl Fn(
+        &S,
+        eventyr_core::vocabulary::StreamId,
+        Vec<eventyr_core::envelope::NewEvent<E>>,
+    ) -> Vec<EventEnvelope<E>>,
+    append_batch: impl Fn(&S, Vec<eventyr_core::batch::StreamAppend<E>>) -> Vec<EventEnvelope<E>>,
+    read: impl Fn(&S, &str, &str) -> Option<(V, Sequence)>,
+    event: impl Fn(u64) -> E,
+    folded: impl Fn(u64) -> V,
+) where
+    E: Clone + PartialEq + core::fmt::Debug,
+    V: Clone + PartialEq + core::fmt::Debug,
+{
+    use eventyr_core::batch::StreamAppend;
+    use eventyr_core::envelope::NewEvent;
+    use eventyr_core::vocabulary::{ExpectedVersion, StreamId};
+
+    let deposit = |amount: u64| NewEvent::new(event(amount));
+
+    // The rows are there the moment the append returns: no projector
+    // ran, the append itself wrote them.
+    let store = make_store_with(views());
+    let committed = append(
+        &store,
+        StreamId::from("account-1"),
+        vec![deposit(10), deposit(5)],
+    );
+    assert_eq!(
+        read(&store, "balance", "account-1"),
+        Some((folded(15), committed[1].sequence)),
+        "the rows are there the moment the append returns"
+    );
+    assert_eq!(
+        read(&store, "total", "all").map(|row| row.0),
+        Some(folded(15)),
+        "one row per view, both written by the one append"
+    );
+
+    // A batch folds every stream's events into its own row plus the
+    // totals.
+    append_batch(
+        &store,
+        vec![
+            StreamAppend {
+                stream_id: StreamId::from("account-1"),
+                expected: ExpectedVersion::Any,
+                events: vec![deposit(1)],
+            },
+            StreamAppend {
+                stream_id: StreamId::from("account-2"),
+                expected: ExpectedVersion::Empty,
+                events: vec![deposit(100)],
+            },
+        ],
+    );
+    assert_eq!(
+        read(&store, "balance", "account-1").map(|row| row.0),
+        Some(folded(16))
+    );
+    assert_eq!(
+        read(&store, "balance", "account-2").map(|row| row.0),
+        Some(folded(100))
+    );
+    assert_eq!(
+        read(&store, "total", "all").map(|row| row.0),
+        Some(folded(116))
+    );
+
+    // A store without views writes nothing.
+    let plain = make_plain();
+    append(&plain, StreamId::from("account-1"), vec![deposit(1)]);
+    assert!(
+        read(&plain, "balance", "account-1").is_none(),
+        "no views, no rows"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
