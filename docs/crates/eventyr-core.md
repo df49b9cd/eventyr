@@ -117,9 +117,7 @@ internal `RetryBudget` is what the machine counts down.
 Multi-stream decide, atomic append.
 
 * `Fold<E>` — how to fold one stream's events into a state box:
-  `AggregateFold<A>` folds an aggregate's state for `A::Id`; `NoFold`
-  collects nothing (the decider only needs the events' presence, not folded
-  state).
+  `AggregateFold<A>` folds an aggregate's state for `A::Id`.
 * `Decide<E, Err>` — `decide(&self, states: &BTreeMap<StreamId, Box<dyn Any
   + Send>>, &Command) -> BatchDecision`. A `RoutedDecision` builder routes
   events to streams (`of(stream, events)` / `to(stream, …)`), `reject`s,
@@ -161,8 +159,9 @@ history selected by a query.
 * `acknowledged` moves the condition's `after` past a conflicting event
   that lies outside the fold query: the boundary re-validates against a
   fresh `after` instead of rejecting outright.
-* `enrollment` is the worked fixture (courses with a two-student cap) used
-  by `query_append_contract` in
+* `enrollment` is the worked fixture (courses with a two-student cap),
+  in core's `testing` module and re-exported from `boundary`; it is used by
+  `query_append_contract` in
   [eventyr-store-testing](eventyr-store-testing.md).
 
 ### `SubscriptionMachine` (`subscription_machine`)
@@ -237,7 +236,8 @@ way:
   `then_error_matching`, `then_result`, `with_state` (pre-command state).
 * **`account` fixture** — the canonical aggregate
   (open/deposit/withdraw/check-balance) used across the workspace's tests;
-  the `enrollment` fixture in `boundary` plays the same role for DCB.
+  the `enrollment` fixture plays the same role for DCB (it lives here too,
+  re-exported from `boundary`).
 
 ## Invariants summary
 
