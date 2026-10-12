@@ -1,0 +1,19 @@
+error[E0277]: `Handler` is named by type, so the mediator constructs it once with `Default` — it does not implement `Default`
+  --> tests/ui/typed_handler_without_default.rs:15:21
+   |
+15 |     command Ping => Handler;
+   |                     ^^^^^^^ constructed when the mediator is built
+   |
+   = help: the trait `Default` is not implemented for `Handler`
+   = note: derive or implement `Default` for it, or put an instance in a field of the mediator and name the field: `self.field`
+   = note: required for `Handler` to implement `eventyr_mediator::__private::Singleton`
+note: required by a bound in `eventyr_mediator::__private::singleton`
+  --> src/lib.rs
+   |
+   |     pub fn singleton<T: Singleton>() -> T {
+   |                         ^^^^^^^^^ required by this bound in `singleton`
+help: consider annotating `Handler` with `#[derive(Default)]`
+   |
+ 8 + #[derive(Default)]
+ 9 | struct Handler(u32);
+   |

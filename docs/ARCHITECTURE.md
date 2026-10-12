@@ -89,9 +89,15 @@ The layering rule (the placement rule, [DESIGN.md §3](../DESIGN.md#3-crate-layo
 * **eventyr-macros** is a proc-macro crate used only through core's optional
   `macros` feature; **eventyr-store-testing** is consumed as a dev-dependency
   by every store and by shred.
+* **eventyr-mediator** (with its proc-macro crate, **eventyr-mediator-macros**)
+  sits at the edge: it depends on core and store behind its `store` feature,
+  and nothing depends on it. A `mediator!` composition routes requests to
+  handlers — an `AggregateRepository` among them — through compile-time
+  pipelines, and can dispatch a saga's commands.
 
 Per-crate documents: [eventyr](crates/eventyr.md),
 [eventyr-core](crates/eventyr-core.md), [eventyr-macros](crates/eventyr-macros.md),
+[eventyr-mediator](crates/eventyr-mediator.md),
 [eventyr-store](crates/eventyr-store.md),
 [eventyr-subscription](crates/eventyr-subscription.md),
 [eventyr-projection](crates/eventyr-projection.md),
@@ -506,8 +512,8 @@ other crate adds capability features that only pull their dependencies in:
   `subscription`, `bus`, `projection`, `postgres` (+`_snapshots`,
   `_checkpoints`, `_leases`, `_views`), `fjall`(+`_snapshots`),
   `sqlite`(+`_snapshots`, `_views`, `_checkpoints`, `_shred`, `_parked`),
-  `shred`(+`_aes_gcm`, `_chacha`, `_parked`), `metrics`, and the legacy
-  alias `snapshots` → `postgres_snapshots`.
+  `shred`(+`_aes_gcm`, `_chacha`, `_parked`), `mediator`, `metrics`, and
+  the legacy alias `snapshots` → `postgres_snapshots`.
 * Adapter crates keep their auxiliary stores behind features
   (`snapshots`, `views`, `checkpoints`, `leases`, `parked`, `shred`) so an
   embedded deployment doesn't compile the schema for things it doesn't use.

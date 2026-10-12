@@ -1,0 +1,32 @@
+[package]
+name = "eventyr-mediator-macros"
+description = "The composition macro behind eventyr-mediator: mediator! { ... } builds the concrete type, its routes, its behaviors, and its observers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["event-sourcing", "cqrs", "mediator", "proc-macro"]
+repository = "https://github.com/df49b9cd/eventyr"
+readme = "README.md"
+homepage = "https://github.com/df49b9cd/eventyr"
+categories = ["database"]
+documentation = "https://docs.rs/eventyr-mediator-macros"
+
+[lints]
+workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
+# Resolves the crate the generated code names: `eventyr_mediator`
+# directly (under its local name), or `eventyr::mediator` through the
+# umbrella — so the `crate = path;` clause is only needed for vendoring.
+proc-macro-crate.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

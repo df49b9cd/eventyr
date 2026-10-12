@@ -6,6 +6,7 @@
 | [crates/eventyr.md](crates/eventyr.md) | The umbrella crate and its feature graph |
 | [crates/eventyr-core.md](crates/eventyr-core.md) | The pure core: `Aggregate`, protocol vocabulary, the five machines |
 | [crates/eventyr-macros.md](crates/eventyr-macros.md) | `#[derive(Aggregate)]` / `#[derive(EventName)]` |
+| [crates/eventyr-mediator.md](crates/eventyr-mediator.md) | The compile-time mediator: `mediator!`, MediatR's vocabulary, pipelines and route selection, the eventyr integration |
 | [crates/eventyr-store.md](crates/eventyr-store.md) | The persistence ports, in-memory store, drivers, repository |
 | [crates/eventyr-subscription.md](crates/eventyr-subscription.md) | The projector runner, checkpoints, leases, parking, sagas |
 | [crates/eventyr-projection.md](crates/eventyr-projection.md) | Upcasting, views, inline views, rebuilds |

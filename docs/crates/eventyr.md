@@ -22,6 +22,8 @@ rendered from the root README.
 * `postgres`, `fjall`, `sqlite` — the store adapters.
 * `shred`, `shred_aes_gcm`, `shred_chacha` — crypto-shredding and the
   cipher adapters.
+* `mediator` — eventyr-mediator with its `store` integration, as
+  `eventyr::mediator`.
 
 ## The feature graph
 
@@ -51,6 +53,7 @@ choices made.
 | `shred` | store + eventyr-shred | `Sensitive`, `ShreddingStore`, `Cipher`/`KeyStore` seams |
 | `shred_aes_gcm`, `shred_chacha` | shred + adapter crate | pick a cipher |
 | `shred_parked` | shred + subscription | parked rejects are sealed before parking |
+| `mediator` | store + eventyr-mediator (+ its `store`) | the compile-time mediator; `time` adds `LoadUntil` |
 | `metrics` | store `tracing` | `TracingMetrics` |
 
 The design principle: features map one-to-one onto *capabilities that drag

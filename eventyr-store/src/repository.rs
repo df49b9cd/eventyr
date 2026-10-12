@@ -13,6 +13,10 @@ use eventyr_core::snapshot::{HasSnapshotState, OfferSnapshot, Snapshot, WritePol
 use eventyr_core::vocabulary::{StreamId, Version};
 use eventyr_core::write::{RetryPolicy, WriteMachine, WriteOutcome, envelope_continues};
 
+use core::future::Future;
+
+use eventyr_core::envelope::Metadata;
+
 use crate::driver::{drive_write, drive_write_with_snapshots};
 use crate::snapshot_store::SnapshotStore;
 use crate::store::EventStore;
@@ -579,5 +583,177 @@ where
             WriteOutcome::Rejected(error) => Err(ExecutionError::Domain(error)),
             WriteOutcome::Failed(error) => Err(ExecutionError::Store(error)),
         }
+    }
+}
+
+/// The write and read operations every [`AggregateRepository`] offers,
+/// whichever snapshot channel it carries — the seam for code generic over
+/// "a repository of `A`".
+///
+/// A plain repository (`SS = ()`) executes and loads by folding the
+/// whole stream; one built with
+/// [`with_snapshots`](AggregateRepository::with_snapshots) starts from
+/// the newest snapshot and persists the post-commit offer. Through this
+/// trait both answer the same calls, so the snapshot decision stays
+/// where the repository is built. The snapshot offer a commit may carry
+/// is dropped here: it was already persisted (or deliberately skipped)
+/// by the time the outcome returns.
+pub trait Repository<A: Aggregate>: Send + Sync {
+    /// [`execute_with_metadata`](AggregateRepository::execute_with_metadata),
+    /// or its snapshot counterpart.
+    ///
+    /// # Errors
+    ///
+    /// A domain rejection, or a store failure — as the inherent methods.
+    fn execute_with_metadata(
+        &self,
+        id: A::Id,
+        command: A::Command,
+        metadata: Metadata,
+    ) -> impl Future<Output = Result<ExecutionOutcome<A::Event>, ExecutionError<A>>> + Send;
+
+    /// [`load`](AggregateRepository::load), or its snapshot counterpart.
+    ///
+    /// # Errors
+    ///
+    /// As the inherent methods: the store's read failed, or the stream
+    /// violated the fold's invariants.
+    fn load(&self, id: A::Id) -> impl Future<Output = Result<Loaded<A::State>, StoreError>> + Send;
+
+    /// [`load_at`](AggregateRepository::load_at), or its snapshot
+    /// counterpart.
+    ///
+    /// # Errors
+    ///
+    /// As [`load`](Repository::load).
+    fn load_at(
+        &self,
+        id: A::Id,
+        version: Version,
+    ) -> impl Future<Output = Result<Loaded<A::State>, StoreError>> + Send;
+}
+
+impl<A, S> Repository<A> for AggregateRepository<A, S, ()>
+where
+    A: Aggregate,
+    A::Id: Send + Sync,
+    A::Command: Send,
+    A::State: Send,
+    A::Event: Send + Sync,
+    A::Error: Send,
+    S: EventStore<Event = A::Event> + Send + Sync,
+{
+    fn execute_with_metadata(
+        &self,
+        id: A::Id,
+        command: A::Command,
+        metadata: Metadata,
+    ) -> impl Future<Output = Result<ExecutionOutcome<A::Event>, ExecutionError<A>>> + Send {
+        AggregateRepository::execute_with_metadata(self, id, command, metadata)
+    }
+
+    fn load(&self, id: A::Id) -> impl Future<Output = Result<Loaded<A::State>, StoreError>> + Send {
+        AggregateRepository::load(self, id)
+    }
+
+    fn load_at(
+        &self,
+        id: A::Id,
+        version: Version,
+    ) -> impl Future<Output = Result<Loaded<A::State>, StoreError>> + Send {
+        AggregateRepository::load_at(self, id, version)
+    }
+}
+
+impl<A, S, SS> Repository<A> for AggregateRepository<A, S, SS>
+where
+    A: HasSnapshotState,
+    A::Id: Send + Sync,
+    A::Command: Send,
+    A::State: Clone + Send + Sync,
+    A::Event: Send + Sync,
+    A::Error: Send,
+    S: EventStore<Event = A::Event> + Send + Sync,
+    SS: SnapshotStore<State = A::State> + Send + Sync,
+{
+    async fn execute_with_metadata(
+        &self,
+        id: A::Id,
+        command: A::Command,
+        metadata: Metadata,
+    ) -> Result<ExecutionOutcome<A::Event>, ExecutionError<A>> {
+        Ok(
+            match self
+                .execute_with_snapshots_and_metadata(id, command, metadata)
+                .await?
+            {
+                ExecutionOutcome::Committed { committed, .. } => ExecutionOutcome::Committed {
+                    committed,
+                    snapshot: None,
+                },
+                ExecutionOutcome::AlreadyCommitted { committed } => {
+                    ExecutionOutcome::AlreadyCommitted { committed }
+                }
+                ExecutionOutcome::Noop => ExecutionOutcome::Noop,
+            },
+        )
+    }
+
+    fn load(&self, id: A::Id) -> impl Future<Output = Result<Loaded<A::State>, StoreError>> + Send {
+        self.load_with_snapshots(id)
+    }
+
+    fn load_at(
+        &self,
+        id: A::Id,
+        version: Version,
+    ) -> impl Future<Output = Result<Loaded<A::State>, StoreError>> + Send {
+        self.load_at_with_snapshots(id, version)
+    }
+}
+
+impl<A: Aggregate, R: Repository<A> + ?Sized> Repository<A> for &R {
+    fn execute_with_metadata(
+        &self,
+        id: A::Id,
+        command: A::Command,
+        metadata: Metadata,
+    ) -> impl Future<Output = Result<ExecutionOutcome<A::Event>, ExecutionError<A>>> + Send {
+        (**self).execute_with_metadata(id, command, metadata)
+    }
+
+    fn load(&self, id: A::Id) -> impl Future<Output = Result<Loaded<A::State>, StoreError>> + Send {
+        (**self).load(id)
+    }
+
+    fn load_at(
+        &self,
+        id: A::Id,
+        version: Version,
+    ) -> impl Future<Output = Result<Loaded<A::State>, StoreError>> + Send {
+        (**self).load_at(id, version)
+    }
+}
+
+impl<A: Aggregate, R: Repository<A> + ?Sized> Repository<A> for std::sync::Arc<R> {
+    fn execute_with_metadata(
+        &self,
+        id: A::Id,
+        command: A::Command,
+        metadata: Metadata,
+    ) -> impl Future<Output = Result<ExecutionOutcome<A::Event>, ExecutionError<A>>> + Send {
+        (**self).execute_with_metadata(id, command, metadata)
+    }
+
+    fn load(&self, id: A::Id) -> impl Future<Output = Result<Loaded<A::State>, StoreError>> + Send {
+        (**self).load(id)
+    }
+
+    fn load_at(
+        &self,
+        id: A::Id,
+        version: Version,
+    ) -> impl Future<Output = Result<Loaded<A::State>, StoreError>> + Send {
+        (**self).load_at(id, version)
     }
 }

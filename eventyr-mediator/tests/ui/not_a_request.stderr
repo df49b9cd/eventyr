@@ -1,0 +1,109 @@
+error[E0277]: `Ping` is not a request
+ --> tests/ui/not_a_request.rs:8:13
+  |
+8 |     command Ping => Handler;
+  |             ^^^^ routed as a request
+  |
+help: the trait `eventyr_mediator::Request` is not implemented for `Ping`
+ --> tests/ui/not_a_request.rs:1:1
+  |
+1 | struct Ping;
+  | ^^^^^^^^^^^
+  = note: implement `Request` for it: `impl Request for Ping { type Response = …; }`
+
+error[E0277]: `Ping` is not a request
+ --> tests/ui/not_a_request.rs:6:1
+  |
+6 | eventyr_mediator::mediator! {
+  | ^ routed as a request
+  |
+help: the trait `eventyr_mediator::Request` is not implemented for `Ping`
+ --> tests/ui/not_a_request.rs:1:1
+  |
+1 | struct Ping;
+  | ^^^^^^^^^^^
+  = note: implement `Request` for it: `impl Request for Ping { type Response = …; }`
+note: required by a bound in `eventyr_mediator::Sender`
+ --> src/lib.rs
+  |
+  | pub trait Sender<Req: Request>: Sync {
+  |                       ^^^^^^^ required by this bound in `Sender`
+  = note: this error originates in the macro `eventyr_mediator::mediator` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Ping` is not a request
+ --> tests/ui/not_a_request.rs:8:13
+  |
+8 |     command Ping => Handler;
+  |             ^^^^ routed as a request
+  |
+help: the trait `eventyr_mediator::Request` is not implemented for `Ping`
+ --> tests/ui/not_a_request.rs:1:1
+  |
+1 | struct Ping;
+  | ^^^^^^^^^^^
+  = note: implement `Request` for it: `impl Request for Ping { type Response = …; }`
+note: required by a bound in `eventyr_mediator::__private::RequestRoute`
+ --> src/lib.rs
+  |
+  |     pub trait RequestRoute<M>: Request {
+  |                                ^^^^^^^ required by this bound in `RequestRoute`
+
+error[E0277]: `Ping` is not a request
+ --> tests/ui/not_a_request.rs:8:13
+  |
+8 |     command Ping => Handler;
+  |             ^^^^ routed as a request
+  |
+help: the trait `eventyr_mediator::Request` is not implemented for `Ping`
+ --> tests/ui/not_a_request.rs:1:1
+  |
+1 | struct Ping;
+  | ^^^^^^^^^^^
+  = note: implement `Request` for it: `impl Request for Ping { type Response = …; }`
+note: required by a bound in `eventyr_mediator::__private::handles_request`
+ --> src/lib.rs
+  |
+  |     pub fn handles_request<Req: Request, M, H: RequestHandler<Req, M> + ?Sized>(_: &H) {}
+  |                                 ^^^^^^^ required by this bound in `handles_request`
+
+error[E0277]: `Handler` does not handle the request `Ping` in the mediator `App`
+ --> tests/ui/not_a_request.rs:8:21
+  |
+8 |     command Ping => Handler;
+  |                     ^^^^^^^ not a handler of `Ping`
+  |
+help: the trait `RequestHandler<Ping, App>` is not implemented for `Handler`
+ --> tests/ui/not_a_request.rs:4:1
+  |
+4 | struct Handler;
+  | ^^^^^^^^^^^^^^
+  = note: implement `RequestHandler<Ping, App>` for it, or check the bounds its impl puts on the mediator
+note: required by a bound in `eventyr_mediator::__private::handles_request`
+ --> src/lib.rs
+  |
+  |     pub fn handles_request<Req: Request, M, H: RequestHandler<Req, M> + ?Sized>(_: &H) {}
+  |                                                ^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `handles_request`
+
+error[E0277]: `Ping` is not a request
+ --> tests/ui/not_a_request.rs:8:13
+  |
+8 |     command Ping => Handler;
+  |             ^^^^
+  |             |
+  |             `Ping` doesn't satisfy the trait bound
+  |             routed as a request
+  |
+help: the trait `eventyr_mediator::Request` is not implemented for `Ping`
+ --> tests/ui/not_a_request.rs:1:1
+  |
+1 | struct Ping;
+  | ^^^^^^^^^^^
+  = note: implement `Request` for it: `impl Request for Ping { type Response = …; }`
+note: required by a bound in `send`
+ --> src/lib.rs
+  |
+  | pub trait Sender<Req: Request>: Sync {
+  |                       ^^^^^^^ required by this bound in `Sender::send`
+  |     /// Runs `request` through its pipeline to its handler.
+  |     fn send(&self, request: Req) -> impl Future<Output = Req::Response> + Send;
+  |        ---- required by a bound in this associated function

@@ -1,0 +1,5 @@
+error: `a::Ping` and `b::Ping` would both be the variant `Ping` of `AnyRequest`; name one with `as`: `… as OtherName => …`
+  --> tests/ui/dispatch_enum_variant_clash.rs:28:13
+   |
+28 |     command b::Ping => Handler;
+   |             ^^^^^^^

@@ -456,6 +456,7 @@ name = "eventyr"
 version = "0.1.0"
 dependencies = [
  "eventyr-core",
+ "eventyr-mediator",
  "eventyr-projection",
  "eventyr-shred",
  "eventyr-shred-aes-gcm",
@@ -497,6 +498,29 @@ dependencies = [
  "serde_json",
  "syn 3.0.6",
  "trybuild",
+]
+
+[[package]]
+name = "eventyr-mediator"
+version = "0.1.0"
+dependencies = [
+ "eventyr-core",
+ "eventyr-mediator-macros",
+ "eventyr-store",
+ "eventyr-subscription",
+ "futures",
+ "time",
+ "trybuild",
+]
+
+[[package]]
+name = "eventyr-mediator-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
 ]
 
 [[package]]

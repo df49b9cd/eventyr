@@ -22,9 +22,9 @@
 
 - Not a runtime or an actor framework (no wasm, no embedded database as the center of the world — that's `thalo`'s identity).
 - No HTTP/transport layer, no message-bus integrations baked into core (esrs ships rabbit/kafka buses; Eventyr keeps `EventBus` as a trait users implement).
-- No ORM, no code generation beyond optional derive macros.
+- No ORM, no code generation beyond the optional macros (the derives, and `mediator!`).
 - Not a full DDD toolkit (no value-object/entity macros — that's `eventide`'s hexagonal bet).
-- No command bus, query bus, or mediator. Routing a command is a function call in the caller's code; routing it to one node is the caller's load balancer or framework (§15.1).
+- No command bus or query bus, and no transport between processes. The one mediator the workspace ships, `eventyr-mediator`, is compile-time and in-process: a `mediator!` composition routes a request to its handler as a static function call through a pipeline, with nothing registered at runtime. It is optional and depends on the store side, never the reverse. Routing a command to one node remains the caller's load balancer or framework (§15.1).
 - No state-stored aggregates. Every read-side feature (projections, sagas, upcasting, shredding, parking, leases) consumes the event log, and a state-stored aggregate has none (§15.1).
 
 ## 3. Crate layout
@@ -34,6 +34,8 @@ eventyr/                    # umbrella: re-exports core + prelude; README as its
 ├── eventyr-core/           # machines + protocol vocabulary; no_std + alloc; zero deps
 ├── eventyr-store/          # EventStore/StreamsAll ports, in-memory impl, drivers, repository, CommitSignal
 ├── eventyr-macros/         # #[derive(Aggregate)] / #[derive(EventName)] (proc-macro crate)
+├── eventyr-mediator/       # compile-time mediator: requests, notifications, pipelines; the repository behind it
+├── eventyr-mediator-macros/ # mediator! (proc-macro crate)
 ├── eventyr-store-postgres/ # sqlx-based store, migrations, snapshots/views/checkpoints/leases
 ├── eventyr-store-sqlite/   # embedded store (rusqlite); the contract suite's reference port
 ├── eventyr-store-fjall/    # embedded store over fjall; driveable without a runtime
@@ -726,7 +728,7 @@ Event sourcing on its own is not a usable product. The log answers "give me stre
 
 Two things that commonly travel under the CQRS name are refused, now as §2 non-goals:
 
-- **Buses and mediators.** A command or query bus routes a call to a handler, which in one process is a function call, and across processes needs a transport §2 already refuses. The field confirms the split: Marten does not route commands, Wolverine (a separate framework) does; Axon's consistent-hash routing and Akka's cluster sharding are framework features, not store features. Eventyr's repository is stateless, so any node can execute any command, and the store's optimistic concurrency settles races. Hot aggregates are the cost: many nodes writing one stream multiply conflict retries. The answer is caller-side routing by stream id (consistent hashing at the load balancer, or a framework that offers it), documented, not built.
+- **Buses and mediators.** A command or query bus routes a call to a handler, which in one process is a function call, and across processes needs a transport §2 already refuses. The in-process half is shipped as that function call, generated: `eventyr-mediator`'s `mediator!` composition (§3) routes each request to its handler statically, so an edge (HTTP, a queue consumer) sends requests without naming the aggregate, the repository, or the store, and a request without a handler is a compile error. Nothing crosses a process boundary, and no runtime registry exists. The field confirms the split: Marten does not route commands, Wolverine (a separate framework) does; Axon's consistent-hash routing and Akka's cluster sharding are framework features, not store features. Eventyr's repository is stateless, so any node can execute any command, and the store's optimistic concurrency settles races. Hot aggregates are the cost: many nodes writing one stream multiply conflict retries. The answer is caller-side routing by stream id (consistent hashing at the load balancer, or a framework that offers it), documented, not built.
 - **State-stored aggregates.** `decide`/`apply` is the Decider shape, and `fmodel-rust` runs one decider over either an event store or a state store. Eventyr could do the same with one machine and a `StateStore` port, but nothing on the read side would work for it: projections, sagas, upcasting, shredding, parking, and leases all consume the log, and a state-stored aggregate produces none. Publishing its changes would need an outbox, which reintroduces the dual write the log exists to avoid. Integration with systems that are not event-sourced goes through the caller's `EventBus`.
 
 ### 15.2 What a store is

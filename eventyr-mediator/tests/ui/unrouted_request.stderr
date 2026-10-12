@@ -1,0 +1,28 @@
+error[E0277]: the mediator `App` has no handler for the request `Unrouted`
+  --> tests/ui/unrouted_request.rs:26:22
+   |
+26 |     let _ = app.send(Unrouted);
+   |                 ---- ^^^^^^^^ `Unrouted` is not routed by this mediator
+   |                 |
+   |                 required by a bound introduced by this call
+   |
+help: the trait `eventyr_mediator::__private::RequestRoute<App>` is not implemented for `Unrouted`
+  --> tests/ui/unrouted_request.rs:8:1
+   |
+ 8 | struct Unrouted;
+   | ^^^^^^^^^^^^^^^
+   = note: route it in the composition: `command Unrouted => SomeHandler;` (or `query`)
+help: the trait `eventyr_mediator::__private::RequestRoute<App>` is implemented for `Routed`
+  --> tests/ui/unrouted_request.rs:21:13
+   |
+21 |     command Routed => Handler;
+   |             ^^^^^^
+note: required by a bound in `App::send`
+  --> tests/ui/unrouted_request.rs:19:1
+   |
+19 | / eventyr_mediator::mediator! {
+20 | |     struct App;
+21 | |     command Routed => Handler;
+22 | | }
+   | |_^ required by this bound in `App::send`
+   = note: this error originates in the macro `eventyr_mediator::mediator` (in Nightly builds, run with -Z macro-backtrace for more info)
