@@ -51,7 +51,10 @@ fn contracts() {
 
 In CI: in-memory and SQLite run on every build; the Postgres run is
 `#[ignore]`d and enabled against a Postgres 17 service, serialized with
-`--test-threads=1` (one database, one migration state). fjall runs on
+`--test-threads=1` — kept for the contract suites' open transactions,
+  not schema safety: each Postgres test owns a `SchemaScope` and drops
+  only its own schemas, so a parallel `-- --ignored` run is safe. fjall
+  runs on
 `tempfile` directories. The shred crate runs the log suites through
 `ShreddingStore` — the decorator must be transparent — plus its own
 `cipher_contract`/`key_store_contract` (those live in

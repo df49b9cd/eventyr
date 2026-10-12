@@ -65,7 +65,7 @@ Parent: [ARCHITECTURE.md](../ARCHITECTURE.md).
 | Port | Contract | Reference impl |
 |---|---|---|
 | `CheckpointStore` (`checkpoint.rs`) | `load(name) -> Checkpoint`, `store(name, cp)`; **last-write-wins** (CAS is 0.8.1; leases are today's guard) | `InMemoryCheckpointStore` |
-| `ProjectorLease` (`lease.rs`) | `acquire(name, ttl, grace, max_grace)`, `renew(&mut lease, …) -> Instant`, `release` | `InMemoryLeaseStore` (with `is_held`/`expire` test seams) |
+| `ProjectorLease` (`lease.rs`) | `acquire(name, policy: LeasePolicy)`, `renew(&mut lease, policy) -> Instant`, `release` | `InMemoryLeaseStore` (with `is_held`/`expire_at_max_grace` test seams) |
 | `ParkedStore` (`parked.rs`) | `park(ParkedEvent)`, `list`, `remove` | `InMemoryParkedStore`; `NoParking` refuses |
 | `SubscriptionSource` (`source.rs`) | `fetch(from: Checkpoint, max) -> Batch` | `StoreSubscription` (over any `StreamsAll`), `FilteredSubscription` |
 

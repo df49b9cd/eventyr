@@ -75,8 +75,13 @@ jobs:
           cargo run -p eventyr --example loan_eligibility --locked
           cargo run -p eventyr --example inline_view --features sqlite_views --locked
           cargo run -p eventyr --example distributed --features sqlite_views,sqlite_checkpoints,postgres_checkpoints,postgres_leases,postgres_views --locked
-        # The distributed example's clustered half runs against the
-        # service database, in a throwaway schema.
+          cargo run -p eventyr --example versioning --features projection --locked
+          cargo run -p eventyr --example embedded --features fjall_snapshots,subscription --locked
+          cargo run -p eventyr --example operations --features sqlite_snapshots,sqlite_checkpoints,sqlite_shred,sqlite_parked,shred_chacha,shred_parked,metrics --locked
+          cargo run -p eventyr --example bus --features bus --locked
+          cargo run -p eventyr --example hello_postgres --features postgres --locked
+        # The distributed example's clustered half and hello_postgres
+        # run against the service database, each in a throwaway schema.
         env:
           EVENTYR_PG_URL: ${{ env.EVENTYR_TEST_PG_URL }}
 

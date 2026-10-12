@@ -62,18 +62,27 @@ serde_json into your build unless a JSON-carrying feature is.
 
 ## Examples
 
-Five shipped examples, each behind exactly the features it uses so
+Ten shipped examples, each behind exactly the features it uses so
 `cargo build --examples` under default features skips rather than fails:
 
 | Example | Features | Demonstrates |
 |---|---|---|
-| `bank` | subscription, projection, shred_aes_gcm | the full surface: aggregate writes, projector, upcasters, views, shredding |
-| `enrollment` | store (default) | the teaching example, DCB-style enrollment |
-| `loan_eligibility` | store (default) | the *blocking* boundary driver |
+| `bank` | subscription, projection, shred_aes_gcm | the full surface: aggregate writes, batch transfer, saga, projector, parking, an upcaster, shredding and the post-erasure refusal |
+| `enrollment` | store (default) | the teaching example, DCB-style enrollment, self-contained; the async boundary driver |
+| `loan_eligibility` | store (default) | the narrowed validation query; the *blocking* boundary driver |
 | `inline_view` | sqlite_views | views folded inside the append transaction |
+| `versioning` | projection | `UpcasterRegistry` ladders and `build()`, `VersionedSource` in a projector, `RebuildPlan` schema bumps, poison payloads |
+| `embedded` | fjall_snapshots, subscription | fjall with no runtime: blocking write and projector drivers, snapshots on the same database, `Optional`, `EventFilter::event_types` |
+| `operations` | sqlite_snapshots, sqlite_checkpoints, sqlite_shred, sqlite_parked, shred_chacha, shred_parked, metrics | SQLite's side stores across a restart, `TracingMetrics`, XChaCha20-Poly1305, erasure |
+| `bus` | bus | an `EventBus` transport waking a projector through a `CommitSignal` |
+| `hello_postgres` | postgres | the minimal Postgres deployment, `EVENTYR_PG_URL` |
 | `distributed` | sqlite_views, sqlite_checkpoints, postgres_checkpoints, postgres_leases, postgres_views | the multi-node shape: leases, durable checkpoints, `EVENTYR_PG_URL` |
 
-`tests/bank_story.rs` mirrors the bank example as an integration test.
+Mirroring suites gate three of them in `cargo test`:
+`tests/bank_story.rs`, `tests/inline_view_story.rs`, and
+`tests/loan_eligibility_story.rs` (which also drives the
+deposit-doesn't-retry / withdrawal-retries race the example only
+describes).
 
 ## Conventions
 
@@ -82,8 +91,9 @@ Five shipped examples, each behind exactly the features it uses so
   include_str!("../README.md")]`) and the crate/table features table is the
   user-facing map; every per-crate `README.md` in the workspace is a symlink to
   it.
-* CI runs `cargo hack --each-feature --no-dev-deps` against this crate to
-  prove every feature combination builds standalone.
+* CI runs `cargo hack --each-feature --no-dev-deps` across the whole
+  workspace, this crate included, to prove every feature combination
+  builds standalone.
 
 ## Limits
 
