@@ -558,10 +558,12 @@ pays off:
    `key_store_contract`).
 5. **Crate-level suites**: adapters test their error mapping and
    store-specific behavior (lock ordering, pagination, truncation) beyond
-   the contracts; the umbrella's `tests/bank_story.rs` mirrors the bank
-   example end to end; macro crates use `trybuild` UI tests.
-6. **Examples as smoke targets**: CI runs the examples (`bank`,
-   `enrollment`, `loan_eligibility`, `inline_view`, `distributed`) as
+   the contracts; the umbrella's `tests/bank_story.rs`,
+   `tests/inline_view_story.rs`, and `tests/loan_eligibility_story.rs`
+   mirror their examples; macro crates use `trybuild` UI tests.
+6. **Examples as smoke targets**: CI runs every example (`bank`,
+   `enrollment`, `loan_eligibility`, `inline_view`, `versioning`,
+   `embedded`, `operations`, `bus`, `hello_postgres`, `distributed`) as
    integration smoke tests, each behind exactly the features it uses.
 
 ## 14. Extension points

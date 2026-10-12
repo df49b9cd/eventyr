@@ -58,6 +58,11 @@ struct Withdrawn {
 struct Closed {
     account: u64,
 }
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct OwnerChanged {
+    account: u64,
+    owner: Sensitive<String>,
+}
 
 #[derive(Debug)]
 enum AccountCommand {
@@ -65,6 +70,7 @@ enum AccountCommand {
     Deposit { amount: u64 },
     Withdraw { amount: u64 },
     Close,
+    ChangeOwner { new_owner: String },
 }
 
 #[derive(Debug, PartialEq)]
@@ -110,6 +116,7 @@ fn apply(state: &mut AccountState, event: &AccountEvent) {
         AccountEvent::Deposited(Deposited { amount, .. }) => state.balance += amount,
         AccountEvent::Withdrawn(Withdrawn { amount, .. }) => state.balance -= amount,
         AccountEvent::Closed(Closed { .. }) => state.closed = true,
+        AccountEvent::OwnerChanged(..) => {}
     }
 }
 
@@ -132,6 +139,14 @@ fn decide(
         AccountCommand::Deposit { .. } | AccountCommand::Withdraw { .. } if !state.open => {
             Err(AccountError::NotOpen)
         }
+        AccountCommand::ChangeOwner { .. } if !state.open => Err(AccountError::NotOpen),
+        AccountCommand::ChangeOwner { new_owner } => Ok(vec![
+            OwnerChanged {
+                account,
+                owner: Sensitive::new(format!("account-{account}"), new_owner.clone()),
+            }
+            .into(),
+        ]),
         AccountCommand::Deposit { amount } => Ok(vec![
             Deposited {
                 account,
@@ -159,7 +174,7 @@ fn decide(
     error = AccountError,
     command = AccountCommand,
     initial = AccountState::new(id),
-    events(Opened, Deposited, Withdrawn, Closed),
+    events(Opened, Deposited, Withdrawn, Closed, OwnerChanged),
     event_derive(serde::Serialize, serde::Deserialize)
 )]
 struct Account;
@@ -273,6 +288,7 @@ impl Projection for Ledger {
             AccountEvent::Closed(Closed { .. }) => {
                 balances.remove(&id);
             }
+            AccountEvent::OwnerChanged(..) => {}
         }
         Ok(())
     }
@@ -576,6 +592,31 @@ async fn closure_and_erasure() {
         panic!("the first event opened the account")
     };
     assert!(owner.is_shredded());
+
+    // New personal data for the erased subject is refused at the seal:
+    // the domain decides the rename, the store refuses to write it.
+    let refused = rig
+        .repo
+        .execute(
+            AccountId(2),
+            AccountCommand::ChangeOwner {
+                new_owner: "bobby".into(),
+            },
+        )
+        .await
+        .expect_err("an erased subject's data is never sealed again");
+    let ExecutionError::Store(StoreError::Other(source)) = &refused else {
+        panic!("the seal's refusal is a store failure: {refused:?}")
+    };
+    assert!(matches!(
+        source.downcast_ref::<eventyr::shred::ShredError>(),
+        Some(eventyr::shred::ShredError::SubjectErased(subject)) if subject == "account-2"
+    ));
+    // Writes that carry no personal data still land for the account.
+    rig.repo
+        .execute(AccountId(2), AccountCommand::Deposit { amount: 1 })
+        .await
+        .expect("a deposit seals nothing");
 }
 
 #[tokio::test]

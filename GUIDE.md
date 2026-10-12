@@ -35,7 +35,8 @@ of the design, in code:
 State is rebuilt by folding, never stored on the write path (the
 `State = Option<T>` "doesn't exist yet" shape has an
 [`Optional`](https://github.com/df49b9cd/eventyr/blob/main/eventyr-core/src/aggregate.rs)
-helper; `#[derive(Aggregate)]` can wire the trait and generate the
+helper — the [embedded example](https://github.com/df49b9cd/eventyr/blob/main/eventyr/examples/embedded.rs)
+uses it; `#[derive(Aggregate)]` can wire the trait and generate the
 event enum — sugar, everything stays hand-writable).
 
 Because both functions are pure, domain tests are plain asserts — and
@@ -82,13 +83,17 @@ not a choice you're locked into:
 - **SQLite** (`eventyr-store-sqlite`) — embedded; the reference port for
   the contract suite every third-party store must pass.
 - **fjall** (`eventyr-store-fjall`) — embedded, no server, no runtime
-  needed to drive.
+  needed to drive (the
+  [embedded example](https://github.com/df49b9cd/eventyr/blob/main/eventyr/examples/embedded.rs)
+  runs on the blocking drivers alone).
 - **Postgres** (`eventyr-store-postgres`) — the production store:
   migrations compiled in, optimistic concurrency, global ordering
   enforced by a commit-order lock, inline views, leases. Its crate docs
   state the [deployment contract](https://github.com/df49b9cd/eventyr/blob/main/DESIGN.md#162-the-postgres-deployment-contract)
   (single writable primary, synchronous replication for failover without
-  loss) — read it before running it against user-facing traffic.
+  loss) — read it before running it against user-facing traffic. The
+  [hello_postgres example](https://github.com/df49b9cd/eventyr/blob/main/eventyr/examples/hello_postgres.rs)
+  is the smallest deployment: migrate, write, read back.
 
 A third-party store earns compatibility by passing the contract suites
 in `eventyr-store-testing`, not by being on an approved list. Snapshots
@@ -112,7 +117,18 @@ wakes a projector on commits instead of the idle timer;
 `FailurePolicy::Park` records poison events (ones your projection keeps
 rejecting) in a `ParkedStore` and advances — list them, fix the
 projection, replay; `Halt` (the default) stalls the projection until a
-human looks.
+human looks. A commit can also arrive by push: an `EventBus` transport
+feeds the wake-up, and a lost push costs latency, never the event — the
+[bus example](https://github.com/df49b9cd/eventyr/blob/main/eventyr/examples/bus.rs).
+
+Stored payloads keep the shape they were written in; upcasting lifts
+them on the read path. An `UpcasterRegistry` validates a per-type
+version ladder at startup, `VersionedSource` walks it inside the
+projector's fetch, and a payload nothing can lift stops the projection
+instead of being skipped. When the *fold* changes, `RebuildPlan`
+re-folds from the origin under a versioned checkpoint key — the
+[versioning example](https://github.com/df49b9cd/eventyr/blob/main/eventyr/examples/versioning.rs)
+shows all three.
 
 ## 6. Views: query it now
 
@@ -152,7 +168,7 @@ Two shapes when an invariant spans streams:
   under the condition that nothing matching arrived since the read.
   Boundaries follow the domain, not the aggregate layout. The
   [enrollment example](https://github.com/df49b9cd/eventyr/blob/main/eventyr/examples/enrollment.rs)
-  is the canonical demo; the
+  is the canonical demo, on the async driver; the
   [loan_eligibility example](https://github.com/df49b9cd/eventyr/blob/main/eventyr/examples/loan_eligibility.rs)
   shows the narrowed validation query and the blocking driver.
 
@@ -170,11 +186,17 @@ Two shapes when an invariant spans streams:
   embedded on SQLite and clustered on Postgres through the same code.
 - **Erasure** is crypto-shredding (`eventyr-shred`): personal fields
   sealed per data-subject, keys outside the log; deleting a key erases
-  without rewriting history. It is not access control —
+  without rewriting history, and no new data is ever sealed for an
+  erased subject. It is not access control —
   [SECURITY.md](SECURITY.md) scopes it honestly.
 - **Observability** is a port: implement `Metrics` (or take
   `TracingMetrics`) at the driver boundaries; `eventyr_parked_events_total`
   above zero is the one to alert on.
+- **The side stores are state too.** Subject keys, parked events,
+  snapshots, and checkpoints must survive a restart with the log. The
+  [operations example](https://github.com/df49b9cd/eventyr/blob/main/eventyr/examples/operations.rs)
+  keeps all four beside the log in one SQLite file, restarts, and
+  carries on — metrics and erasure included.
 
 ## 10. Where the design lives
 
