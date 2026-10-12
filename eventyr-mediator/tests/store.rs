@@ -14,6 +14,8 @@ use eventyr_mediator::prelude::*;
 use eventyr_mediator::store::{
     Execute, HasMetadata, Load, LoadAt, StampMetadata, parse_id, saga_dispatcher,
 };
+#[cfg(feature = "time")]
+use eventyr_mediator::store::LoadUntil;
 use eventyr_store::prelude::{
     AggregateRepository, EventStore, ExecutionError, ExecutionOutcome, InMemorySnapshotStore,
     InMemoryStore, SnapshotStore, StreamsAll,
@@ -469,4 +471,62 @@ fn a_saga_rejection_is_other_never_unavailable() {
         failure.to_string().contains("the wallet is not open"),
         "the rejection is named: {failure}"
     );
+}
+
+// -- folding to an instant, routed through the mediator (`time`) -----------
+
+#[cfg(feature = "time")]
+eventyr_mediator::mediator! {
+    struct Timed {
+        wallets: Arc<AggregateRepository<Wallet, Store>>,
+    }
+
+    command Execute<Wallet> => self.wallets;
+    query Load<Wallet> => self.wallets;
+    query LoadUntil<Wallet> => self.wallets;
+}
+
+/// One event per second, then a fold up to an instant keeps only the
+/// events at or before it.
+#[cfg(feature = "time")]
+#[test]
+fn a_load_until_folds_to_the_instant() {
+    use time::OffsetDateTime;
+
+    let store: Store = Arc::new(InMemoryStore::new());
+    let repository = AggregateRepository::<Wallet, _>::new(store.clone(), RetryPolicy::default());
+    let app = Timed::new(Arc::new(repository));
+    let epoch = OffsetDateTime::UNIX_EPOCH;
+    let at = |seconds: i64| Metadata {
+        timestamp: Some(epoch + time::Duration::seconds(seconds)),
+        ..Metadata::default()
+    };
+
+    block_on(app.send(
+        Execute::<Wallet>::new(WalletId(1), WalletCommand::Open).with_metadata(at(1)),
+    ))
+    .expect("open");
+    block_on(app.send(
+        Execute::<Wallet>::new(WalletId(1), WalletCommand::Credit { amount: 10 })
+            .with_metadata(at(2)),
+    ))
+    .expect("credit at t=2");
+    block_on(app.send(
+        Execute::<Wallet>::new(WalletId(1), WalletCommand::Credit { amount: 100 })
+            .with_metadata(at(5)),
+    ))
+    .expect("credit at t=5");
+
+    // t=3 folds the open and the first credit, not the second.
+    let as_of_three =
+        block_on(app.send(LoadUntil::<Wallet>::new(WalletId(1), epoch + time::Duration::seconds(3))))
+            .expect("load until t=3");
+    assert_eq!(as_of_three.state.balance, 10);
+    assert_eq!(as_of_three.version, Version::new(2));
+    // t=10 folds all three.
+    let as_of_ten =
+        block_on(app.send(LoadUntil::<Wallet>::new(WalletId(1), epoch + time::Duration::seconds(10))))
+            .expect("load until t=10");
+    assert_eq!(as_of_ten.state.balance, 110);
+    assert_eq!(as_of_ten.version, Version::new(3));
 }

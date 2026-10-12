@@ -94,3 +94,51 @@ fn a_stream_behavior_applies_where_its_bounds_hold() {
     let names: Vec<&str> = block_on(app.create_stream(Names).collect());
     assert_eq!(names, ["ada", "grace"]);
 }
+
+// -- three routes in one dispatch enum: the nested `Either` middle arm ---
+
+/// A singleton stream.
+struct Once(u32);
+impl StreamRequest for Once {
+    type Item = u32;
+}
+
+#[derive(Default)]
+struct Singles;
+
+impl<M: Sync> StreamRequestHandler<Once, M> for Singles {
+    fn handle(&self, _: &M, request: Once) -> impl Stream<Item = u32> + Send {
+        futures::stream::iter([request.0])
+    }
+}
+
+eventyr_mediator::mediator! {
+    struct ThreeVariant {
+        counter: Counter,
+    }
+
+    stream CountFrom => self.counter;
+    stream Names => Roster;
+    stream Once => Singles;
+
+    // Three arms nest: `Left`, `Right(Left(_))`, `Right(Right(_))`. The
+    // middle arm is generated only for three or more routes.
+    streams AnyThree -> #[derive(Debug, PartialEq)] AnyThreeItem;
+}
+
+#[test]
+fn a_three_variant_stream_enum_dispatches_each_arm() {
+    let app = ThreeVariant::new(Counter { limit: 5 });
+    let count: Vec<AnyThreeItem> =
+        block_on(app.create_stream(AnyThree::from(CountFrom(3))).collect());
+    assert_eq!(count, [AnyThreeItem::CountFrom(3), AnyThreeItem::CountFrom(4)]);
+    // The middle arm: `Right(Left(_))`.
+    let once: Vec<AnyThreeItem> = block_on(app.create_stream(AnyThree::Once(Once(7))).collect());
+    assert_eq!(once, [AnyThreeItem::Once(7)]);
+    let names: Vec<AnyThreeItem> =
+        block_on(app.create_stream(AnyThree::Names(Names)).collect());
+    assert_eq!(
+        names,
+        [AnyThreeItem::Names("ada"), AnyThreeItem::Names("grace")]
+    );
+}
