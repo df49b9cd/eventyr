@@ -43,10 +43,10 @@ help: the trait `eventyr_mediator::Request` is not implemented for `Ping`
   | ^^^^^^^^^^^
   = note: implement `Request` for it: `impl Request for Ping { type Response = …; }`
 note: required by a bound in `eventyr_mediator::__private::RequestRoute`
- --> src/lib.rs
+ --> src/private.rs
   |
-  |     pub trait RequestRoute<M>: Request {
-  |                                ^^^^^^^ required by this bound in `RequestRoute`
+  | pub trait RequestRoute<M>: Request {
+  |                            ^^^^^^^ required by this bound in `RequestRoute`
 
 error[E0277]: `Ping` is not a request
  --> tests/ui/not_a_request.rs:8:13
@@ -61,10 +61,10 @@ help: the trait `eventyr_mediator::Request` is not implemented for `Ping`
   | ^^^^^^^^^^^
   = note: implement `Request` for it: `impl Request for Ping { type Response = …; }`
 note: required by a bound in `eventyr_mediator::__private::handles_request`
- --> src/lib.rs
+ --> src/private.rs
   |
-  |     pub fn handles_request<Req: Request, M, H: RequestHandler<Req, M> + ?Sized>(_: &H) {}
-  |                                 ^^^^^^^ required by this bound in `handles_request`
+  | pub fn handles_request<Req: Request, M, H: RequestHandler<Req, M> + ?Sized>(_: &H) {}
+  |                             ^^^^^^^ required by this bound in `handles_request`
 
 error[E0277]: `Handler` does not handle the request `Ping` in the mediator `App`
  --> tests/ui/not_a_request.rs:8:21
@@ -79,10 +79,10 @@ help: the trait `RequestHandler<Ping, App>` is not implemented for `Handler`
   | ^^^^^^^^^^^^^^
   = note: implement `RequestHandler<Ping, App>` for it, or check the bounds its impl puts on the mediator
 note: required by a bound in `eventyr_mediator::__private::handles_request`
- --> src/lib.rs
+ --> src/private.rs
   |
-  |     pub fn handles_request<Req: Request, M, H: RequestHandler<Req, M> + ?Sized>(_: &H) {}
-  |                                                ^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `handles_request`
+  | pub fn handles_request<Req: Request, M, H: RequestHandler<Req, M> + ?Sized>(_: &H) {}
+  |                                            ^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `handles_request`
 
 error[E0277]: `Ping` is not a request
  --> tests/ui/not_a_request.rs:8:13

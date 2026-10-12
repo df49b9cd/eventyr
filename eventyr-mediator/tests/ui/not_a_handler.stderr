@@ -11,7 +11,7 @@ help: the trait `RequestHandler<Ping, App>` is not implemented for `Bystander`
    | ^^^^^^^^^^^^^^^^
    = note: implement `RequestHandler<Ping, App>` for it, or check the bounds its impl puts on the mediator
 note: required by a bound in `eventyr_mediator::__private::handles_request`
-  --> src/lib.rs
+  --> src/private.rs
    |
-   |     pub fn handles_request<Req: Request, M, H: RequestHandler<Req, M> + ?Sized>(_: &H) {}
-   |                                                ^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `handles_request`
+   | pub fn handles_request<Req: Request, M, H: RequestHandler<Req, M> + ?Sized>(_: &H) {}
+   |                                            ^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `handles_request`

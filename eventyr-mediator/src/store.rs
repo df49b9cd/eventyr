@@ -451,19 +451,13 @@ fn dispatch_failure<A: Aggregate>(error: ExecutionError<A>) -> StoreError {
 }
 
 /// The aggregate instance a saga command targets: its stream id is
-/// `"{A::NAME}-{id}"` (see `StreamId::for_aggregate`), and `parse` reads
-/// the id back from the part after the prefix.
+/// `"{A::NAME}-{id}"` (see `StreamId::for_aggregate`), and
+/// [`StreamId::aggregate_id`] reads the id back.
 fn target_id<A: Aggregate>(
     target: &StreamId,
     parse: &impl Fn(&str) -> Option<A::Id>,
 ) -> Result<A::Id, StoreError> {
-    let id = target
-        .as_str()
-        .strip_prefix(A::NAME)
-        .and_then(|rest| rest.strip_prefix('-'))
-        .filter(|raw| !raw.is_empty())
-        .and_then(parse);
-    match id {
+    match target.aggregate_id::<A>(parse) {
         Some(id) => Ok(id),
         None => Err(StoreError::other(alloc::format!(
             "the saga targeted {target}, which is not a {} stream",
