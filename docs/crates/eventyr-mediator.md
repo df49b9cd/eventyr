@@ -181,8 +181,9 @@ crate as `eventyr::mediator`.
 
 - A generic route is a family, so it is not a variant of a dispatch
   enum, and the stages of its kind are not checked for applying
-  somewhere. Whether a stage applies is still decided per message, at
-  each `send`.
+  somewhere: whether a stage applies to a member of the family is
+  decided per message, at each `send`. (For concrete routes the check
+  does run, and a stage that applies to no route fails the build.)
 - A stage or handler named by type is a singleton. Per-dispatch state
   belongs in the request, and shared mutable state behind `Mutex` or
   `Arc` in a field.

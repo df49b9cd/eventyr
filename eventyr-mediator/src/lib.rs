@@ -112,7 +112,11 @@
 //! behavior implemented for `Req: Request + Authorizable` wraps exactly
 //! the routes whose request is `Authorizable`; a blanket impl wraps every
 //! route; an impl for one concrete request wraps one route. A listed
-//! stage that applies to no route is skipped silently, as in MediatR.
+//! stage that applies to none of the mediator's routes is a mistake — a
+//! missing impl, or bounds no routed message meets — and the build fails
+//! at the stage. (A generic route is a family of messages: the check
+//! passes any route of its kind, and whether a stage applies to a member
+//! of the family is decided per message, at each `send`.)
 //!
 //! A request's pipeline is MediatR's, from the outside in: the error
 //! actions and error handlers (actions outermost, so they see what no
@@ -385,9 +389,11 @@ where
 ///
 /// It receives a notification's handlers as [`Deliveries`] and decides
 /// how to run them: the built-in strategies are the provided
-/// combinators, and a publisher can wrap them (log, time, retry) or
-/// order its own. Implement it generically over `N` to serve every
-/// notification the mediator routes.
+/// combinators, and a publisher can wrap them (log, time) or order its
+/// own. Deliveries are consumed on use, so a run happens exactly once —
+/// to retry a failed delivery, publish again from the caller. Implement
+/// it generically over `N` to serve every notification the mediator
+/// routes.
 pub trait NotificationPublisher<N: Notification>: Send + Sync {
     /// Runs `handlers`, in whatever order and concurrency this
     /// publisher chooses.

@@ -270,6 +270,33 @@ fn an_idempotent_command_commits_once() {
     assert_eq!(loaded.state.balance, 10);
 }
 
+#[test]
+fn with_metadata_keeps_a_preset_idempotency_key() {
+    let (app, store) = app();
+    block_on(app.send(Execute::<Wallet>::new(WalletId(1), WalletCommand::Open))).expect("open");
+    // The key is set first; the interaction's metadata carries none, so
+    // it must not clobber it — a repeat still matches the earlier commit.
+    let credit = || {
+        Execute::<Wallet>::new(WalletId(1), WalletCommand::Credit { amount: 10 })
+            .idempotent("deposit-42")
+            .with_metadata(Metadata {
+                correlation_id: Some("req-9".into()),
+                ..Metadata::default()
+            })
+    };
+    assert!(matches!(
+        block_on(app.send(credit())),
+        Ok(ExecutionOutcome::Committed { .. })
+    ));
+    assert!(matches!(
+        block_on(app.send(credit())),
+        Ok(ExecutionOutcome::AlreadyCommitted { .. })
+    ));
+    assert_eq!(metadata_of(&store).len(), 2);
+    let loaded = block_on(app.send(Load::<Wallet>::new(WalletId(1)))).expect("load");
+    assert_eq!(loaded.state.balance, 10);
+}
+
 // -- the same routes over a snapshotting repository ------------------------
 
 type Snapshots = Arc<InMemorySnapshotStore<WalletState>>;
@@ -418,4 +445,28 @@ fn a_saga_command_to_a_foreign_stream_fails_the_dispatch() {
         metadata: Metadata::default(),
     }));
     assert!(failure.is_err());
+}
+
+#[test]
+fn a_saga_rejection_is_other_never_unavailable() {
+    let (app, _) = app();
+    let mut dispatch = saga_dispatcher::<Wallet, _, _>(Arc::new(app), parse_id::<WalletId>);
+    // Wallet 9 was never opened: the credit is a domain rejection. The
+    // dispatcher maps it to `StoreError::other`, and the runner treats a
+    // projection failure as `Other` too — a rejection is a failure by
+    // policy, not a retriable `Unavailable`.
+    let failure = block_on(dispatch(SagaCommand {
+        command: WalletCommand::Credit { amount: 5 },
+        target: StreamId::for_aggregate::<Wallet>(&WalletId(9)),
+        metadata: Metadata::default(),
+    }))
+    .expect_err("a rejection fails the dispatch");
+    assert!(
+        matches!(&failure, StoreError::Other(_)),
+        "expected StoreError::Other, got {failure:?}"
+    );
+    assert!(
+        failure.to_string().contains("the wallet is not open"),
+        "the rejection is named: {failure}"
+    );
 }

@@ -2,24 +2,13 @@
 //! bounds, short-circuits, pre- and post-processors, and the order of
 //! every stage around the handler.
 
-use std::sync::{Arc, Mutex};
+mod common;
 
 use eventyr_mediator::prelude::*;
 use futures::executor::block_on;
 
 /// The order stages ran in, shared by every stage of one mediator.
-#[derive(Clone, Default)]
-struct Trace(Arc<Mutex<Vec<String>>>);
-
-impl Trace {
-    fn push(&self, step: impl Into<String>) {
-        self.0.lock().unwrap().push(step.into());
-    }
-
-    fn take(&self) -> Vec<String> {
-        std::mem::take(&mut *self.0.lock().unwrap())
-    }
-}
+use common::Trace;
 
 /// Requests a guard checks.
 trait Guarded {
