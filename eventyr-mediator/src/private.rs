@@ -813,77 +813,33 @@ impl<K, Req, M, C> Check<K, Req, M, C> {
     }
 }
 
-pub trait CheckBehavior {
-    #[inline]
-    fn check(&self) -> Applies {
-        Applies
-    }
+/// One `Check<Kind, …>` applies its stage when the stage's trait bounds
+/// hold for the route: the marker that "some route applies" looks for.
+/// Each stage kind gets one trait and one impl, written out by the macro
+/// so adding a kind is one line here, not a trait-impl pair by hand.
+macro_rules! check_stage {
+    ($check:ident, $kind:ident, $candidate:ident : $($bounds:tt)*) => {
+        pub trait $check {
+            #[inline]
+            fn check(&self) -> Applies {
+                Applies
+            }
+        }
+
+        impl<Req, M, $candidate> $check for Check<$kind, Req, M, $candidate>
+        where
+            $($bounds)*
+        {
+        }
+    };
 }
 
-impl<Req: Request, M, B: PipelineBehavior<Req, M>> CheckBehavior
-    for Check<BehaviorKind, Req, M, B>
-{
-}
-
-pub trait CheckStreamBehavior {
-    #[inline]
-    fn check(&self) -> Applies {
-        Applies
-    }
-}
-
-impl<Req: StreamRequest, M, B: StreamPipelineBehavior<Req, M>> CheckStreamBehavior
-    for Check<StreamBehaviorKind, Req, M, B>
-{
-}
-
-pub trait CheckPre {
-    #[inline]
-    fn check(&self) -> Applies {
-        Applies
-    }
-}
-
-impl<Req: Request, M, P: RequestPreProcessor<Req, M>> CheckPre for Check<PreKind, Req, M, P> {}
-
-pub trait CheckPost {
-    #[inline]
-    fn check(&self) -> Applies {
-        Applies
-    }
-}
-
-impl<Req: Request, M, P: RequestPostProcessor<Req, M>> CheckPost for Check<PostKind, Req, M, P> {}
-
-pub trait CheckRecover {
-    #[inline]
-    fn check(&self) -> Applies {
-        Applies
-    }
-}
-
-impl<Req, M, H> CheckRecover for Check<RecoverKind, Req, M, H>
-where
-    Req: Request,
-    Req::Response: Fallible,
-    H: RequestErrorHandler<Req, M>,
-{
-}
-
-pub trait CheckObserve {
-    #[inline]
-    fn check(&self) -> Applies {
-        Applies
-    }
-}
-
-impl<Req, M, A> CheckObserve for Check<ObserveKind, Req, M, A>
-where
-    Req: Request,
-    Req::Response: Fallible,
-    A: RequestErrorAction<Req, M>,
-{
-}
+check_stage!(CheckBehavior, BehaviorKind, B: Req: Request, B: PipelineBehavior<Req, M>);
+check_stage!(CheckStreamBehavior, StreamBehaviorKind, B: Req: StreamRequest, B: StreamPipelineBehavior<Req, M>);
+check_stage!(CheckPre, PreKind, P: Req: Request, P: RequestPreProcessor<Req, M>);
+check_stage!(CheckPost, PostKind, P: Req: Request, P: RequestPostProcessor<Req, M>);
+check_stage!(CheckRecover, RecoverKind, H: Req: Request, Req::Response: Fallible, H: RequestErrorHandler<Req, M>);
+check_stage!(CheckObserve, ObserveKind, A: Req: Request, Req::Response: Fallible, A: RequestErrorAction<Req, M>);
 
 /// The fallback: the stage does not apply to the route probed.
 pub trait CheckSkip {

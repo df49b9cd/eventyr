@@ -421,37 +421,42 @@ impl<'c> Expansion<'c> {
 
         /// A stage list, its probe kind and check trait, and the routes
         /// (all concrete) it is checked against.
-        type StageList<'s> = (
-            &'s [Instance],
-            &'static str,
-            &'static str,
-            &'s Option<Vec<&'s Type>>,
-        );
+        type StageList<'s> = (&'s [Instance], Ident, Ident, &'s Option<Vec<&'s Type>>);
         let lists: [StageList<'_>; 6] = [
             (
                 &self.c.behaviors,
-                "BehaviorKind",
-                "CheckBehavior",
+                format_ident!("BehaviorKind"),
+                format_ident!("CheckBehavior"),
                 &requests,
             ),
             (
                 &self.c.stream_behaviors,
-                "StreamBehaviorKind",
-                "CheckStreamBehavior",
+                format_ident!("StreamBehaviorKind"),
+                format_ident!("CheckStreamBehavior"),
                 &streams,
             ),
-            (&self.c.pre_processors, "PreKind", "CheckPre", &requests),
-            (&self.c.post_processors, "PostKind", "CheckPost", &requests),
+            (
+                &self.c.pre_processors,
+                format_ident!("PreKind"),
+                format_ident!("CheckPre"),
+                &requests,
+            ),
+            (
+                &self.c.post_processors,
+                format_ident!("PostKind"),
+                format_ident!("CheckPost"),
+                &requests,
+            ),
             (
                 &self.c.error_handlers,
-                "RecoverKind",
-                "CheckRecover",
+                format_ident!("RecoverKind"),
+                format_ident!("CheckRecover"),
                 &requests,
             ),
             (
                 &self.c.error_actions,
-                "ObserveKind",
-                "CheckObserve",
+                format_ident!("ObserveKind"),
+                format_ident!("CheckObserve"),
                 &requests,
             ),
         ];
@@ -461,8 +466,6 @@ impl<'c> Expansion<'c> {
             let Some(routes) = routes else {
                 continue;
             };
-            let kind = format_ident!("{kind}");
-            let apply = format_ident!("{apply}");
             for stage in stages {
                 let stage_expr = self.instance(stage);
                 let mut tuple = quote!(());
