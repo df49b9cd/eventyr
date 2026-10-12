@@ -10,6 +10,33 @@ release.
 Added (0.8 groundwork is still ahead; this is where the next milestone's
 entries go):
 
+- `eventyr-mediator` and `eventyr-mediator-macros`: MediatR's design,
+  composed at compile time. A `mediator!` composition names every route
+  and pipeline stage and generates a concrete mediator implementing
+  `Sender`, `StreamSender`, and `Publisher` for exactly what it routes —
+  no runtime registry, so an unrouted request is a compile error at the
+  `send` call. The vocabulary covers MediatR's surface: requests and
+  handlers, stream requests, notifications with sequential, concurrent,
+  or custom (`NotificationPublisher`) publishing, pipeline and stream
+  behaviors, pre- and post-processors, error handlers and error actions
+  (over `Result`-shaped responses, with both action strategies), generic
+  routes, and generated request/stream/notification enums for dispatch
+  by value. A stage applies to the routes its impl bounds accept —
+  open-generic constraint filtering, resolved by the compiler — and a
+  stage that applies to no route fails the build. Handlers take the
+  mediator as a type parameter, so a handler bounded on `M: Sender<…>`
+  sub-dispatches through whichever mediator composes it. Behind the
+  `store` feature, `Execute<A>`/`Load<A>`/`LoadAt<A>` (and `LoadUntil<A>`
+  with `time`) route to an `AggregateRepository`, `StampMetadata` fills
+  interaction ids, and `saga_dispatcher` makes a mediator the dispatcher
+  of a `SagaProjection`, carrying the saga's idempotency keys. The
+  umbrella's `mediator` feature re-exports it as `eventyr::mediator`.
+  DESIGN.md §2 and §15.1 are amended: an in-process, compile-time
+  mediator is in scope; buses and transport stay out.
+- `eventyr-store`: `Repository<A>`, the trait every `AggregateRepository`
+  implements whichever snapshot channel it carries — execute with
+  metadata, load, load at a version — for code generic over "a
+  repository of `A`" (the mediator's handler impls are).
 - Documentation: the workspace's crates are packaged for publication —
   license texts (MIT/Apache-2.0), per-crate README, `repository`/
   `documentation`/`categories` metadata, docs.rs `all-features` builds

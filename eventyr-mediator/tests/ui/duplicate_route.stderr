@@ -1,0 +1,11 @@
+error: `Ping` is routed twice; a request has exactly one handler
+  --> tests/ui/duplicate_route.rs:17:11
+   |
+17 |     query Ping => Handler;
+   |           ^^^^
+
+error: first routed here
+  --> tests/ui/duplicate_route.rs:16:13
+   |
+16 |     command Ping => Handler;
+   |             ^^^^

@@ -1,0 +1,5 @@
+error: a `command` route has exactly one handler; only an `event` has several
+  --> tests/ui/two_handlers_on_a_request.rs:15:22
+   |
+15 |     command Ping => A, B;
+   |                      ^

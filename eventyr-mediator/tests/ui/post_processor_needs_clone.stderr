@@ -1,0 +1,25 @@
+error[E0277]: the trait bound `Ping: Clone` is not satisfied
+  --> tests/ui/post_processor_needs_clone.rs:25:13
+   |
+25 |     command Ping => Handler;
+   |             ^^^^ the trait `Clone` is not implemented for `Ping`
+   |
+help: the trait `Next<Req>` is conditionally implemented for `eventyr_mediator::__private::PostProcess<'_, M, P, N>`
+  --> src/lib.rs
+   |
+   | /     impl<M, Req, P, N> Next<Req> for PostProcess<'_, M, P, N>
+   | |     where
+   | |         M: Sync,
+   | |         Req: Request + Retained + Sync,
+   | |                        -------- unsatisfied requirement introduced here: `Ping: eventyr_mediator::__private::Retained`
+   | |         Req::Response: Sync,
+   | |         P: PostProcessors<Req, M>,
+   | |         N: Next<Req>,
+   | |_____________________^
+   = note: required for `Ping` to implement `eventyr_mediator::__private::Retained`
+   = note: required for `eventyr_mediator::__private::PostProcess<'_, App, eventyr_mediator::__private::Processors<&Audit, ()>, eventyr_mediator::__private::Terminus<'_, App, &Handler>>` to implement `Next<Ping>`
+help: consider annotating `Ping` with `#[derive(Clone)]`
+   |
+ 3 + #[derive(Clone)]
+ 4 | struct Ping;
+   |

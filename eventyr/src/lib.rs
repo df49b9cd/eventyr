@@ -81,3 +81,10 @@ pub use eventyr_shred_aes_gcm as shred_aes_gcm;
 /// `shred_chacha`.
 #[cfg(feature = "shred_chacha")]
 pub use eventyr_shred_chacha as shred_chacha;
+
+/// The compile-time mediator: MediatR's requests, notifications, and
+/// pipelines, composed by `mediator!` with no runtime registry, and the
+/// repository behind it (`mediator::store`) — re-exported from
+/// `eventyr-mediator` behind the `mediator` feature.
+#[cfg(feature = "mediator")]
+pub use eventyr_mediator as mediator;

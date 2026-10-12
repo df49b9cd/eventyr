@@ -142,7 +142,9 @@ pub mod prelude {
     pub use crate::notify::{
         CommitListener, CommitSignal, LocalCommitListener, LocalCommitSignal, NoSignal,
     };
-    pub use crate::repository::{AggregateRepository, ExecutionError, ExecutionOutcome, Loaded};
+    pub use crate::repository::{
+        AggregateRepository, ExecutionError, ExecutionOutcome, Loaded, Repository,
+    };
     pub use crate::snapshot_store::{InMemorySnapshotStore, SnapshotStore};
     pub use crate::store::{
         EventFilter, EventStore, FilteredRead, QueryAppend, StreamLifecycle, StreamsAll,

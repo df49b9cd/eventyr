@@ -1,0 +1,5 @@
+error: `AnyStream` would be empty: the composition routes no `stream` messages
+  --> tests/ui/empty_dispatch_enum.rs:17:5
+   |
+17 |     streams AnyStream -> AnyItem;
+   |     ^^^^^^^

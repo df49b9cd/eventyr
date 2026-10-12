@@ -1,0 +1,5 @@
+error: expected one of: `requests`, `streams`, `notifications`, `command`, `query`, `stream`, `event`, `behaviors`, `stream_behaviors`, `pre_processors`, `post_processors`, `error_handlers`, `error_actions`, `error_action_strategy`, `publish`, `crate`
+ --> tests/ui/unknown_clause.rs:3:5
+  |
+3 |     handlers { Foo }
+  |     ^^^^^^^^

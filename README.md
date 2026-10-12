@@ -17,7 +17,9 @@ for the full design.
 
 Non-goals worth naming: not a runtime or actor framework, no HTTP or
 transport, no baked-in bus integrations (`EventBus` stays a
-user-implementable trait), no ORM, no DDD toolkit.
+user-implementable trait), no ORM, no DDD toolkit. The optional
+mediator is in-process and compile-time — a function call, generated —
+not a command bus.
 
 ## Status
 
@@ -60,6 +62,8 @@ via the blocking drivers) drives the same machines.
 | `eventyr-core` | `Aggregate`, protocol vocabulary (`StreamId`/`Version`/`Sequence`/`ExpectedVersion`/`StoreError`/envelope/`Metadata`), `WriteMachine`, `BatchMachine`, `BoundaryMachine` (dynamic consistency boundaries: `Tag`/`Tagged`/`Query`/`Decision`), idempotent commands via `Metadata::idempotency_key`, `SubscriptionMachine`, `SagaMachine`, upcast vocabulary (`Upcaster`/`RawEvent`/`UpcastError`) — `no_std + alloc`, zero deps | shipped |
 | `eventyr-store` | `EventStore`/`StreamsAll` ports, the opt-in `QueryAppend`, `CommitSignal` and `StreamLifecycle` ports, `InMemoryStore`, `drive_write` driver, `AggregateRepository` (with the `load` / `load_at` / `load_until` read path, 0.7.8), prelude | shipped |
 | `eventyr-macros` | `#[derive(Aggregate)]`, `#[derive(EventName)]` — convention wiring, sugar not API | shipped |
+| `eventyr-mediator` | MediatR for Rust, composed at compile time: requests, stream requests, notifications, pipeline behaviors, pre/post-processors, error handlers/actions, publish strategies, dispatch enums — and, behind `store`, eventyr's repository behind it (`Execute`/`Load`, `StampMetadata`, a saga dispatcher). No runtime registry; an unrouted request is a compile error | shipped |
+| `eventyr-mediator-macros` | `mediator!` — the composition macro behind `eventyr-mediator` | shipped |
 | `eventyr-store-postgres` | sqlx-based `EventStore`/`StreamsAll` (`PgStore`, `append_events` PL/pgSQL); `snapshots`, `views`, `checkpoints`, and `leases` (0.7.9) features | shipped |
 | `eventyr-store-sqlite` | Embedded SQLite store (`rusqlite`) — the contract suite's reference port, with `snapshots`, `views`, `checkpoints`, `shred`, and `parked` substores | shipped |
 | `eventyr-projection` | Read-path correctness layer: `UpcasterChain`/`ClosureUpcaster`, `UpcastingSource` (raw→typed), `RebuildPlan`/`SchemaVersion`/`checkpoint_key`; `View`/`ViewProjection`, and inline views written in the append transaction (`inline` feature, run by the Postgres and SQLite stores) | shipped |
@@ -88,6 +92,7 @@ their subscription runner (`SagaProjection`) beside the projector.
 | `fjall` | no | `eventyr::fjall` — the embedded store (`fjall_snapshots` adds its snapshot store) |
 | `sqlite` | no | `eventyr::sqlite` — the embedded SQLite store; `sqlite_snapshots`, `sqlite_views`, `sqlite_checkpoints`, `sqlite_shred`, `sqlite_parked` for its substores |
 | `shred` | no | `eventyr::shred` — crypto-shredding; pick a cipher with `shred_aes_gcm` / `shred_chacha`, and `shred_parked` seals parked events |
+| `mediator` | no | `store` + `eventyr::mediator` — the compile-time mediator with its eventyr integration (`mediator::store`) |
 | `metrics` | no | the `Metrics` port's tracing backend (`TracingMetrics`), passed to `drive_write_with_metrics` or `Projector::with_metrics` |
 
 ## A taste

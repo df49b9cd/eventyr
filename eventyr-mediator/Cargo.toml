@@ -1,0 +1,47 @@
+[package]
+name = "eventyr-mediator"
+description = "The compile-time mediator for eventyr: requests, notifications, and pipeline behaviors composed by the mediator! macro — no runtime registry, no reflection, no dependency-injection container."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["event-sourcing", "cqrs", "mediator", "macro"]
+repository = "https://github.com/df49b9cd/eventyr"
+readme = "README.md"
+homepage = "https://github.com/df49b9cd/eventyr"
+categories = ["database"]
+documentation = "https://docs.rs/eventyr-mediator"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+store = ["dep:eventyr-core", "dep:eventyr-store"]
+time = ["store", "eventyr-core/time", "eventyr-store/time", "dep:time"]
+
+[dependencies]
+eventyr-mediator-macros.workspace = true
+futures.workspace = true
+eventyr-core = { workspace = true, optional = true }
+eventyr-store = { workspace = true, optional = true }
+time = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Path-only, as everywhere in the workspace: a versioned dev-dependency
+# would point the packaged manifest at a registry copy.
+eventyr-core = { path = "../eventyr-core", features = ["macros"] }
+eventyr-store = { path = "../eventyr-store" }
+eventyr-subscription = { path = "../eventyr-subscription" }
+futures = { workspace = true, features = ["executor"] }
+trybuild.workspace = true
+
+# The eventyr integration: an aggregate derived with eventyr-macros,
+# routed through a mediator, and a saga dispatching through it.
+[[test]]
+name = "store"
+required-features = ["store"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

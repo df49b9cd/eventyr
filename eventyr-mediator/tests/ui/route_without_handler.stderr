@@ -1,0 +1,5 @@
+error: expected `=>` and the handler: `command Ping => SomeHandler;`
+  --> tests/ui/route_without_handler.rs:10:17
+   |
+10 |     command Ping;
+   |                 ^

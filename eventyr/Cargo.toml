@@ -19,9 +19,19 @@ workspace = true
 default = ["time", "macros", "store"]
 # Carries `Metadata::timestamp` through the re-exported core — and
 # through the stores that populate it, when they are enabled.
-time = ["eventyr-core/time", "eventyr-store/time", "eventyr-store-postgres?/time"]
+time = [
+    "eventyr-core/time",
+    "eventyr-store/time",
+    "eventyr-store-postgres?/time",
+    "eventyr-mediator?/time",
+]
 # Re-exports the derive macros through the re-exported core.
 macros = ["eventyr-core/macros"]
+# The compile-time mediator (`eventyr::mediator`): MediatR's requests,
+# notifications, and pipelines, composed by the `mediator!` macro — with
+# the store side's repository behind it (`Execute`, `Load`, the saga
+# dispatcher), since the umbrella's `store` feature carries it anyway.
+mediator = ["store", "dep:eventyr-mediator", "eventyr-mediator/store"]
 # Re-exports the store side: ports, in-memory store, driver, repository.
 store = ["dep:eventyr-store"]
 # Re-exports the subscription side: projector runner, checkpoint store.
@@ -72,6 +82,7 @@ metrics = ["store", "eventyr-store/tracing"]
 
 [dependencies]
 eventyr-core = { workspace = true }
+eventyr-mediator = { workspace = true, optional = true }
 eventyr-store = { workspace = true, optional = true }
 eventyr-store-fjall = { workspace = true, optional = true }
 eventyr-store-postgres = { workspace = true, optional = true }
