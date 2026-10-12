@@ -91,6 +91,11 @@ sqlx = { workspace = true, features = ["postgres", "runtime-tokio"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures.workspace = true
+# The embedded example opens the fjall database handle its log and
+# snapshot store share; it and the operations example run in a
+# throwaway directory.
+fjall.workspace = true
+tempfile.workspace = true
 
 # The bank runs the full shipped surface; the focused examples sit
 # behind exactly what they use, so `--all-targets` under default
@@ -112,6 +117,34 @@ required-features = [
     "postgres_leases",
     "postgres_views",
 ]
+
+[[example]]
+name = "versioning"
+required-features = ["projection"]
+
+[[example]]
+name = "embedded"
+required-features = ["fjall_snapshots", "subscription"]
+
+[[example]]
+name = "operations"
+required-features = [
+    "sqlite_snapshots",
+    "sqlite_checkpoints",
+    "sqlite_shred",
+    "sqlite_parked",
+    "shred_chacha",
+    "shred_parked",
+    "metrics",
+]
+
+[[example]]
+name = "bus"
+required-features = ["bus"]
+
+[[example]]
+name = "hello_postgres"
+required-features = ["postgres"]
 
 [package.metadata.docs.rs]
 all-features = true

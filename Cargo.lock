@@ -465,10 +465,12 @@ dependencies = [
  "eventyr-store-postgres",
  "eventyr-store-sqlite",
  "eventyr-subscription",
+ "fjall",
  "futures",
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "tokio",
 ]
 

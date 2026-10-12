@@ -9,13 +9,17 @@
 //! subscription (roadmap 0.6.1 + 0.7.4) with the saga's command keys making
 //! redelivery safe; the ledger read model rebuilds off the global
 //! stream, woken by commits (roadmap 0.7.2); a poison event is parked and
-//! replayed (roadmap 0.7.7); a renamed event is upcast end to end (roadmap 0.3);
-//! owner names are sealed by the shredding store and one subject is
-//! erased (roadmap 0.7.6); and an account is closed, its further writes refused
-//! (roadmap 0.7.6).
+//! replayed (roadmap 0.7.7); a renamed event's old payload is upcast to the
+//! current shape (roadmap 0.3); owner names are sealed by the shredding store,
+//! one subject is erased, and a new write of that subject's data is
+//! refused (roadmap 0.7.6); and an account is closed, its further writes
+//! refused (roadmap 0.7.6).
 //!
-//! Dynamic consistency boundaries live in `examples/loan_eligibility.rs`
-//! and inline views in `examples/inline_view.rs`.
+//! Dynamic consistency boundaries live in `examples/enrollment.rs` and
+//! `examples/loan_eligibility.rs`, inline views in
+//! `examples/inline_view.rs`, and the read path over stored raw
+//! payloads — version ladders, `VersionedSource`, schema-versioned
+//! rebuilds — in `examples/versioning.rs`.
 //!
 //! Run with:
 //! ```sh
@@ -33,7 +37,7 @@ use std::time::Duration;
 use eventyr::envelope::Metadata;
 use eventyr::prelude::*;
 use eventyr::projection::prelude::{ClosureUpcaster, UpcasterChain};
-use eventyr::shred::{InMemoryKeyStore, Sensitive, Shredder, ShreddingStore};
+use eventyr::shred::{InMemoryKeyStore, Sensitive, ShredError, Shredder, ShreddingStore};
 use eventyr::shred_aes_gcm::Aes256GcmCipher;
 use eventyr::store::prelude::*;
 use eventyr::subscription::prelude::{
@@ -82,6 +86,13 @@ struct Withdrawn {
 struct Closed {
     account: u64,
 }
+/// An owner change carries fresh personal data — sealed under the
+/// account's subject, erased with it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct OwnerChanged {
+    account: u64,
+    owner: Sensitive<String>,
+}
 
 /// The account's commands.
 #[derive(Debug)]
@@ -94,6 +105,9 @@ enum AccountCommand {
     Withdraw { amount: u64 },
     /// Close the account: records the fact, then the stream is closed.
     Close,
+    /// Change the owner's name — a write that carries personal data and
+    /// therefore goes through the shredder on append.
+    ChangeOwner { new_owner: String },
 }
 
 /// The account's rejections.
@@ -138,6 +152,7 @@ fn apply(state: &mut AccountState, event: &AccountEvent) {
         AccountEvent::Deposited(Deposited { amount, .. }) => state.balance += amount,
         AccountEvent::Withdrawn(Withdrawn { amount, .. }) => state.balance -= amount,
         AccountEvent::Closed(Closed { .. }) => state.closed = true,
+        AccountEvent::OwnerChanged(..) => {}
     }
 }
 
@@ -166,6 +181,16 @@ fn decide(
         AccountCommand::Deposit { .. } | AccountCommand::Withdraw { .. } if !state.open => {
             Err(AccountError::NotOpen)
         }
+        // The domain accepts a rename for an open account; the store
+        // refuses if the subject's keys are gone.
+        AccountCommand::ChangeOwner { .. } if !state.open => Err(AccountError::NotOpen),
+        AccountCommand::ChangeOwner { new_owner } => Ok(vec![
+            OwnerChanged {
+                account,
+                owner: Sensitive::new(format!("account-{account}"), new_owner.clone()),
+            }
+            .into(),
+        ]),
         AccountCommand::Deposit { amount } => Ok(vec![
             Deposited {
                 account,
@@ -202,7 +227,7 @@ fn decide(
     error = AccountError,
     command = AccountCommand,
     initial = AccountState::new(id),
-    events(Opened, Deposited, Withdrawn, Closed),
+    events(Opened, Deposited, Withdrawn, Closed, OwnerChanged),
     event_derive(serde::Serialize, serde::Deserialize)
 )]
 struct Account;
@@ -226,7 +251,8 @@ impl Tagged for AccountEvent {
             AccountEvent::Opened(Opened { .. }) => return Vec::new(),
             AccountEvent::Deposited(Deposited { account, .. })
             | AccountEvent::Withdrawn(Withdrawn { account, .. })
-            | AccountEvent::Closed(Closed { account }) => *account,
+            | AccountEvent::Closed(Closed { account })
+            | AccountEvent::OwnerChanged(OwnerChanged { account, .. }) => *account,
         };
         vec![Tag::of("account", account)]
     }
@@ -354,6 +380,7 @@ impl Ledger {
             AccountEvent::Closed(Closed { .. }) => {
                 balances.remove(&id);
             }
+            AccountEvent::OwnerChanged(..) => {}
         }
     }
 }
@@ -628,7 +655,11 @@ async fn main() {
 
     // The upcast story (roadmap 0.3): a deposit stored under its old name
     // `AmountV1` — a bare number, from before deposits knew their
-    // account — is lifted to the current `Deposited` shape on read.
+    // account — is lifted to the current `Deposited` shape. This is the
+    // upcaster on its own: the stores here decode straight into the
+    // event enum, so the raw payload is built by hand. The full read
+    // path — a version ladder run inside a projector's fetch — is
+    // `examples/versioning.rs`.
     let chain = UpcasterChain::new()
         .with(
             "AmountV1",
@@ -731,9 +762,31 @@ async fn main() {
     };
     assert!(owner.is_shredded(), "bob's name is gone from the log");
 
+    // The refused write: renaming bob seals fresh personal data, and an
+    // erased subject never gets a key again. The domain decided the
+    // rename; the store refused to seal it, so it is a store failure
+    // naming the subject, not a domain rejection.
+    let refused = repo
+        .execute(
+            AccountId(2),
+            AccountCommand::ChangeOwner {
+                new_owner: "bobby".into(),
+            },
+        )
+        .await
+        .expect_err("an erased subject's data is never sealed again");
+    let ExecutionError::Store(StoreError::Other(source)) = &refused else {
+        panic!("the seal's refusal is a store failure: {refused:?}")
+    };
+    assert!(matches!(
+        source.downcast_ref::<ShredError>(),
+        Some(ShredError::SubjectErased(subject)) if subject == "account-2"
+    ));
+
     println!(
         "ledger: alice=99 bob=30 (fee charged); transfer replayed once; \
-         parked withdrawal replayed; upcast AmountV1=42; carol closed; bob erased",
+         parked withdrawal replayed; upcast AmountV1=42; carol closed; \
+         bob erased and refused a new name",
     );
 }
 

@@ -10,6 +10,26 @@ release.
 Added (0.8 groundwork is still ahead; this is where the next milestone's
 entries go):
 
+- `eventyr` (examples): five new examples, each run by CI —
+  `versioning` (upcaster ladders validated by `build()`,
+  `VersionedSource` in a projector, a `RebuildPlan` schema bump, a
+  poison payload stopping the projection), `embedded` (fjall with no
+  runtime: the blocking write and projector drivers, snapshots on the
+  same database, `Optional`, a reopened directory), `operations`
+  (SQLite's key, parked, snapshot, and checkpoint stores surviving a
+  restart; `TracingMetrics`; XChaCha20-Poly1305; erasure),
+  `bus` (an `EventBus` transport waking a projector), and
+  `hello_postgres` (the minimal Postgres deployment).
+- `eventyr` (examples): `enrollment` defines its DCB domain inline
+  instead of importing the contract-suite fixture, and runs the async
+  `drive_boundary`; `bank` now shows the write erasure refuses (a
+  rename sealing an erased subject's data fails at the store) and
+  says plainly that its upcast is the upcaster alone, pointing at
+  `versioning` for the read path.
+- `eventyr` (tests): mirroring suites for `inline_view` and
+  `loan_eligibility`, beside `bank_story`; the loan suite steps the
+  boundary machine by hand to show a concurrent deposit committing
+  without a retry and a concurrent withdrawal forcing one.
 - Documentation: the workspace's crates are packaged for publication —
   license texts (MIT/Apache-2.0), per-crate README, `repository`/
   `documentation`/`categories` metadata, docs.rs `all-features` builds
