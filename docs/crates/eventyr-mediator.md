@@ -165,7 +165,8 @@ crate as `eventyr::mediator`.
 
 - Integration suites, one per area: `requests`, `pipeline`, `errors`,
   `notifications`, `streams`, `dynamic` (dispatch enums, generic routes,
-  generic mediators), and `store` (a derived aggregate end to end:
+  generic mediators), `clones` (the retaining stages share one copy of
+  the request), and `store` (a derived aggregate end to end:
   routing, metadata stamping, idempotency, a snapshotting repository, a
   saga dispatching through the mediator).
 - trybuild UI tests pin every composition diagnostic: unrouted request,
@@ -180,10 +181,15 @@ crate as `eventyr::mediator`.
 ## Limits
 
 - A generic route is a family, so it is not a variant of a dispatch
-  enum, and the stages of its kind are not checked for applying
-  somewhere: whether a stage applies to a member of the family is
-  decided per message, at each `send`. (For concrete routes the check
-  does run, and a stage that applies to no route fails the build.)
+  enum, and its stage probes resolve once for the whole family at
+  compile time — per member is not decidable, that is monomorphization.
+  A stage therefore wraps a generic route only when the stage's bounds
+  hold for every member of the family; a stage bounded on a property of
+  some members never runs for the family, and the applies-somewhere
+  check fails the build at the stage unless it applies to a concrete
+  route of the same kind. (When a kind has several generic routes, the
+  check runs per family: a stage must apply to the whole of one family
+  or to one concrete route.)
 - A stage or handler named by type is a singleton. Per-dispatch state
   belongs in the request, and shared mutable state behind `Mutex` or
   `Arc` in a field.

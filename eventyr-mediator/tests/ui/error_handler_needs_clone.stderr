@@ -20,6 +20,6 @@ help: the trait `Next<Req>` is conditionally implemented for `eventyr_mediator::
    | |                    -------- unsatisfied requirement introduced here: `Ping: eventyr_mediator::__private::Retained`
    | |     Req::Response: Fallible,
    | |     H: RequestErrorHandler<Req, M>,
-   | |     N: Next<Req>,
-   | |_________________^
+   | |     N: NextKept<Req>,
+   | |_____________________^
    = note: required for `eventyr_mediator::__private::Recover<'_, App, &Fallback, eventyr_mediator::__private::Terminus<'_, App, &Handler>>` to implement `Next<Ping>`

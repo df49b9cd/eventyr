@@ -114,9 +114,16 @@
 //! route; an impl for one concrete request wraps one route. A listed
 //! stage that applies to none of the mediator's routes is a mistake — a
 //! missing impl, or bounds no routed message meets — and the build fails
-//! at the stage. (A generic route is a family of messages: the check
-//! passes any route of its kind, and whether a stage applies to a member
-//! of the family is decided per message, at each `send`.)
+//! at the stage.
+//!
+//! A generic route is a family of messages, and its probes resolve once
+//! for the whole family — deciding per member would be monomorphization,
+//! which comes after macro expansion. So a stage wraps a generic route
+//! only when its bounds hold for every member of the family; a stage
+//! bounded on a property of *some* members (say `Req: Authorizable`
+//! where only `Get<Secret>` is `Authorizable`) never runs for the
+//! family, and the applies-somewhere check above fails the build at the
+//! stage unless it also applies to a concrete route.
 //!
 //! A request's pipeline is MediatR's, from the outside in: the error
 //! actions and error handlers (actions outermost, so they see what no

@@ -131,12 +131,14 @@ fn a_three_variant_stream_enum_dispatches_each_arm() {
     let app = ThreeVariant::new(Counter { limit: 5 });
     let count: Vec<AnyThreeItem> =
         block_on(app.create_stream(AnyThree::from(CountFrom(3))).collect());
-    assert_eq!(count, [AnyThreeItem::CountFrom(3), AnyThreeItem::CountFrom(4)]);
+    assert_eq!(
+        count,
+        [AnyThreeItem::CountFrom(3), AnyThreeItem::CountFrom(4)]
+    );
     // The middle arm: `Right(Left(_))`.
     let once: Vec<AnyThreeItem> = block_on(app.create_stream(AnyThree::Once(Once(7))).collect());
     assert_eq!(once, [AnyThreeItem::Once(7)]);
-    let names: Vec<AnyThreeItem> =
-        block_on(app.create_stream(AnyThree::Names(Names)).collect());
+    let names: Vec<AnyThreeItem> = block_on(app.create_stream(AnyThree::Names(Names)).collect());
     assert_eq!(
         names,
         [AnyThreeItem::Names("ada"), AnyThreeItem::Names("grace")]

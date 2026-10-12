@@ -210,6 +210,12 @@ impl<Req: Request> Next<Req> for Unreachable<Req> {
     }
 }
 
+impl<Req: Request + Sync> NextKept<Req> for Unreachable<Req> {
+    async fn run_kept(self, _: Req, _: Arc<Req>) -> Req::Response {
+        unreachable!("a route whose handler does not handle it does not compile")
+    }
+}
+
 impl<Req: StreamRequest> NextStream<Req> for Unreachable<Req> {
     fn run(self, _: Req) -> impl Stream<Item = Req::Item> + Send {
         futures::stream::poll_fn(|_| {
@@ -294,6 +300,21 @@ impl<T: Clone> Retained for T {
 
 // -- request chain -------------------------------------------------
 
+/// The rest of a request pipeline after the request's kept copy exists.
+///
+/// Post-processors and the error stages see the request after the
+/// handler consumed it, so the *outermost* retaining layer keeps one
+/// copy in an `Arc` the inner retaining layers borrow — one clone of
+/// the request per send, however many stages keep it. A layer reached
+/// through plain [`Next::run`] is the outermost retaining one and makes
+/// the copy; one reached through `run_kept` shares it. Behaviors, which
+/// take the request by value, sit inside the innermost retaining layer
+/// and drop their share.
+pub trait NextKept<Req: Request>: Send {
+    /// Continues the pipeline, sharing the route's one kept copy.
+    fn run_kept(self, request: Req, kept: Arc<Req>) -> impl Future<Output = Req::Response> + Send;
+}
+
 /// A behavior around the rest of a request pipeline.
 pub struct Layer<'a, M, B, N> {
     mediator: &'a M,
@@ -310,6 +331,21 @@ where
 {
     #[inline]
     async fn run(self, request: Req) -> Req::Response {
+        self.behavior
+            .handle(self.mediator, request, self.next)
+            .await
+    }
+}
+
+impl<M, Req, B, N> NextKept<Req> for Layer<'_, M, B, N>
+where
+    M: Sync,
+    Req: Request + Sync,
+    B: PipelineBehavior<Req, M>,
+    N: Next<Req>,
+{
+    #[inline]
+    async fn run_kept(self, request: Req, _kept: Arc<Req>) -> Req::Response {
         self.behavior
             .handle(self.mediator, request, self.next)
             .await
@@ -335,6 +371,18 @@ where
     }
 }
 
+impl<M, Req, H> NextKept<Req> for Terminus<'_, M, H>
+where
+    M: Sync,
+    Req: Request + Sync,
+    H: RequestHandler<Req, M>,
+{
+    #[inline]
+    async fn run_kept(self, request: Req, _kept: Arc<Req>) -> Req::Response {
+        self.handler.handle(self.mediator, request).await
+    }
+}
+
 /// The route's pre-processors, in order, before the rest.
 pub struct PreProcess<'a, M, P, N> {
     mediator: &'a M,
@@ -356,6 +404,20 @@ where
     }
 }
 
+impl<M, Req, P, N> NextKept<Req> for PreProcess<'_, M, P, N>
+where
+    M: Sync,
+    Req: Request + Sync,
+    P: PreProcessors<Req, M>,
+    N: NextKept<Req>,
+{
+    #[inline]
+    async fn run_kept(self, request: Req, kept: Arc<Req>) -> Req::Response {
+        self.processors.process(self.mediator, &request).await;
+        self.next.run_kept(request, kept).await
+    }
+}
+
 /// The route's post-processors, in order, after the rest answers.
 pub struct PostProcess<'a, M, P, N> {
     mediator: &'a M,
@@ -373,7 +435,21 @@ where
 {
     #[inline]
     async fn run(self, request: Req) -> Req::Response {
-        let kept = request.retain();
+        let kept = Arc::new(request.retain());
+        self.run_kept(request, kept).await
+    }
+}
+
+impl<M, Req, P, N> NextKept<Req> for PostProcess<'_, M, P, N>
+where
+    M: Sync,
+    Req: Request + Sync,
+    Req::Response: Sync,
+    P: PostProcessors<Req, M>,
+    N: Next<Req>,
+{
+    #[inline]
+    async fn run_kept(self, request: Req, kept: Arc<Req>) -> Req::Response {
         let response = self.next.run(request).await;
         self.processors
             .process(self.mediator, &kept, &response)
@@ -395,12 +471,31 @@ where
     Req: Request + Retained + Sync,
     Req::Response: Fallible,
     H: RequestErrorHandler<Req, M>,
-    N: Next<Req>,
+    N: NextKept<Req>,
 {
     #[inline]
     async fn run(self, request: Req) -> Req::Response {
-        let kept = request.retain();
-        match self.next.run(request).await.into_result() {
+        let kept = Arc::new(request.retain());
+        self.run_kept(request, kept).await
+    }
+}
+
+impl<M, Req, H, N> NextKept<Req> for Recover<'_, M, H, N>
+where
+    M: Sync,
+    Req: Request + Sync,
+    Req::Response: Fallible,
+    H: RequestErrorHandler<Req, M>,
+    N: NextKept<Req>,
+{
+    #[inline]
+    async fn run_kept(self, request: Req, kept: Arc<Req>) -> Req::Response {
+        match self
+            .next
+            .run_kept(request, kept.clone())
+            .await
+            .into_result()
+        {
             Ok(ok) => Fallible::from_result(Ok(ok)),
             Err(error) => self.handler.handle(self.mediator, &kept, error).await,
         }
@@ -421,12 +516,31 @@ where
     Req::Response: Fallible,
     <Req::Response as Fallible>::Error: Sync,
     A: RequestErrorAction<Req, M>,
-    N: Next<Req>,
+    N: NextKept<Req>,
 {
     #[inline]
     async fn run(self, request: Req) -> Req::Response {
-        let kept = request.retain();
-        let response = self.next.run(request).await.into_result();
+        let kept = Arc::new(request.retain());
+        self.run_kept(request, kept).await
+    }
+}
+
+impl<M, Req, A, N> NextKept<Req> for Observe<'_, M, A, N>
+where
+    M: Sync,
+    Req: Request + Sync,
+    Req::Response: Fallible,
+    <Req::Response as Fallible>::Error: Sync,
+    A: RequestErrorAction<Req, M>,
+    N: NextKept<Req>,
+{
+    #[inline]
+    async fn run_kept(self, request: Req, kept: Arc<Req>) -> Req::Response {
+        let response = self
+            .next
+            .run_kept(request, kept.clone())
+            .await
+            .into_result();
         if let Err(error) = &response {
             self.action.execute(self.mediator, &kept, error).await;
         }
@@ -634,13 +748,17 @@ impl<'a, K, Req, M, C, N> Probe<'a, K, Req, M, C, N> {
     }
 }
 
-/// Applies a pipeline behavior.
-pub trait ApplyBehavior {
+/// Applies a stage to the probed route: one trait, one impl per stage
+/// kind, keyed by the kind marker in `Probe`. What distinguishes the
+/// kinds is each impl's bounds, output type, and constructor; what
+/// selects between them is the marker, so a type that is both, say, a
+/// behavior and a pre-processor still matches one impl per probe.
+pub trait Apply {
     type Output;
     fn select(&self) -> Self::Output;
 }
 
-impl<'a, Req, M, B, N> ApplyBehavior for Probe<'a, BehaviorKind, Req, M, B, N>
+impl<'a, Req, M, B, N> Apply for Probe<'a, BehaviorKind, Req, M, B, N>
 where
     Req: Request,
     B: PipelineBehavior<Req, M>,
@@ -658,13 +776,7 @@ where
     }
 }
 
-/// Applies a stream pipeline behavior.
-pub trait ApplyStreamBehavior {
-    type Output;
-    fn select(&self) -> Self::Output;
-}
-
-impl<'a, Req, M, B, N> ApplyStreamBehavior for Probe<'a, StreamBehaviorKind, Req, M, &'a B, N>
+impl<'a, Req, M, B, N> Apply for Probe<'a, StreamBehaviorKind, Req, M, &'a B, N>
 where
     Req: StreamRequest,
     B: StreamPipelineBehavior<Req, M>,
@@ -682,13 +794,7 @@ where
     }
 }
 
-/// Applies a pre-processor: prepends it to the route's list.
-pub trait ApplyPre {
-    type Output;
-    fn select(&self) -> Self::Output;
-}
-
-impl<Req, M, P, T> ApplyPre for Probe<'_, PreKind, Req, M, P, T>
+impl<Req, M, P, T> Apply for Probe<'_, PreKind, Req, M, P, T>
 where
     Req: Request,
     P: RequestPreProcessor<Req, M>,
@@ -702,13 +808,7 @@ where
     }
 }
 
-/// Applies a post-processor: prepends it to the route's list.
-pub trait ApplyPost {
-    type Output;
-    fn select(&self) -> Self::Output;
-}
-
-impl<Req, M, P, T> ApplyPost for Probe<'_, PostKind, Req, M, P, T>
+impl<Req, M, P, T> Apply for Probe<'_, PostKind, Req, M, P, T>
 where
     Req: Request,
     P: RequestPostProcessor<Req, M>,
@@ -722,13 +822,7 @@ where
     }
 }
 
-/// Applies an error handler around the rest of the chain.
-pub trait ApplyRecover {
-    type Output;
-    fn select(&self) -> Self::Output;
-}
-
-impl<'a, Req, M, H, N> ApplyRecover for Probe<'a, RecoverKind, Req, M, H, N>
+impl<'a, Req, M, H, N> Apply for Probe<'a, RecoverKind, Req, M, H, N>
 where
     Req: Request,
     Req::Response: Fallible,
@@ -747,13 +841,7 @@ where
     }
 }
 
-/// Applies an error action around the rest of the chain.
-pub trait ApplyObserve {
-    type Output;
-    fn select(&self) -> Self::Output;
-}
-
-impl<'a, Req, M, A, N> ApplyObserve for Probe<'a, ObserveKind, Req, M, A, N>
+impl<'a, Req, M, A, N> Apply for Probe<'a, ObserveKind, Req, M, A, N>
 where
     Req: Request,
     Req::Response: Fallible,
@@ -804,42 +892,69 @@ pub struct Applies;
 pub struct Skips;
 
 /// One stage against one route, by type only.
-pub struct Check<K, Req, M, C>(PhantomData<fn(K, Req, M, C)>);
+pub struct StageCheck<K, Req, M, C>(PhantomData<fn(K, Req, M, C)>);
 
-impl<K, Req, M, C> Check<K, Req, M, C> {
+impl<K, Req, M, C> StageCheck<K, Req, M, C> {
     #[inline]
     pub fn new(_: &M, _: &C) -> Self {
         Self(PhantomData)
     }
 }
 
-/// One `Check<Kind, …>` applies its stage when the stage's trait bounds
-/// hold for the route: the marker that "some route applies" looks for.
-/// Each stage kind gets one trait and one impl, written out by the macro
-/// so adding a kind is one line here, not a trait-impl pair by hand.
-macro_rules! check_stage {
-    ($check:ident, $kind:ident, $candidate:ident : $($bounds:tt)*) => {
-        pub trait $check {
-            #[inline]
-            fn check(&self) -> Applies {
-                Applies
-            }
-        }
-
-        impl<Req, M, $candidate> $check for Check<$kind, Req, M, $candidate>
-        where
-            $($bounds)*
-        {
-        }
-    };
+/// One `StageCheck<Kind, …>` applies its stage when the stage's trait
+/// bounds hold for the route: the marker that "some route applies" looks
+/// for. One trait, one impl per stage kind, keyed by the kind marker —
+/// adding a kind is one impl here.
+pub trait Check {
+    #[inline]
+    fn check(&self) -> Applies {
+        Applies
+    }
 }
 
-check_stage!(CheckBehavior, BehaviorKind, B: Req: Request, B: PipelineBehavior<Req, M>);
-check_stage!(CheckStreamBehavior, StreamBehaviorKind, B: Req: StreamRequest, B: StreamPipelineBehavior<Req, M>);
-check_stage!(CheckPre, PreKind, P: Req: Request, P: RequestPreProcessor<Req, M>);
-check_stage!(CheckPost, PostKind, P: Req: Request, P: RequestPostProcessor<Req, M>);
-check_stage!(CheckRecover, RecoverKind, H: Req: Request, Req::Response: Fallible, H: RequestErrorHandler<Req, M>);
-check_stage!(CheckObserve, ObserveKind, A: Req: Request, Req::Response: Fallible, A: RequestErrorAction<Req, M>);
+impl<Req, M, B> Check for StageCheck<BehaviorKind, Req, M, B>
+where
+    Req: Request,
+    B: PipelineBehavior<Req, M>,
+{
+}
+
+impl<Req, M, B> Check for StageCheck<StreamBehaviorKind, Req, M, B>
+where
+    Req: StreamRequest,
+    B: StreamPipelineBehavior<Req, M>,
+{
+}
+
+impl<Req, M, P> Check for StageCheck<PreKind, Req, M, P>
+where
+    Req: Request,
+    P: RequestPreProcessor<Req, M>,
+{
+}
+
+impl<Req, M, P> Check for StageCheck<PostKind, Req, M, P>
+where
+    Req: Request,
+    P: RequestPostProcessor<Req, M>,
+{
+}
+
+impl<Req, M, H> Check for StageCheck<RecoverKind, Req, M, H>
+where
+    Req: Request,
+    Req::Response: Fallible,
+    H: RequestErrorHandler<Req, M>,
+{
+}
+
+impl<Req, M, A> Check for StageCheck<ObserveKind, Req, M, A>
+where
+    Req: Request,
+    Req::Response: Fallible,
+    A: RequestErrorAction<Req, M>,
+{
+}
 
 /// The fallback: the stage does not apply to the route probed.
 pub trait CheckSkip {
@@ -849,7 +964,7 @@ pub trait CheckSkip {
     }
 }
 
-impl<K, Req, M, C> CheckSkip for &Check<K, Req, M, C> {}
+impl<K, Req, M, C> CheckSkip for &StageCheck<K, Req, M, C> {}
 
 /// Some route in the list applies.
 #[diagnostic::on_unimplemented(

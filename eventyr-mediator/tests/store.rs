@@ -11,11 +11,11 @@ use std::num::NonZeroU64;
 
 use eventyr_core::prelude::*;
 use eventyr_mediator::prelude::*;
+#[cfg(feature = "time")]
+use eventyr_mediator::store::LoadUntil;
 use eventyr_mediator::store::{
     Execute, HasMetadata, Load, LoadAt, StampMetadata, parse_id, saga_dispatcher,
 };
-#[cfg(feature = "time")]
-use eventyr_mediator::store::LoadUntil;
 use eventyr_store::prelude::{
     AggregateRepository, EventStore, ExecutionError, ExecutionOutcome, InMemorySnapshotStore,
     InMemoryStore, SnapshotStore, StreamsAll,
@@ -502,31 +502,39 @@ fn a_load_until_folds_to_the_instant() {
         ..Metadata::default()
     };
 
-    block_on(app.send(
-        Execute::<Wallet>::new(WalletId(1), WalletCommand::Open).with_metadata(at(1)),
-    ))
+    block_on(
+        app.send(Execute::<Wallet>::new(WalletId(1), WalletCommand::Open).with_metadata(at(1))),
+    )
     .expect("open");
-    block_on(app.send(
-        Execute::<Wallet>::new(WalletId(1), WalletCommand::Credit { amount: 10 })
-            .with_metadata(at(2)),
-    ))
+    block_on(
+        app.send(
+            Execute::<Wallet>::new(WalletId(1), WalletCommand::Credit { amount: 10 })
+                .with_metadata(at(2)),
+        ),
+    )
     .expect("credit at t=2");
-    block_on(app.send(
-        Execute::<Wallet>::new(WalletId(1), WalletCommand::Credit { amount: 100 })
-            .with_metadata(at(5)),
-    ))
+    block_on(
+        app.send(
+            Execute::<Wallet>::new(WalletId(1), WalletCommand::Credit { amount: 100 })
+                .with_metadata(at(5)),
+        ),
+    )
     .expect("credit at t=5");
 
     // t=3 folds the open and the first credit, not the second.
-    let as_of_three =
-        block_on(app.send(LoadUntil::<Wallet>::new(WalletId(1), epoch + time::Duration::seconds(3))))
-            .expect("load until t=3");
+    let as_of_three = block_on(app.send(LoadUntil::<Wallet>::new(
+        WalletId(1),
+        epoch + time::Duration::seconds(3),
+    )))
+    .expect("load until t=3");
     assert_eq!(as_of_three.state.balance, 10);
     assert_eq!(as_of_three.version, Version::new(2));
     // t=10 folds all three.
-    let as_of_ten =
-        block_on(app.send(LoadUntil::<Wallet>::new(WalletId(1), epoch + time::Duration::seconds(10))))
-            .expect("load until t=10");
+    let as_of_ten = block_on(app.send(LoadUntil::<Wallet>::new(
+        WalletId(1),
+        epoch + time::Duration::seconds(10),
+    )))
+    .expect("load until t=10");
     assert_eq!(as_of_ten.state.balance, 110);
     assert_eq!(as_of_ten.version, Version::new(3));
 }

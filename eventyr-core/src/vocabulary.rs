@@ -269,7 +269,10 @@ mod tests {
         assert_eq!(stream.aggregate_id::<Account>(parse), Some(TestId(7)));
         // A name that ends in the separator reads the whole of it.
         let framed = StreamId::from("just-banks-42");
-        assert_eq!(framed.aggregate_id::<FramedAccount>(parse), Some(TestId(42)));
+        assert_eq!(
+            framed.aggregate_id::<FramedAccount>(parse),
+            Some(TestId(42))
+        );
     }
 
     #[test]
@@ -279,15 +282,24 @@ mod tests {
         // "%just-banks-%9-%" is not `account-...`.
         assert_eq!(other.aggregate_id::<Account>(parse), None);
         // The bare name is not a stream with an empty id part.
-        assert_eq!(StreamId::from("account").aggregate_id::<Account>(parse), None);
-        assert_eq!(StreamId::from("account-").aggregate_id::<Account>(parse), None);
+        assert_eq!(
+            StreamId::from("account").aggregate_id::<Account>(parse),
+            None
+        );
+        assert_eq!(
+            StreamId::from("account-").aggregate_id::<Account>(parse),
+            None
+        );
         // "x" is not an id.
         assert_eq!(
             StreamId::from("account-x").aggregate_id::<Account>(parse),
             None
         );
         // A stream from another aggregate is not this aggregate's.
-        assert_eq!(StreamId::from("just-banks-7").aggregate_id::<Account>(parse), None);
+        assert_eq!(
+            StreamId::from("just-banks-7").aggregate_id::<Account>(parse),
+            None
+        );
         assert_eq!(
             StreamId::from("just-banks-x").aggregate_id::<FramedAccount>(parse),
             None
