@@ -1,0 +1,5 @@
+error: `requests` appears twice; a composition generates one such enum
+  --> tests/ui/requests_enum_appears_twice.rs:19:5
+   |
+19 |     requests OtherRequest -> OtherResponse;
+   |     ^^^^^^^^

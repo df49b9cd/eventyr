@@ -1,0 +1,5 @@
+error: name a field of the mediator: `self.field`
+  --> tests/ui/field_without_a_name.rs:16:21
+   |
+16 |     command Ping => self;
+   |                     ^^^^

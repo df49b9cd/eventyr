@@ -1,0 +1,5 @@
+error: a generic route is not a variant of a dispatch enum, so it takes no `as` name
+  --> tests/ui/generic_route_with_as.rs:16:27
+   |
+16 |     query<T: Send> Get<T> as GetAny => Handler;
+   |                           ^^

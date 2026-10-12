@@ -1,0 +1,5 @@
+error: `error_handlers` appears twice; list everything in one clause
+  --> tests/ui/clause_appears_twice.rs:36:5
+   |
+36 |     error_handlers { Fallback2 }
+   |     ^^^^^^^^^^^^^^

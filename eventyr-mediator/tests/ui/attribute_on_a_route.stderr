@@ -1,0 +1,5 @@
+error: attributes are accepted only on the `requests`, `streams`, and `notifications` clauses
+  --> tests/ui/attribute_on_a_route.rs:18:5
+   |
+18 |     #[derive(Debug)]
+   |     ^^^^^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: `crate` appears twice
+  --> tests/ui/crate_appears_twice.rs:19:5
+   |
+19 |     crate = eventyr_mediator;
+   |     ^^^^^
