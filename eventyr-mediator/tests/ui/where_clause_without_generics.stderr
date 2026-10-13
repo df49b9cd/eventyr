@@ -1,0 +1,5 @@
+error: a `where` clause needs the route's own generics: `query<T> Get<T> where T: Bound => …;`
+  --> tests/ui/where_clause_without_generics.rs:16:16
+   |
+16 |     query Ping where Ping: Send => Handler;
+   |                ^^^^^

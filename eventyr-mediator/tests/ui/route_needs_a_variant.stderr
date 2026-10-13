@@ -1,0 +1,5 @@
+error: name this route's variant in the dispatch enum: `… as Variant => …`
+  --> tests/ui/route_needs_a_variant.rs:30:13
+   |
+30 |     command &'static Other => Handler;
+   |             ^^^^^^^^^^^^^^

@@ -1,24 +1,14 @@
 //! Notifications: fan-out, both publisher strategies, handler errors,
 //! and an event nobody handles.
 
+mod common;
+
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
 
 use eventyr_mediator::prelude::*;
 use futures::executor::block_on;
 
-#[derive(Clone, Default)]
-struct Trace(Arc<Mutex<Vec<String>>>);
-
-impl Trace {
-    fn push(&self, step: impl Into<String>) {
-        self.0.lock().unwrap().push(step.into());
-    }
-
-    fn take(&self) -> Vec<String> {
-        std::mem::take(&mut *self.0.lock().unwrap())
-    }
-}
+use common::Trace;
 
 /// A notification whose handlers can fail.
 struct Shipped(u32);

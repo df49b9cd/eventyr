@@ -1,23 +1,12 @@
 //! Error handlers and error actions: recovery, observation, selection by
 //! the request and the error type, and both action strategies.
 
-use std::sync::{Arc, Mutex};
+mod common;
 
 use eventyr_mediator::prelude::*;
 use futures::executor::block_on;
 
-#[derive(Clone, Default)]
-struct Trace(Arc<Mutex<Vec<String>>>);
-
-impl Trace {
-    fn push(&self, step: impl Into<String>) {
-        self.0.lock().unwrap().push(step.into());
-    }
-
-    fn take(&self) -> Vec<String> {
-        std::mem::take(&mut *self.0.lock().unwrap())
-    }
-}
+use common::Trace;
 
 /// A fallible query.
 #[derive(Clone)]

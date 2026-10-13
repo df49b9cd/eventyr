@@ -1,0 +1,5 @@
+error: a composition starts with the mediator's struct: `pub struct App { … }` or `pub struct App;`
+ --> tests/ui/composition_starts_with_struct.rs:9:5
+  |
+9 |     command Ping => Handler;
+  |     ^^^^^^^

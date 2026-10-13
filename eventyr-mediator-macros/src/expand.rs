@@ -63,11 +63,21 @@ fn display(ty: &Type) -> String {
 }
 
 /// Which route kinds share one namespace (and one dispatch enum).
-fn class(kind: RouteKind) -> u8 {
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Class {
+    /// `command` and `query`.
+    Request,
+    /// `stream`.
+    Stream,
+    /// `event`.
+    Notification,
+}
+
+fn class(kind: RouteKind) -> Class {
     match kind {
-        RouteKind::Command | RouteKind::Query => 0,
-        RouteKind::Stream => 1,
-        RouteKind::Event => 2,
+        RouteKind::Command | RouteKind::Query => Class::Request,
+        RouteKind::Stream => Class::Stream,
+        RouteKind::Event => Class::Notification,
     }
 }
 
@@ -98,7 +108,7 @@ fn validate(composition: &Composition) -> syn::Result<()> {
         None => errors = Some(error),
     };
 
-    let mut seen: BTreeMap<(u8, String), &Route> = BTreeMap::new();
+    let mut seen: BTreeMap<(Class, String), &Route> = BTreeMap::new();
     for route in &composition.routes {
         let slot = (class(route.kind), key(&route.message));
         if let Some(first) = seen.get(&slot) {
@@ -126,9 +136,13 @@ fn validate(composition: &Composition) -> syn::Result<()> {
     }
 
     let enums = [
-        (&composition.requests, 0, "request (`command` or `query`)"),
-        (&composition.streams, 1, "`stream`"),
-        (&composition.notifications, 2, "`event`"),
+        (
+            &composition.requests,
+            Class::Request,
+            "request (`command` or `query`)",
+        ),
+        (&composition.streams, Class::Stream, "`stream`"),
+        (&composition.notifications, Class::Notification, "`event`"),
     ];
     for (enumeration, wanted, what) in enums {
         let Some(enumeration) = enumeration else {
@@ -395,95 +409,127 @@ impl<'c> Expansion<'c> {
     /// One check per listed stage: it applies to at least one route of
     /// its kind, or the build fails at the stage.
     ///
-    /// A generic route is a family, and a probe needs one concrete
-    /// message, so a composition with a generic route of a kind does
-    /// not check that kind's stages: whether a stage applies to the
-    /// family is decided per message, at each `send`.
+    /// A generic route is a family whose stages are selected once, in
+    /// the family's generic context: per member is not decidable (that
+    /// is monomorphization, after macro expansion). So each generic
+    /// route is checked in its own generic context — a stage must apply
+    /// to the whole family, or to one of the concrete routes of its
+    /// kind, to pass there.
     fn checks(&self) -> TokenStream {
         let krate = self.krate;
         let name = &self.c.name;
         let (impl_generics, ty_generics, where_clause) = self.c.generics.split_for_impl();
 
-        let concrete = |wanted: &dyn Fn(RouteKind) -> bool| -> Option<Vec<&Type>> {
-            let routes: Vec<&Route> = self
-                .c
-                .routes
-                .iter()
-                .filter(|route| wanted(route.kind))
-                .collect();
-            if routes.iter().any(|route| !route.generics.params.is_empty()) {
-                return None;
+        /// The routes of one kind: the concrete ones' messages, and the
+        /// generic ones (families) whole.
+        struct KindRoutes<'r> {
+            concrete: Vec<&'r Type>,
+            generic: Vec<&'r Route>,
+        }
+        let routes_of = |wanted: &dyn Fn(RouteKind) -> bool| -> KindRoutes<'_> {
+            let mut concrete = Vec::new();
+            let mut generic = Vec::new();
+            for route in self.c.routes.iter().filter(|route| wanted(route.kind)) {
+                if route.generics.params.is_empty() {
+                    concrete.push(&route.message);
+                } else {
+                    generic.push(route);
+                }
             }
-            Some(routes.iter().map(|route| &route.message).collect())
+            KindRoutes { concrete, generic }
         };
-        let requests = concrete(&|kind| class(kind) == 0);
-        let streams = concrete(&|kind| kind == RouteKind::Stream);
+        let requests = routes_of(&|kind| class(kind) == Class::Request);
+        let streams = routes_of(&|kind| class(kind) == Class::Stream);
 
-        /// A stage list, its probe kind and check trait, and the routes
-        /// (all concrete) it is checked against.
-        type StageList<'s> = (
-            &'s [Instance],
-            &'static str,
-            &'static str,
-            &'s Option<Vec<&'s Type>>,
-        );
+        /// A stage list, its probe kind, and the routes it is checked
+        /// against.
+        type StageList<'s> = (&'s [Instance], Ident, &'s KindRoutes<'s>);
         let lists: [StageList<'_>; 6] = [
+            (&self.c.behaviors, format_ident!("BehaviorKind"), &requests),
             (
-                &self.c.behaviors,
-                "BehaviorKind",
-                "CheckBehavior",
+                &self.c.stream_behaviors,
+                format_ident!("StreamBehaviorKind"),
+                &streams,
+            ),
+            (&self.c.pre_processors, format_ident!("PreKind"), &requests),
+            (
+                &self.c.post_processors,
+                format_ident!("PostKind"),
                 &requests,
             ),
             (
-                &self.c.stream_behaviors,
-                "StreamBehaviorKind",
-                "CheckStreamBehavior",
-                &streams,
-            ),
-            (&self.c.pre_processors, "PreKind", "CheckPre", &requests),
-            (&self.c.post_processors, "PostKind", "CheckPost", &requests),
-            (
                 &self.c.error_handlers,
-                "RecoverKind",
-                "CheckRecover",
+                format_ident!("RecoverKind"),
                 &requests,
             ),
             (
                 &self.c.error_actions,
-                "ObserveKind",
-                "CheckObserve",
+                format_ident!("ObserveKind"),
                 &requests,
             ),
         ];
 
+        // One stage's probes against `messages`, as a nested tuple.
+        let probe = |kind: &Ident, stage: &Instance, messages: &[&Type]| -> TokenStream {
+            let stage_expr = self.instance(stage);
+            let mut tuple = quote!(());
+            for message in messages.iter().rev() {
+                tuple = quote! {
+                    (
+                        (&#krate::__private::StageCheck::<#krate::__private::#kind, #message, Self, _>::new(self, #stage_expr)).check(),
+                        #tuple,
+                    )
+                };
+            }
+            quote_spanned! {stage.span()=>
+                #krate::__private::applies_somewhere({
+                    #[allow(unused_imports)]
+                    use #krate::__private::{Check as _, CheckSkip as _};
+                    #tuple
+                });
+            }
+        };
+
         let mut checks = Vec::new();
-        for (stages, kind, apply, routes) in lists {
-            let Some(routes) = routes else {
-                continue;
-            };
-            let kind = format_ident!("{kind}");
-            let apply = format_ident!("{apply}");
-            for stage in stages {
-                let stage_expr = self.instance(stage);
-                let mut tuple = quote!(());
-                for message in routes.iter().rev() {
-                    tuple = quote! {
-                        (
-                            (&#krate::__private::Check::<#krate::__private::#kind, #message, Self, _>::new(self, #stage_expr)).check(),
-                            #tuple,
-                        )
-                    };
+        let mut family_checks = Vec::new();
+        for (stages, kind, routes) in lists {
+            if routes.generic.is_empty() {
+                // All routes of the kind are concrete: one check method
+                // in the mediator's own context.
+                for stage in stages {
+                    checks.push(probe(&kind, stage, &routes.concrete));
                 }
-                checks.push(quote_spanned! {stage.span()=>
-                    #krate::__private::applies_somewhere({
-                        #[allow(unused_imports)]
-                        use #krate::__private::{#apply as _, CheckSkip as _};
-                        #tuple
-                    });
+                continue;
+            }
+            // A kind with generic routes checks in each family's own
+            // context, one generic method per family; the concrete
+            // routes probe anywhere.
+            for (index, family) in routes.generic.iter().enumerate() {
+                let mut messages = vec![&family.message];
+                messages.extend(routes.concrete.iter().copied());
+                let probes: Vec<TokenStream> = stages
+                    .iter()
+                    .map(|stage| probe(&kind, stage, &messages))
+                    .collect();
+                if probes.is_empty() {
+                    continue;
+                }
+                let method = format_ident!("__mediator_stages_apply_route_{index}");
+                let (family_generics, _, family_where_clause) = family.generics.split_for_impl();
+                family_checks.push(quote! {
+                    /// Never called: type-checks that every listed stage
+                    /// of one kind applies to this family (whose bounds
+                    /// must hold for the whole family) or to one of the
+                    /// kind's concrete routes.
+                    #[doc(hidden)]
+                    #[allow(dead_code, clippy::needless_borrow, clippy::let_unit_value)]
+                    fn #method #family_generics (&self) #family_where_clause {
+                        #(#probes)*
+                    }
                 });
             }
         }
-        if checks.is_empty() {
+        if checks.is_empty() && family_checks.is_empty() {
             return TokenStream::new();
         }
 
@@ -496,6 +542,8 @@ impl<'c> Expansion<'c> {
                 fn __mediator_stages_apply(&self) {
                     #(#checks)*
                 }
+
+                #(#family_checks)*
             }
         }
     }
@@ -582,8 +630,7 @@ impl<'c> Expansion<'c> {
                 ) -> impl ::core::future::Future<Output = <#message as #krate::Request>::Response>
                        + ::core::marker::Send {
                     use #krate::__private::{
-                        ApplyBehavior as _, ApplyObserve as _, ApplyPost as _, ApplyPre as _,
-                        ApplyRecover as _, ApplyTerminus as _, Skip as _, SkipHandler as _,
+                        Apply as _, ApplyTerminus as _, Skip as _, SkipHandler as _,
                     };
                     #(#chain)*
                     <_ as #krate::Next<#message>>::run(__next, request)
@@ -636,7 +683,7 @@ impl<'c> Expansion<'c> {
                 ) -> impl #krate::__private::Stream<Item = <#message as #krate::StreamRequest>::Item>
                        + ::core::marker::Send {
                     use #krate::__private::{
-                        ApplyStreamBehavior as _, ApplyStreamTerminus as _, Skip as _, SkipHandler as _,
+                        Apply as _, ApplyStreamTerminus as _, Skip as _, SkipHandler as _,
                     };
                     #(#chain)*
                     <_ as #krate::NextStream<#message>>::run(__next, request)
@@ -751,7 +798,7 @@ impl<'c> Expansion<'c> {
     }
 
     /// The routes of one class with their variants (validated).
-    fn variants(&self, wanted: u8) -> syn::Result<(Vec<&Type>, Vec<Ident>, Vec<String>)> {
+    fn variants(&self, wanted: Class) -> syn::Result<(Vec<&Type>, Vec<Ident>, Vec<String>)> {
         let mut messages = Vec::new();
         let mut variants = Vec::new();
         let mut docs = Vec::new();
@@ -771,7 +818,7 @@ impl<'c> Expansion<'c> {
     /// `requests AnyRequest -> AnyResponse;`
     fn requests(&self, enumeration: &Enumeration) -> syn::Result<TokenStream> {
         let krate = self.krate;
-        let (messages, variants, docs) = self.variants(0)?;
+        let (messages, variants, docs) = self.variants(Class::Request)?;
         let Enumeration {
             attrs,
             name: enum_name,
@@ -847,7 +894,7 @@ impl<'c> Expansion<'c> {
     /// `streams AnyStream -> AnyItem;`
     fn streams(&self, enumeration: &Enumeration) -> syn::Result<TokenStream> {
         let krate = self.krate;
-        let (messages, variants, docs) = self.variants(1)?;
+        let (messages, variants, docs) = self.variants(Class::Stream)?;
         let Enumeration {
             attrs,
             name: enum_name,
@@ -939,7 +986,7 @@ impl<'c> Expansion<'c> {
     /// `notifications AnyNotification -> AnyNotificationError;`
     fn notifications(&self, enumeration: &Enumeration) -> syn::Result<TokenStream> {
         let krate = self.krate;
-        let (messages, variants, docs) = self.variants(2)?;
+        let (messages, variants, docs) = self.variants(Class::Notification)?;
         let Enumeration {
             attrs,
             name: enum_name,

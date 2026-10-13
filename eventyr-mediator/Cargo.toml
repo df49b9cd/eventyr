@@ -21,7 +21,10 @@ store = ["dep:eventyr-core", "dep:eventyr-store"]
 time = ["store", "eventyr-core/time", "eventyr-store/time", "dep:time"]
 
 [dependencies]
-eventyr-mediator-macros.workspace = true
+# Generated code names `eventyr-mediator::__private` items whose shape
+# changes with the macro, so the macros crate is pinned exactly — the
+# serde/serde_derive rule. (The workspace carries the same pin.)
+eventyr-mediator-macros = { workspace = true }
 futures.workspace = true
 eventyr-core = { workspace = true, optional = true }
 eventyr-store = { workspace = true, optional = true }

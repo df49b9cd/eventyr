@@ -1,0 +1,25 @@
+error[E0277]: the request `Ping` must be `Clone`: a post-processor or an error stage applies to its route and keeps a copy
+  --> tests/ui/error_handler_needs_clone.rs:26:13
+   |
+26 |     command Ping => Handler;
+   |             ^^^^ kept past the handler
+   |
+help: the trait `eventyr_mediator::__private::Retained` is not implemented for `Ping`
+  --> tests/ui/error_handler_needs_clone.rs:3:1
+   |
+ 3 | struct Ping;
+   | ^^^^^^^^^^^
+   = note: derive `Clone` for the request, or narrow that processor's impl bounds so they exclude it
+help: the trait `Next<Req>` is conditionally implemented for `eventyr_mediator::__private::Recover<'_, M, H, N>`
+  --> src/private.rs
+   |
+   | / impl<M, Req, H, N> Next<Req> for Recover<'_, M, H, N>
+   | | where
+   | |     M: Sync,
+   | |     Req: Request + Retained + Sync,
+   | |                    -------- unsatisfied requirement introduced here: `Ping: eventyr_mediator::__private::Retained`
+   | |     Req::Response: Fallible,
+   | |     H: RequestErrorHandler<Req, M>,
+   | |     N: NextKept<Req>,
+   | |_____________________^
+   = note: required for `eventyr_mediator::__private::Recover<'_, App, &Fallback, eventyr_mediator::__private::Terminus<'_, App, &Handler>>` to implement `Next<Ping>`

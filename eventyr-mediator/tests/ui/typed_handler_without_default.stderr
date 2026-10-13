@@ -8,10 +8,10 @@ error[E0277]: `Handler` is named by type, so the mediator constructs it once wit
    = note: derive or implement `Default` for it, or put an instance in a field of the mediator and name the field: `self.field`
    = note: required for `Handler` to implement `eventyr_mediator::__private::Singleton`
 note: required by a bound in `eventyr_mediator::__private::singleton`
-  --> src/lib.rs
+  --> src/private.rs
    |
-   |     pub fn singleton<T: Singleton>() -> T {
-   |                         ^^^^^^^^^ required by this bound in `singleton`
+   | pub fn singleton<T: Singleton>() -> T {
+   |                     ^^^^^^^^^ required by this bound in `singleton`
 help: consider annotating `Handler` with `#[derive(Default)]`
    |
  8 + #[derive(Default)]

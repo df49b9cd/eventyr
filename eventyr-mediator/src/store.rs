@@ -83,9 +83,18 @@ impl<A: Aggregate> Execute<A> {
     }
 
     /// Builder-style: the metadata to stamp on the appended events.
+    ///
+    /// An [`idempotency_key`](Metadata::idempotency_key) the command
+    /// already carries is kept — it is what a redelivered saga command
+    /// matches the earlier commit with, and an interaction's metadata
+    /// must not clobber it. The rest of `metadata` replaces the
+    /// command's.
     #[must_use]
     pub fn with_metadata(mut self, metadata: Metadata) -> Self {
-        self.metadata = metadata;
+        self.metadata = Metadata {
+            idempotency_key: metadata.idempotency_key.or(self.metadata.idempotency_key),
+            ..metadata
+        };
         self
     }
 
@@ -437,11 +446,15 @@ where
 // The mediator as a saga dispatcher
 // ---------------------------------------------------------------------------
 
-/// Why a saga's command did not commit, as the saga runner sees it.
+/// Why a saga's command did not commit, as the dispatcher answers it.
+///
+/// A store failure keeps its classification; a domain rejection becomes
+/// [`StoreError::other`] naming the aggregate and the refusal. Either
+/// way the projection's `apply` fails, and the runner wraps that as its
+/// own `StoreError::other` — a dispatch failure is never `Unavailable`
+/// to the runner, so it is parked or halted by policy, not retried.
 fn dispatch_failure<A: Aggregate>(error: ExecutionError<A>) -> StoreError {
     match error {
-        // A store failure keeps its classification: the runner retries
-        // `Unavailable` and parks or halts on the rest by policy.
         ExecutionError::Store(error) => error,
         ExecutionError::Domain(rejection) => StoreError::other(alloc::format!(
             "{} rejected the saga command: {rejection}",
@@ -451,19 +464,13 @@ fn dispatch_failure<A: Aggregate>(error: ExecutionError<A>) -> StoreError {
 }
 
 /// The aggregate instance a saga command targets: its stream id is
-/// `"{A::NAME}-{id}"` (see `StreamId::for_aggregate`), and `parse` reads
-/// the id back from the part after the prefix.
+/// `"{A::NAME}-{id}"` (see `StreamId::for_aggregate`), and
+/// [`StreamId::aggregate_id`] reads the id back.
 fn target_id<A: Aggregate>(
     target: &StreamId,
     parse: &impl Fn(&str) -> Option<A::Id>,
 ) -> Result<A::Id, StoreError> {
-    let id = target
-        .as_str()
-        .strip_prefix(A::NAME)
-        .and_then(|rest| rest.strip_prefix('-'))
-        .filter(|raw| !raw.is_empty())
-        .and_then(parse);
-    match id {
+    match target.aggregate_id::<A>(parse) {
         Some(id) => Ok(id),
         None => Err(StoreError::other(alloc::format!(
             "the saga targeted {target}, which is not a {} stream",

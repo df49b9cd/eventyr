@@ -7,7 +7,7 @@ error[E0277]: this pipeline stage applies to none of the mediator's routes
    = help: the trait `eventyr_mediator::__private::AppliesSomewhere` is not implemented for `(eventyr_mediator::__private::Skips, ())`
    = note: a stage applies to the routes whose messages its impl's bounds accept: check that it implements its stage trait (`PipelineBehavior`, `RequestPreProcessor`, `RequestErrorHandler`, …) for a request this mediator routes — or take it out of the list
 note: required by a bound in `eventyr_mediator::__private::applies_somewhere`
-  --> src/lib.rs
+  --> src/private.rs
    |
-   |     pub fn applies_somewhere<T: AppliesSomewhere>(_: T) {}
-   |                                 ^^^^^^^^^^^^^^^^ required by this bound in `applies_somewhere`
+   | pub fn applies_somewhere<T: AppliesSomewhere>(_: T) {}
+   |                             ^^^^^^^^^^^^^^^^ required by this bound in `applies_somewhere`

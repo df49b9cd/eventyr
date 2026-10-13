@@ -1,0 +1,5 @@
+error: expected the mediator's fields `{ … }`, or `;` for a mediator without fields
+  --> tests/ui/struct_needs_fields_or_semicolon.rs:10:5
+   |
+10 |     command Ping => Handler;
+   |     ^^^^^^^

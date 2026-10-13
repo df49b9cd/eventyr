@@ -1,0 +1,5 @@
+error: expected one of: `sequential`, `concurrent`, `with`
+  --> tests/ui/unknown_publish_strategy.rs:12:13
+   |
+12 |     publish whenever;
+   |             ^^^^^^^^
