@@ -32,7 +32,11 @@ postgres = [
 ]
 
 [dependencies]
-eventyr = { path = "../eventyr", features = ["mediator", "projection", "subscription", "time"] }
+# The sample's deps are all workspace crates, so they carry the
+# workspace's own version — a versionless `eventyr = { path = ... }`
+# makes `cargo package --workspace` fail the dry-run ("all dependencies
+# must have a version requirement").
+eventyr = { path = "../eventyr", version = "0.1.0", features = ["mediator", "projection", "subscription", "time"] }
 # The sample's events, views, and reads serialize (`BalanceRead`,
 # `Cash`, the store's `Sequence`), whichever backend serves them.
 eventyr-core = { workspace = true, features = ["serde"] }
