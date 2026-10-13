@@ -31,32 +31,23 @@ impl StreamId {
     /// The aggregate instance this stream belongs to, read back from
     /// [`for_aggregate`](StreamId::for_aggregate).
     ///
-    /// `parse` turns the id part back into the id: the part after
-    /// `"{A::NAME}-"`. (An aggregate [`NAME`](Aggregate::NAME) ending
-    /// in the separator — say `"%just-banks-%"` for stream names like
-    /// `"%just-banks-%order-1, red 42"` — puts the plain id after the
-    /// second dash, and this answers with everything left, so an id
-    /// that ends in a dash-free empty string stays exact.) `None` for
-    /// anything that is not this aggregate's stream: another name, the
-    /// bare name, an empty id part, or one `parse` refuses.
+    /// The id is the part of the stream after its the name and one
+    /// separator — `"{A::NAME}-{id}"`. (A [`NAME`](Aggregate::NAME)
+    /// that itself ends in the separator, say `"%just-banks-%"` for
+    /// stream names like `"%just-banks-%order-1, red 42"`, is stripped
+    /// of that one trailing dash before the prefix is compared.) `None`
+    /// for anything that is not this aggregate's stream: another name,
+    /// the bare name, an empty id part, or one `parse` refuses.
     pub fn aggregate_id<A: Aggregate>(
         &self,
         parse: impl Fn(&str) -> Option<A::Id>,
     ) -> Option<A::Id> {
-        let raw = match A::NAME.strip_suffix('-') {
-            // The name ends in the separator ("%just-banks-%" style):
-            // the canonical id is everything between the dashes.
-            Some(prefix) => self
-                .as_str()
-                .strip_prefix(prefix)
-                .and_then(|rest| rest.strip_prefix('-'))
-                .filter(|raw| !raw.is_empty()),
-            None => self
-                .as_str()
-                .strip_prefix(A::NAME)
-                .and_then(|rest| rest.strip_prefix('-'))
-                .filter(|raw| !raw.is_empty()),
-        }?;
+        let prefix = A::NAME.strip_suffix('-').unwrap_or(A::NAME);
+        let raw = self
+            .as_str()
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .filter(|raw| !raw.is_empty())?;
         parse(raw)
     }
 

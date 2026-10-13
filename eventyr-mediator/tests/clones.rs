@@ -13,15 +13,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use eventyr_mediator::prelude::*;
 use futures::executor::block_on;
 
-/// The clone count, shared by the request and the test.
-#[derive(Default)]
+/// The clone count, shared by the request and the test. (The count
+/// lives on the transfer's own `Clone`; this is only the shared
+/// counter.)
+#[derive(Clone, Default)]
 struct Clones(Arc<AtomicU32>);
-
-impl Clone for Clones {
-    fn clone(&self) -> Self {
-        Clones(self.0.clone())
-    }
-}
 
 impl Clones {
     fn count(&self) -> u32 {

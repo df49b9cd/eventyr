@@ -1,0 +1,66 @@
+[package]
+name = "eventyr-sample"
+description = "A deployable CQRS-ES miniature bank: commands through the mediator, events in the store, views from a projection, failover via leases. HTTP and compose included."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["event-sourcing", "cqrs", "mediator", "sample", "bank"]
+repository = "https://github.com/df49b9cd/eventyr"
+homepage = "https://github.com/df49b9cd/eventyr"
+categories = ["database", "web-programming"]
+readme = "README.md"
+# Ships as a git checkout, not to crates.io — keeps `cargo package --workspace` green.
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+# The deployments the README wires. The in-memory backend always
+# builds — it is what `cargo run` and the tests compose out of the
+# box; `postgres` adds the compose-managed cluster's backend. Every
+# feature compiles alone (cargo-hack each-feature).
+default = []
+postgres = [
+    "eventyr/postgres",
+    "eventyr/postgres_snapshots",
+    "eventyr/postgres_checkpoints",
+    "eventyr/postgres_leases",
+    "eventyr/postgres_views",
+    "dep:sqlx",
+]
+
+[dependencies]
+# The sample's deps are all workspace crates, so they carry the
+# workspace's own version — a versionless `eventyr = { path = ... }`
+# makes `cargo package --workspace` fail the dry-run ("all dependencies
+# must have a version requirement").
+eventyr = { path = "../eventyr", version = "0.1.0", features = ["mediator", "projection", "subscription", "time"] }
+# The sample's events, views, and reads serialize (`BalanceRead`,
+# `Cash`, the store's `Sequence`), whichever backend serves them.
+eventyr-core = { workspace = true, features = ["serde"] }
+eventyr-mediator.workspace = true
+eventyr-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true }
+anyhow.workspace = true
+axum.workspace = true
+uuid.workspace = true
+
+# The compose-managed backend's pool: the Postgres composition opens
+# its own, so the crate names sqlx only with the backend's feature.
+sqlx = { workspace = true, optional = true, features = ["postgres", "runtime-tokio"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The compose-managed deployment's test drives a real Postgres; it
+# builds only with the backend's feature (`--features postgres`).
+[[test]]
+name = "compose"
+path = "tests/compose.rs"
+required-features = ["postgres"]

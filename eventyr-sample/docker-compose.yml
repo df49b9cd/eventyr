@@ -1,0 +1,45 @@
+# The compose-managed deployment of the miniature bank: one Postgres
+# primary behind as many API replicas as you scale to. The projection's
+# lease decides which replica projects; the others stand by and take
+# over on a failover. The migration runs once and exits.
+#
+# Copy `.env.example` to `.env` and set the password first:
+#
+#   cp .env.example .env
+#   docker compose up --build --scale api=3
+#
+# The db publishes 127.0.0.1:${EVENTYR_SAMPLE_PG_PORT} so the
+# compose-managed test on the host can point DATABASE_URL at the same
+# primary the replicas use; `./scripts/dev-services.sh up` is the
+# lighter dev loop for just the database, and it reads the same
+# variables.
+
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-eventyr}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 1s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "127.0.0.1:${EVENTYR_SAMPLE_PG_PORT:-55432}:5432"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      EVENTYR_SAMPLE_ADDR: 0.0.0.0:3000
+      # The store's DSN. The compose network resolves `db` to the
+      # primary; every replica points at it.
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-eventyr}
+    ports:
+      - "3000"
