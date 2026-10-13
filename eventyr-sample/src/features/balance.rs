@@ -1,20 +1,19 @@
 //! The read model: a `balances` view the projector maintains, served
 //! without touching the event store's log.
 //!
-//! The handler answers from whichever view store the wiring supplies: the
+//! The query routes to whichever view store the wiring named: the
 //! in-memory backend's [`InMemoryBalances`], or the Postgres backend's
 //! `PgViewStore` — the row the projection last wrote, which on the
 //! database-backed deployment every replica shares. The stored
 //! [`ViewRow`] gives the read-your-writes position the edge exposes as
 //! `as_of`.
 
-use eventyr::prelude::{EventEnvelope, Sequence, StoreError};
+use eventyr::prelude::{EventEnvelope, Sequence};
 use eventyr::projection::prelude::{View, ViewRow, ViewStore};
 use eventyr_mediator::prelude::*;
-use eventyr_mediator::store::parse_id;
 use serde::Serialize;
 
-use crate::domain::{Account, AccountEvent, AccountId, Cash, Deposited, Withdrawn};
+use crate::domain::{AccountEvent, Cash, Deposited, Withdrawn};
 use crate::features::{ApiError, Outcome};
 
 /// One account's row: the balance the read side knows.
@@ -43,10 +42,7 @@ pub const BALANCES: &str = "balances";
 
 /// The row's key for an event — its account, or `None` to pass it by.
 pub fn balance_key(event: &EventEnvelope<AccountEvent>) -> Option<String> {
-    event
-        .stream_id
-        .aggregate_id::<Account>(parse_id::<AccountId>)
-        .map(|AccountId(account)| account.to_string())
+    event.event.account_id().map(|account| account.to_string())
 }
 
 /// The balances' view store the in-memory wiring keeps in process: an
@@ -86,10 +82,10 @@ impl Request for GetBalance {
     type Response = Outcome<Option<BalanceRead>>;
 }
 
-/// Answers from the view store the wiring named. Every backend hands the
-/// same handler shape its own store: the in-memory composition's
-/// [`InMemoryBalances`], the Postgres composition's `PgViewStore` — the
-/// paths differ only in where the projection's rows live.
+/// The balance query handler — a facade, not a second view store: it
+/// names the view the composition's `views` field serves, and the
+/// error maps one `StoreError` arm per status. The mediator's pointer
+/// delegation covers the `Arc<V>` the field holds.
 pub struct BalanceHandler<V> {
     views: std::sync::Arc<V>,
 }
@@ -119,9 +115,6 @@ where
             .load(BALANCES, &request.account.to_string())
             .await
             .map(BalanceRead::of)
-            .map_err(|failure| match failure {
-                StoreError::Conflict { .. } => ApiError::Conflict,
-                _ => ApiError::Unavailable,
-            })
+            .map_err(|failure| ApiError::from(&failure))
     }
 }

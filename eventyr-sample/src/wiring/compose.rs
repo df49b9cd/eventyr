@@ -6,7 +6,9 @@
 //! The functions are async where the store is: the in-memory backend
 //! composes in place; the Postgres backend connects a pool, runs the
 //! store's migration, and builds its snapshots, checkpoints, leases,
-//! views, and commit signal over it.
+//! views, and commit signal over it. The read side's balances live in
+//! the same store the events do, so every replica serves the projection's
+//! own row without a second database round-trip.
 
 use std::sync::Arc;
 
@@ -26,28 +28,22 @@ use crate::wiring::{App, MemorySample, MetricsStamp, Sample};
 
 #[cfg(feature = "postgres")]
 use eventyr::postgres::{
-    PgCheckpointStore, PgCommitSignal, PgLeaseStore, PgSnapshotStore, PgStore,
+    PgCheckpointStore, PgCommitSignal, PgLeaseStore, PgSnapshotStore, PgStore, PgViewStore,
 };
+
+/// How often the snapshots fire: every `SNAPSHOT_EVERY` events the
+/// repository writes one snapshot, so long histories fold from a recent
+/// base instead of from genesis.
+const SNAPSHOT_EVERY: std::num::NonZeroU64 =
+    std::num::NonZeroU64::new(5).expect("every five events");
 
 /// The composition root's in-memory branch: the whole application over
 /// the process's own store, so `compose` runs out of the box.
 pub fn memory() -> MemorySample {
     let store: Arc<InMemoryStore<AccountEvent>> = Arc::new(InMemoryStore::new());
     let snapshots = Arc::new(InMemorySnapshotStore::new());
-    let accounts = Arc::new(
-        AggregateRepository::<Account, _, _>::new(store.clone(), RetryPolicy::default())
-            .with_snapshots(
-                snapshots,
-                SnapshotPolicy::new(std::num::NonZeroU64::new(5).expect("non-zero")),
-            ),
-    );
     let views = Arc::new(InMemoryBalances::new());
-    let app = App::new(
-        accounts,
-        BalanceHandler::new(views.clone()),
-        Arc::new(TransferHandler::new(store.clone())),
-        StampMetadata(MetricsStamp),
-    );
+    let app = build_app(store.clone(), snapshots, BalanceHandler::new(views.clone()));
     Sample {
         app,
         inputs: crate::wiring::runners::Inputs {
@@ -62,16 +58,15 @@ pub fn memory() -> MemorySample {
 }
 
 /// The composed Postgres sample. The read path's view store is the
-/// projection's own in-process table: on the clustered deployment the
-/// replica that holds the lease maintains it, and the read serves it
-/// without a network round-trip.
+/// store's own `views` table, so every replica serves the row the
+/// projection last wrote without a second round-trip.
 #[cfg(feature = "postgres")]
 pub type PgSample = Sample<
     PgStore<AccountEvent>,
     PgSnapshotStore<AccountState>,
     PgCheckpointStore,
     PgLeaseStore,
-    InMemoryBalances,
+    PgViewStore<crate::features::Balance>,
     PgCommitSignal,
 >;
 
@@ -96,20 +91,8 @@ pub async fn postgres(url: &str) -> anyhow::Result<PgSample> {
     let checkpoints = Arc::new(PgCheckpointStore::new(&store));
     let leases = Arc::new(PgLeaseStore::new(&store));
     let store = Arc::new(store);
-    let accounts = Arc::new(
-        AggregateRepository::<Account, _, _>::new(store.clone(), RetryPolicy::default())
-            .with_snapshots(
-                snapshots,
-                SnapshotPolicy::new(std::num::NonZeroU64::new(5).expect("non-zero")),
-            ),
-    );
-    let views = Arc::new(InMemoryBalances::new());
-    let app = App::new(
-        accounts,
-        BalanceHandler::new(views.clone()),
-        Arc::new(TransferHandler::new(store.clone())),
-        StampMetadata(MetricsStamp),
-    );
+    let views = Arc::new(PgViewStore::new(&*store));
+    let app = build_app(store.clone(), snapshots, BalanceHandler::new(views.clone()));
     Ok(Sample {
         app,
         inputs: crate::wiring::runners::Inputs {
@@ -121,4 +104,39 @@ pub async fn postgres(url: &str) -> anyhow::Result<PgSample> {
         },
         shutdown: watch::channel(false).0,
     })
+}
+
+/// Build one `App` over a store, a snapshotter, and the balances' view
+/// store — the two backends' shared last step.
+fn build_app<Store, Snapshots, Views>(
+    store: Arc<Store>,
+    snapshots: Arc<Snapshots>,
+    balances: BalanceHandler<Views>,
+) -> App<Store, Snapshots, Views>
+where
+    Store: eventyr::store::prelude::EventStore<Event = AccountEvent>
+        + eventyr::store::prelude::StreamsAll<Event = AccountEvent>
+        + Send
+        + Sync
+        + 'static,
+    Snapshots: eventyr::store::prelude::SnapshotStore<State = crate::domain::AccountState>
+        + Send
+        + Sync
+        + 'static,
+    Views:
+        eventyr::projection::prelude::ViewStore<crate::features::Balance> + Send + Sync + 'static,
+    Arc<Store>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
+    Arc<Snapshots>:
+        eventyr::store::prelude::SnapshotStore<State = crate::domain::AccountState> + Send + Sync,
+{
+    let accounts = Arc::new(
+        AggregateRepository::<Account, _, _>::new(store.clone(), RetryPolicy::default())
+            .with_snapshots(snapshots, SnapshotPolicy::new(SNAPSHOT_EVERY)),
+    );
+    App::new(
+        accounts,
+        balances,
+        Arc::new(TransferHandler::new(store)),
+        StampMetadata(MetricsStamp),
+    )
 }

@@ -8,7 +8,16 @@
 # The compose-managed deployment the sample's README describes runs its
 # own `db` service; this script is the dev loop's shortcut for the tests
 # that want a real Postgres without the images — one throwaway container
-# with the same credentials and database, published on 127.0.0.1:55432.
+# with the same credentials and database, published on
+# 127.0.0.1:55432.
+#
+# The credentials and port are the sample's documented defaults — the
+# same ones `eventyr-sample/.env.example` ships — and they are not
+# production secrets. Override them through the environment:
+#
+#   EVENTYR_SAMPLE_PG_PORT=55433 \
+#   POSTGRES_USER=... POSTGRES_PASSWORD=... POSTGRES_DB=... \
+#       ./scripts/dev-services.sh up
 #
 # Docker and podman both work; whichever is on PATH wins. The default
 # image is postgres:17, matching the compose file.
@@ -17,9 +26,9 @@ set -euo pipefail
 NAME="eventyr-sample-pg"
 PORT="${EVENTYR_SAMPLE_PG_PORT:-55432}"
 IMAGE="${EVENTYR_SAMPLE_PG_IMAGE:-docker.io/library/postgres:17}"
-USER="postgres"
-PASSWORD="postgres"
-DB="eventyr"
+USER="${POSTGRES_USER:-postgres}"
+PASSWORD="${POSTGRES_PASSWORD:-postgres}"
+DB="${POSTGRES_DB:-eventyr}"
 
 runtime() {
     if command -v podman >/dev/null 2>&1; then

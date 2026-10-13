@@ -3,11 +3,11 @@
 use eventyr::prelude::Version;
 use eventyr_mediator::prelude::*;
 use eventyr_mediator::store::Execute;
-use eventyr_store::prelude::{ExecutionError, ExecutionOutcome};
+use eventyr_store::prelude::ExecutionOutcome;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{Account, AccountCommand, AccountId};
-use crate::features::{ApiError, Outcome, Stamped, store_failure};
+use crate::features::{ApiError, Outcome, Stamped, execution_failure};
 
 /// Open an account for `owner`.
 #[derive(Clone, Debug, Deserialize)]
@@ -55,23 +55,18 @@ impl<M: Sender<Execute<Account>>> RequestHandler<OpenAccount, M> for OpenAccount
         )
         .with_metadata(request.stamped.metadata);
         match mediator.send(command).await {
-            Ok(ExecutionOutcome::Committed { committed, .. }) => Ok(OpenedAccount {
+            Ok(outcome @ ExecutionOutcome::Committed { .. }) => Ok(OpenedAccount {
                 account,
-                version: committed
-                    .last()
-                    .map_or(Version::EMPTY, |event| event.version),
+                version: crate::features::committed_version(&outcome),
                 opened: true,
             }),
-            Ok(ExecutionOutcome::AlreadyCommitted { committed }) => Ok(OpenedAccount {
+            Ok(outcome @ ExecutionOutcome::AlreadyCommitted { .. }) => Ok(OpenedAccount {
                 account,
-                version: committed
-                    .last()
-                    .map_or(Version::EMPTY, |event| event.version),
+                version: crate::features::committed_version(&outcome),
                 opened: false,
             }),
             Ok(ExecutionOutcome::Noop) => Err(ApiError::Domain("open produced no events".into())),
-            Err(ExecutionError::Domain(rejection)) => Err(ApiError::Domain(rejection.to_string())),
-            Err(ExecutionError::Store(failure)) => Err(store_failure(&failure)),
+            Err(failure) => Err(execution_failure(&failure)),
         }
     }
 }

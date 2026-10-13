@@ -192,7 +192,11 @@ fn decide(
         AccountCommand::Deposit { .. } | AccountCommand::Withdraw { .. } if !state.open => {
             Err(AccountError::NotOpen)
         }
-        AccountCommand::Deposit { amount } if !amount.is_positive() => Err(AccountError::BadAmount),
+        AccountCommand::Deposit { amount } | AccountCommand::Withdraw { amount }
+            if !amount.is_positive() =>
+        {
+            Err(AccountError::BadAmount)
+        }
         AccountCommand::Deposit { amount } => Ok(vec![
             Deposited {
                 account,
@@ -200,9 +204,6 @@ fn decide(
             }
             .into(),
         ]),
-        AccountCommand::Withdraw { amount } if !amount.is_positive() => {
-            Err(AccountError::BadAmount)
-        }
         AccountCommand::Withdraw { amount } if amount.0 > state.balance => {
             Err(AccountError::InsufficientFunds)
         }
@@ -213,6 +214,19 @@ fn decide(
             }
             .into(),
         ]),
+    }
+}
+
+impl AccountEvent {
+    /// The account the event belongs to, read from its payload —
+    /// [`Opened`] carries none (it opens the stream, and its id comes
+    /// from the stream name), the movements tag themselves.
+    pub fn account_id(&self) -> Option<AccountId> {
+        match self {
+            Self::Opened(_) => None,
+            Self::Deposited(Deposited { account, .. })
+            | Self::Withdrawn(Withdrawn { account, .. }) => Some(AccountId(*account)),
+        }
     }
 }
 

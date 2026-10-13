@@ -272,31 +272,55 @@ fn an_idempotent_command_commits_once() {
     assert_eq!(loaded.state.balance, 10);
 }
 
-#[test]
-fn with_metadata_keeps_a_preset_idempotency_key() {
+/// One open, then one idempotent credit: the setup the preset-key
+/// tests share.
+fn opened_with_a_credit(keyed: bool) -> (App, Store) {
     let (app, store) = app();
     block_on(app.send(Execute::<Wallet>::new(WalletId(1), WalletCommand::Open))).expect("open");
-    // The key is set first; the interaction's metadata carries none, so
-    // it must not clobber it — a repeat still matches the earlier commit.
-    let credit = || {
-        Execute::<Wallet>::new(WalletId(1), WalletCommand::Credit { amount: 10 })
-            .idempotent("deposit-42")
-            .with_metadata(Metadata {
-                correlation_id: Some("req-9".into()),
-                ..Metadata::default()
-            })
+    let credit = Execute::<Wallet>::new(WalletId(1), WalletCommand::Credit { amount: 10 });
+    let credit = if keyed {
+        credit.idempotent("deposit-42").with_metadata(Metadata {
+            correlation_id: Some("req-9".into()),
+            ..Metadata::default()
+        })
+    } else {
+        credit
     };
-    assert!(matches!(
-        block_on(app.send(credit())),
-        Ok(ExecutionOutcome::Committed { .. })
-    ));
-    assert!(matches!(
-        block_on(app.send(credit())),
-        Ok(ExecutionOutcome::AlreadyCommitted { .. })
-    ));
-    assert_eq!(metadata_of(&store).len(), 2);
+    block_on(app.send(credit)).expect("the first credit commits");
+    (app, store)
+}
+
+#[test]
+fn with_metadata_keeps_a_preset_idempotency_key_on_commit() {
+    let (app, _) = opened_with_a_credit(true);
+    let credit = Execute::<Wallet>::new(WalletId(1), WalletCommand::Credit { amount: 10 })
+        .idempotent("deposit-42")
+        .with_metadata(Metadata {
+            correlation_id: Some("req-9".into()),
+            ..Metadata::default()
+        });
+    // The preset key is not clobbered by the stamp: the repeat matches
+    // the earlier commit instead of re-crediting.
+    assert!(
+        matches!(
+            block_on(app.send(credit)),
+            Ok(ExecutionOutcome::AlreadyCommitted { .. })
+        ),
+        "the repeat under the same key is absorbed"
+    );
+}
+
+#[test]
+fn with_metadata_stamps_an_unkeyed_command_once() {
+    let (app, store) = opened_with_a_credit(false);
     let loaded = block_on(app.send(Load::<Wallet>::new(WalletId(1)))).expect("load");
-    assert_eq!(loaded.state.balance, 10);
+    assert_eq!(loaded.state.balance, 10, "the credit folded once");
+    // The open plus the credit: two commits, two metadata rows.
+    assert_eq!(
+        metadata_of(&store).len(),
+        2,
+        "each commit records one interaction"
+    );
 }
 
 // -- the same routes over a snapshotting repository ------------------------

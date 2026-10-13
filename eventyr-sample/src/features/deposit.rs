@@ -5,11 +5,11 @@
 use eventyr::prelude::Version;
 use eventyr_mediator::prelude::*;
 use eventyr_mediator::store::Execute;
-use eventyr_store::prelude::{ExecutionError, ExecutionOutcome};
+use eventyr_store::prelude::ExecutionOutcome;
 use serde::Deserialize;
 
 use crate::domain::{Account, AccountCommand, AccountId, Cash};
-use crate::features::{ApiError, Outcome, Stamped, store_failure};
+use crate::features::{Outcome, Stamped, committed_version, execution_failure};
 
 /// Deposit `amount` into `account`.
 #[derive(Clone, Debug, Deserialize)]
@@ -43,13 +43,12 @@ impl<M: Sender<Execute<Account>>> RequestHandler<Deposit, M> for DepositHandler 
         )
         .with_metadata(request.stamped.metadata);
         match mediator.send(command).await {
-            Ok(ExecutionOutcome::Committed { committed, .. })
-            | Ok(ExecutionOutcome::AlreadyCommitted { committed }) => Ok(committed
-                .last()
-                .map_or(Version::EMPTY, |event| event.version)),
+            Ok(
+                outcome @ (ExecutionOutcome::Committed { .. }
+                | ExecutionOutcome::AlreadyCommitted { .. }),
+            ) => Ok(committed_version(&outcome)),
             Ok(ExecutionOutcome::Noop) => Ok(Version::EMPTY),
-            Err(ExecutionError::Domain(rejection)) => Err(ApiError::Domain(rejection.to_string())),
-            Err(ExecutionError::Store(failure)) => Err(store_failure(&failure)),
+            Err(failure) => Err(execution_failure(&failure)),
         }
     }
 }
@@ -85,13 +84,12 @@ impl<M: Sender<Execute<Account>>> RequestHandler<Withdraw, M> for WithdrawHandle
         )
         .with_metadata(request.stamped.metadata);
         match mediator.send(command).await {
-            Ok(ExecutionOutcome::Committed { committed, .. })
-            | Ok(ExecutionOutcome::AlreadyCommitted { committed }) => Ok(committed
-                .last()
-                .map_or(Version::EMPTY, |event| event.version)),
+            Ok(
+                outcome @ (ExecutionOutcome::Committed { .. }
+                | ExecutionOutcome::AlreadyCommitted { .. }),
+            ) => Ok(committed_version(&outcome)),
             Ok(ExecutionOutcome::Noop) => Ok(Version::EMPTY),
-            Err(ExecutionError::Domain(rejection)) => Err(ApiError::Domain(rejection.to_string())),
-            Err(ExecutionError::Store(failure)) => Err(store_failure(&failure)),
+            Err(failure) => Err(execution_failure(&failure)),
         }
     }
 }

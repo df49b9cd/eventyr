@@ -41,51 +41,49 @@ type MemoryStore = InMemoryStore<AccountEvent>;
 /// The account repository the commands route to, generic over the event
 /// store and the snapshot store the backend supplies — `Arc` so the
 /// composition's `self.accounts` field is pointer-delegated to it.
-type Accounts<S, SS> = Arc<AggregateRepository<Account, Arc<S>, Arc<SS>>>;
-
-/// The interaction's correlation id: the edge stamps one per request.
-pub fn request_id() -> Option<String> {
-    Some(uuid::Uuid::new_v4().to_string())
-}
+type Accounts<Store, Snapshots> = Arc<AggregateRepository<Account, Arc<Store>, Arc<Snapshots>>>;
 
 /// The sample: what `compose` hands the edge and the runners, generic
 /// over the store's concrete types so either backend builds the same
 /// mediator shape. The app is the mediator the edge sends through;
 /// `inputs` is what the runners drive over the store, the view, and the
 /// lease.
-pub struct Sample<S, SS, C, L, V, W>
+pub struct Sample<Store, Snapshots, Checkpoints, Leases, Views, Signal>
 where
-    S: EventStore<Event = AccountEvent> + StreamsAll<Event = AccountEvent> + Send + Sync + 'static,
-    SS: SnapshotStore<State = AccountState> + Send + Sync + 'static,
-    C: CheckpointStore + Send + Sync + 'static,
-    L: ProjectorLease + Send + Sync + 'static,
-    V: ViewStore<Balance> + Send + Sync + 'static,
-    W: CommitSignal + Send + Sync + 'static,
-    Arc<S>: StreamsAll<Event = AccountEvent> + Send + Sync,
-    Arc<SS>: SnapshotStore<State = AccountState> + Send + Sync,
-    Arc<W>: CommitSignal + Send + Sync,
+    Store:
+        EventStore<Event = AccountEvent> + StreamsAll<Event = AccountEvent> + Send + Sync + 'static,
+    Snapshots: SnapshotStore<State = AccountState> + Send + Sync + 'static,
+    Checkpoints: CheckpointStore + Send + Sync + 'static,
+    Leases: ProjectorLease + Send + Sync + 'static,
+    Views: ViewStore<Balance> + Send + Sync + 'static,
+    Signal: CommitSignal + Send + Sync + 'static,
+    Arc<Store>: StreamsAll<Event = AccountEvent> + Send + Sync,
+    Arc<Snapshots>: SnapshotStore<State = AccountState> + Send + Sync,
+    Arc<Signal>: CommitSignal + Send + Sync,
 {
     /// The mediator every slice routes through.
-    pub app: App<S, SS, V>,
+    pub app: App<Store, Snapshots, Views>,
     /// The projection's and saga's shared inputs — the store's checkpoint
     /// port, the lease store, the balances' view store, the source, and
     /// the commit signal, all over one backend.
-    pub inputs: runners::Inputs<S, C, L, V, W>,
+    pub inputs: runners::Inputs<Store, Checkpoints, Leases, Views, Signal>,
     /// Shutdown: when this closes, the runners stop.
     pub shutdown: watch::Sender<bool>,
 }
 
-impl<S, SS, C, L, V, W> Clone for Sample<S, SS, C, L, V, W>
+impl<Store, Snapshots, Checkpoints, Leases, Views, Signal> Clone
+    for Sample<Store, Snapshots, Checkpoints, Leases, Views, Signal>
 where
-    S: EventStore<Event = AccountEvent> + StreamsAll<Event = AccountEvent> + Send + Sync + 'static,
-    SS: SnapshotStore<State = AccountState> + Send + Sync + 'static,
-    C: CheckpointStore + Send + Sync + 'static,
-    L: ProjectorLease + Send + Sync + 'static,
-    V: ViewStore<Balance> + Send + Sync + 'static,
-    W: CommitSignal + Send + Sync + 'static,
-    Arc<S>: StreamsAll<Event = AccountEvent> + Send + Sync,
-    Arc<SS>: SnapshotStore<State = AccountState> + Send + Sync,
-    Arc<W>: CommitSignal + Send + Sync,
+    Store:
+        EventStore<Event = AccountEvent> + StreamsAll<Event = AccountEvent> + Send + Sync + 'static,
+    Snapshots: SnapshotStore<State = AccountState> + Send + Sync + 'static,
+    Checkpoints: CheckpointStore + Send + Sync + 'static,
+    Leases: ProjectorLease + Send + Sync + 'static,
+    Views: ViewStore<Balance> + Send + Sync + 'static,
+    Signal: CommitSignal + Send + Sync + 'static,
+    Arc<Store>: StreamsAll<Event = AccountEvent> + Send + Sync,
+    Arc<Snapshots>: SnapshotStore<State = AccountState> + Send + Sync,
+    Arc<Signal>: CommitSignal + Send + Sync,
 {
     fn clone(&self) -> Self {
         Self {
@@ -104,20 +102,20 @@ eventyr_mediator::mediator! {
     /// delegated through its `Arc`; the queries ride the same
     /// repository's `Load`/`LoadAt`. `StampMetadata` fills every
     /// `HasMetadata` request's ids before the handler runs.
-    pub struct App<S, SS, V>
+    pub struct App<Store, Snapshots, Views>
     where
-        S: EventStore<Event = AccountEvent> + Send + Sync + 'static,
-        SS: SnapshotStore<State = AccountState> + Send + Sync + 'static,
-        V: ViewStore<Balance> + Send + Sync + 'static,
-        Arc<S>: EventStore<Event = AccountEvent> + Send + Sync,
-        Arc<SS>: SnapshotStore<State = AccountState> + Send + Sync,
+        Store: EventStore<Event = AccountEvent> + Send + Sync + 'static,
+        Snapshots: SnapshotStore<State = AccountState> + Send + Sync + 'static,
+        Views: ViewStore<Balance> + Send + Sync + 'static,
+        Arc<Store>: EventStore<Event = AccountEvent> + Send + Sync,
+        Arc<Snapshots>: SnapshotStore<State = AccountState> + Send + Sync,
     {
         /// The account repository the commands route to.
-        accounts: Accounts<S, SS>,
+        accounts: Accounts<Store, Snapshots>,
         /// The balance read path, over the projection's store.
-        balances: BalanceHandler<V>,
+        balances: BalanceHandler<Views>,
         /// The transfer's batch handler.
-        transfer: Arc<TransferHandler<S>>,
+        transfer: Arc<TransferHandler<Store>>,
         /// The stamp on every request that carries metadata.
         stamp: StampMetadata<MetricsStamp>,
     }
@@ -133,13 +131,13 @@ eventyr_mediator::mediator! {
     behaviors { self.stamp }
 }
 
-impl<S, SS, V> Clone for App<S, SS, V>
+impl<Store, Snapshots, Views> Clone for App<Store, Snapshots, Views>
 where
-    S: EventStore<Event = AccountEvent> + Send + Sync + 'static,
-    SS: SnapshotStore<State = AccountState> + Send + Sync + 'static,
-    V: ViewStore<Balance> + Send + Sync + 'static,
-    Arc<S>: EventStore<Event = AccountEvent> + Send + Sync,
-    Arc<SS>: SnapshotStore<State = AccountState> + Send + Sync,
+    Store: EventStore<Event = AccountEvent> + Send + Sync + 'static,
+    Snapshots: SnapshotStore<State = AccountState> + Send + Sync + 'static,
+    Views: ViewStore<Balance> + Send + Sync + 'static,
+    Arc<Store>: EventStore<Event = AccountEvent> + Send + Sync,
+    Arc<Snapshots>: SnapshotStore<State = AccountState> + Send + Sync,
 {
     fn clone(&self) -> Self {
         Self::new(
@@ -159,7 +157,7 @@ pub struct MetricsStamp;
 
 impl eventyr_mediator::store::CorrelationSource for MetricsStamp {
     fn correlation_id(&self) -> Option<String> {
-        request_id()
+        Some(uuid::Uuid::new_v4().to_string())
     }
 }
 
@@ -180,7 +178,8 @@ pub enum Backend {
 impl Backend {
     /// Pick the backend from the environment: the compose-managed
     /// Postgres when `DATABASE_URL` is set, the in-memory store
-    /// otherwise.
+    /// otherwise. On a build without the `postgres` feature a set
+    /// `DATABASE_URL` is ignored — the binary cannot serve it.
     pub fn from_env() -> Self {
         #[cfg(feature = "postgres")]
         if let Ok(url) = std::env::var("DATABASE_URL") {
@@ -192,7 +191,7 @@ impl Backend {
 
 /// The composed application, tagged by which store it runs on. `main`
 /// matches on it to drive the runners and the edge over the one backend
-/// `compose` picked.
+/// `compose` picked; the tests match it to name the concrete sample.
 pub enum Composed {
     /// The in-memory backend.
     Memory(MemorySample),
@@ -202,25 +201,22 @@ pub enum Composed {
 }
 
 impl Composed {
-    /// The in-memory sample, for the tests that always compose it.
-    ///
-    /// Panics if the backend composed was not the in-memory one — the
-    /// tests pass [`Backend::Memory`], so it never is.
-    #[allow(unreachable_patterns)]
-    pub fn into_memory(self) -> MemorySample {
+    /// The in-memory sample, when the backend is the in-memory one; the
+    /// tests match it out of the enum themselves.
+    pub fn memory(self) -> Option<MemorySample> {
         match self {
-            Self::Memory(sample) => sample,
-            #[allow(unreachable_patterns)]
-            _ => panic!("the in-memory backend composes in memory"),
+            Self::Memory(sample) => Some(sample),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => None,
         }
     }
 
-    /// The Postgres sample, for the compose-managed test.
+    /// The Postgres sample, when the backend is the compose-managed one.
     #[cfg(feature = "postgres")]
-    pub fn into_postgres(self) -> compose::PgSample {
+    pub fn postgres(self) -> Option<compose::PgSample> {
         match self {
-            Self::Postgres(sample) => sample,
-            _ => panic!("the postgres backend composes Postgres"),
+            Self::Memory(_) => None,
+            Self::Postgres(sample) => Some(sample),
         }
     }
 }

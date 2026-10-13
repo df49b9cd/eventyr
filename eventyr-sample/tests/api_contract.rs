@@ -13,19 +13,25 @@ async fn memory_sample() -> MemorySample {
     compose(&Backend::Memory)
         .await
         .expect("the in-memory sample composes")
-        .into_memory()
+        .memory()
+        .expect("the in-memory backend composes in memory")
 }
 
 /// Balance is a projection: the read path serves the row the
 /// runner maintains, and a test needs the row current before the read.
-/// One `run_projection_once` pass — the cold start stops at catch-up,
-/// then the read-your-writes holds.
-async fn balance_after_run(sample: &MemorySample, account: u64) -> BalanceRead {
-    let app = sample.app.clone();
-    runners::run_projection_once(&sample.inputs, &sample.shutdown)
+/// One projection pass brings the view up to the writes; the cold
+/// start stops at catch-up, then the read-your-writes holds.
+async fn project_balances(sample: &MemorySample) {
+    runners::run_projection(&sample.inputs, &sample.shutdown)
         .await
         .expect("the projection catches up");
-    app.send(GetBalance { account })
+}
+
+/// Read one account's balance after the projection has caught up.
+async fn read_balance(sample: &MemorySample, account: u64) -> BalanceRead {
+    sample
+        .app
+        .send(GetBalance { account })
         .await
         .expect("the read serves")
         .expect("the account is known")
@@ -70,7 +76,8 @@ async fn a_full_account_lifecycle_commits_in_order() {
         "the version advanced again: {withdrawn:?}"
     );
 
-    let balance = balance_after_run(&sample, 1).await;
+    project_balances(&sample).await;
+    let balance = read_balance(&sample, 1).await;
     assert_eq!(balance.balance.0, 70, "the projection saw the movements");
 }
 

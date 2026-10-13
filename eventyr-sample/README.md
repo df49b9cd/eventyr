@@ -20,9 +20,9 @@ docker compose up --build
 
 The crate's axis is **a miniature bank**: open an account, deposit,
 withdraw, transfer. The point is the architecture, not banking. One
-aggregate (`Account`) holds the one rule a bank cannot break — an account
-never goes below zero — and the shape around it is the CQRS/event-
-sourcing one eventyr composes:
+aggregate (`Account`) holds the one rule a bank cannot break — an
+account never goes below zero — and the shape around it is the
+CQRS/event-sourcing one eventyr composes:
 
 ```text
             ┌──────────────────────────────────────────────┐
@@ -56,8 +56,11 @@ process's own replicas.
 **The cluster** — `docker compose up --build`. A Postgres primary
 serves every API replica through the event store; the replicas share a
 checkpoint and a lease, so exactly one projects while the others stand
-by. Scale the API — `docker compose up --build --scale api=3` — and the
-projection fails over between them.
+by. The read side's balances live in the same store the events do, so
+every replica serves the row the projection last wrote. Scale the API
+— `docker compose up --build --scale api=3` — and the projection fails
+over between them. The credentials and port are the sample's defaults;
+copy `.env.example` to `.env` before the first run.
 
 ```sh
 # Open an account, then deposit and read the balance back.
@@ -98,6 +101,7 @@ eventyr-sample/
 ├── Cargo.toml
 ├── README.md
 ├── Dockerfile
+├── .env.example
 ├── docker-compose.yml
 ├── src/
 │   ├── lib.rs
@@ -110,11 +114,11 @@ eventyr-sample/
 
 The compose-managed test (`tests/compose.rs`) runs against a real
 Postgres. Bring one up with `./scripts/dev-services.sh up` (a throwaway
-container on `127.0.0.1:55432`, the same credentials as the compose
-file), then run it with the backend's feature:
+container on `127.0.0.1:55432`, reading the same variables as the
+compose file), then run it with the backend's feature:
 
 ```sh
-DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55432/eventyr \
+DATABASE_URL=$(./scripts/dev-services.sh url) \
     cargo test -p eventyr-sample --features postgres --test compose -- --include-ignored
 ```
 

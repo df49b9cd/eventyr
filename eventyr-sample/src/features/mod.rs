@@ -10,7 +10,11 @@
 
 use std::fmt;
 
-use eventyr::prelude::{Metadata, StoreError};
+use axum::Json;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use eventyr::prelude::{Metadata, StoreError, Version};
+use eventyr::store::prelude::{ExecutionError, ExecutionOutcome};
 use eventyr_mediator::store::HasMetadata;
 use serde::Serialize;
 
@@ -44,6 +48,23 @@ pub enum ApiError {
     Unavailable,
 }
 
+impl ApiError {
+    /// The HTTP status the edge answers with.
+    pub fn status(&self) -> StatusCode {
+        match self {
+            Self::Domain(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Conflict => StatusCode::CONFLICT,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status(), Json(self)).into_response()
+    }
+}
+
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -56,12 +77,66 @@ impl fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
-/// Maps a store failure to its edge error: a conflict that exhausted
-/// its retries is a 409, anything else is a 503.
-pub fn store_failure(failure: &StoreError) -> ApiError {
+/// The error body the edge serves for every failure: the `error` field
+/// the slices' [`ApiError`]s map to.
+#[derive(Serialize)]
+pub struct ErrorBody {
+    /// The rejection, conflict, or unavailability message.
+    pub error: String,
+}
+
+/// Whatever a command answers at the edge: `200` with the outcome, or
+/// the failure's status and body.
+pub fn respond<T: Serialize>(outcome: Outcome<T>) -> Response {
+    match outcome {
+        Ok(ok) => (StatusCode::OK, Json(OkBody { ok })).into_response(),
+        Err(failure) => failure.into_response(),
+    }
+}
+
+/// The success body the edge serves for every committed command.
+#[derive(Serialize)]
+pub struct OkBody<T> {
+    /// The committed outcome.
+    pub ok: T,
+}
+
+impl From<&StoreError> for ApiError {
+    /// A store failure is two statuses at the edge: an optimistic-
+    /// concurrency or boundary conflict is a 409, and anything the
+    /// store can't answer for is a 503. There is no third arm by
+    /// design — the store's vocabulary maps to the edge one failure
+    /// kind at a time.
+    fn from(failure: &StoreError) -> Self {
+        match failure {
+            StoreError::Conflict { .. } | StoreError::QueryConflict { .. } => Self::Conflict,
+            StoreError::Unavailable
+            | StoreError::StreamClosed { .. }
+            | StoreError::Truncated { .. }
+            | StoreError::Other(_) => Self::Unavailable,
+        }
+    }
+}
+
+/// The version a store execution committed at — the last committed
+/// event's on the committed path, [`Version::EMPTY`] on a no-op.
+pub fn committed_version<E>(outcome: &ExecutionOutcome<E>) -> Version {
+    match outcome {
+        ExecutionOutcome::Committed { committed, .. }
+        | ExecutionOutcome::AlreadyCommitted { committed } => committed
+            .last()
+            .map_or(Version::EMPTY, |event| event.version),
+        ExecutionOutcome::Noop => Version::EMPTY,
+    }
+}
+
+/// Maps an execution's failure to the edge's vocabulary: a domain
+/// rejection names itself, a store failure goes through
+/// [`ApiError::from`].
+pub fn execution_failure<A: eventyr::prelude::Aggregate>(failure: &ExecutionError<A>) -> ApiError {
     match failure {
-        StoreError::Conflict { .. } => ApiError::Conflict,
-        _ => ApiError::Unavailable,
+        ExecutionError::Domain(rejection) => ApiError::Domain(rejection.to_string()),
+        ExecutionError::Store(failure) => ApiError::from(failure),
     }
 }
 

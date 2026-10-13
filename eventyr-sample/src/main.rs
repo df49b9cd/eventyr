@@ -13,14 +13,15 @@
 
 use anyhow::Context;
 use axum::routing::{get, post};
-use axum::{Json, Router, extract::Path, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{Json, Router, extract::Path, extract::State, response::Response};
 use serde::Deserialize;
 use tokio::signal;
 use tokio::sync::watch;
 
+use eventyr::prelude::Version;
 use eventyr_sample::domain::{AccountEvent, AccountState, Cash};
 use eventyr_sample::features::{
-    ApiError, Balance, Deposit, GetBalance, OpenAccount, Outcome, Transfer, Withdraw,
+    Balance, Deposit, GetBalance, OpenAccount, OpenedAccount, Outcome, Transfer, Withdraw, respond,
 };
 use eventyr_sample::wiring::{App, Backend, Composed, Sample, compose, runners};
 
@@ -32,11 +33,14 @@ struct OpenRequestBody {
     owner: String,
 }
 
+/// A money movement's body: the amount only, the account is the path.
 #[derive(Debug, Deserialize)]
 struct MoneyRequestBody {
     amount: Cash,
 }
 
+/// The transfer's body: the two accounts, the amount, and the caller's
+/// idempotency key.
 #[derive(Debug, Deserialize)]
 struct TransferRequestBody {
     from: u64,
@@ -46,132 +50,187 @@ struct TransferRequestBody {
     idempotency_key: Option<String>,
 }
 
-/// Wrap a succeeded command: 200 with the outcome.
-#[derive(serde::Serialize)]
-struct OkJson<T> {
-    ok: T,
+/// The runtime's one config: read from the environment once at `main`,
+/// validated before anything binds. Every field is a variable the
+/// deployment sets; nothing is read deeper in the process.
+#[derive(Debug)]
+struct Config {
+    /// The tracing filter (`RUST_LOG`), or the sample's own quiet
+    /// default.
+    log_filter: String,
+    /// The edge's listen address (`EVENTYR_SAMPLE_ADDR`).
+    listen_addr: std::net::SocketAddr,
+    /// The backend to compose (`DATABASE_URL` picked, in-memory
+    /// otherwise).
+    backend: Backend,
 }
 
-impl<T> OkJson<T> {
-    fn new(value: T) -> Self {
-        Self { ok: value }
+impl Config {
+    /// The default filter, when `RUST_LOG` is not set.
+    const DEFAULT_LOG_FILTER: &'static str = "eventyr_sample=info,tower_http=warn";
+    /// The default bind, when `EVENTYR_SAMPLE_ADDR` is not set.
+    const DEFAULT_LISTEN_ADDR: &'static str = "0.0.0.0:3000";
+
+    /// Read the environment once; fail fast on a mistyped variable
+    /// instead of deep inside `serve`.
+    fn from_env() -> anyhow::Result<Self> {
+        let log_filter =
+            std::env::var("RUST_LOG").unwrap_or_else(|_| Self::DEFAULT_LOG_FILTER.into());
+        let listen_addr = std::env::var("EVENTYR_SAMPLE_ADDR")
+            .unwrap_or_else(|_| Self::DEFAULT_LISTEN_ADDR.into())
+            .parse()
+            .context("EVENTYR_SAMPLE_ADDR must be a socket address")?;
+        let backend = Backend::from_env();
+        #[cfg(not(feature = "postgres"))]
+        if matches!(backend, Backend::Memory) && std::env::var_os("DATABASE_URL").is_some() {
+            tracing::warn!(
+                "DATABASE_URL is set, but this binary was built without the \
+                 `postgres` feature; the in-memory store will serve instead"
+            );
+        }
+        Ok(Self {
+            log_filter,
+            listen_addr,
+            backend,
+        })
     }
 }
 
-/// Wrap a failure the edge maps: the status, and the message.
-#[derive(serde::Serialize)]
-struct ErrJson {
-    error: String,
-}
-
-/// Whatever a command answers: 200 with the outcome, or the edge-mapped
-/// failure.
-fn map_outcome<T: serde::Serialize>(result: Outcome<T>) -> impl IntoResponse {
-    match result {
-        Ok(ok) => (StatusCode::OK, Json(OkJson::new(ok))).into_response(),
-        Err(ApiError::Domain(rejection)) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(ErrJson { error: rejection }),
-        )
-            .into_response(),
-        Err(ApiError::Conflict) => (
-            StatusCode::CONFLICT,
-            Json(ErrJson {
-                error: "conflict: re-issue the command".into(),
-            }),
-        )
-            .into_response(),
-        Err(ApiError::Unavailable) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrJson {
-                error: "the store is unavailable: retry later".into(),
-            }),
-        )
-            .into_response(),
-    }
-}
+/// How long `serve` waits for a runner to stand down after the edge
+/// stops before it aborts the task.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// `POST /accounts` — open an account.
-async fn open<S, SS, V>(
-    State(app): State<App<S, SS, V>>,
+async fn open<Store, Snapshots, Views>(
+    State(app): State<App<Store, Snapshots, Views>>,
     Json(body): Json<OpenRequestBody>,
-) -> impl IntoResponse
+) -> Response
 where
-    S: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync + 'static,
-    SS: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync + 'static,
-    V: eventyr::projection::prelude::ViewStore<Balance> + Send + Sync + 'static,
-    std::sync::Arc<S>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
-    std::sync::Arc<SS>: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync,
+    Store: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync + 'static,
+    Snapshots: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync + 'static,
+    Views: eventyr::projection::prelude::ViewStore<Balance> + Send + Sync + 'static,
+    std::sync::Arc<Store>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
+    std::sync::Arc<Snapshots>:
+        eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync,
 {
-    map_outcome(
-        app.send(OpenAccount {
-            account: body.account,
-            owner: body.owner,
-            stamped: Default::default(),
-        })
-        .await,
-    )
+    respond(open_account(app, body.account, body.owner).await)
+}
+
+/// One account-opening send: the edge's shape for `open`.
+async fn open_account<Store, Snapshots, Views>(
+    app: App<Store, Snapshots, Views>,
+    account: u64,
+    owner: String,
+) -> Outcome<OpenedAccount>
+where
+    Store: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync + 'static,
+    Snapshots: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync + 'static,
+    Views: eventyr::projection::prelude::ViewStore<Balance> + Send + Sync + 'static,
+    std::sync::Arc<Store>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
+    std::sync::Arc<Snapshots>:
+        eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync,
+{
+    app.send(OpenAccount {
+        account,
+        owner,
+        stamped: Default::default(),
+    })
+    .await
 }
 
 /// `POST /accounts/{id}/deposits`.
-async fn deposit<S, SS, V>(
-    State(app): State<App<S, SS, V>>,
+async fn deposit<Store, Snapshots, Views>(
+    State(app): State<App<Store, Snapshots, Views>>,
     Path(account): Path<u64>,
     Json(body): Json<MoneyRequestBody>,
-) -> impl IntoResponse
+) -> Response
 where
-    S: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync + 'static,
-    SS: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync + 'static,
-    V: eventyr::projection::prelude::ViewStore<Balance> + Send + Sync + 'static,
-    std::sync::Arc<S>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
-    std::sync::Arc<SS>: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync,
+    Store: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync + 'static,
+    Snapshots: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync + 'static,
+    Views: eventyr::projection::prelude::ViewStore<Balance> + Send + Sync + 'static,
+    std::sync::Arc<Store>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
+    std::sync::Arc<Snapshots>:
+        eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync,
 {
-    map_outcome(
-        app.send(Deposit {
-            account,
-            amount: body.amount,
-            stamped: Default::default(),
-        })
-        .await,
-    )
+    respond(move_money(app, account, body.amount, Movement::Deposit).await)
 }
 
 /// `POST /accounts/{id}/withdrawals`.
-async fn withdraw<S, SS, V>(
-    State(app): State<App<S, SS, V>>,
+async fn withdraw<Store, Snapshots, Views>(
+    State(app): State<App<Store, Snapshots, Views>>,
     Path(account): Path<u64>,
     Json(body): Json<MoneyRequestBody>,
-) -> impl IntoResponse
+) -> Response
 where
-    S: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync + 'static,
-    SS: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync + 'static,
-    V: eventyr::projection::prelude::ViewStore<Balance> + Send + Sync + 'static,
-    std::sync::Arc<S>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
-    std::sync::Arc<SS>: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync,
+    Store: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync + 'static,
+    Snapshots: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync + 'static,
+    Views: eventyr::projection::prelude::ViewStore<Balance> + Send + Sync + 'static,
+    std::sync::Arc<Store>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
+    std::sync::Arc<Snapshots>:
+        eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync,
 {
-    map_outcome(
-        app.send(Withdraw {
-            account,
-            amount: body.amount,
-            stamped: Default::default(),
-        })
-        .await,
-    )
+    respond(move_money(app, account, body.amount, Movement::Withdraw).await)
+}
+
+/// Which way the money moves; the two `MoneyRequestBody` routes share
+/// the handling.
+#[derive(Clone, Copy)]
+enum Movement {
+    /// Credit the account.
+    Deposit,
+    /// Debit the account.
+    Withdraw,
+}
+
+/// A deposit or a withdrawal, one send: the movement picks the command.
+async fn move_money<Store, Snapshots, Views>(
+    app: App<Store, Snapshots, Views>,
+    account: u64,
+    amount: Cash,
+    movement: Movement,
+) -> Outcome<Version>
+where
+    Store: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync + 'static,
+    Snapshots: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync + 'static,
+    Views: eventyr::projection::prelude::ViewStore<Balance> + Send + Sync + 'static,
+    std::sync::Arc<Store>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
+    std::sync::Arc<Snapshots>:
+        eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync,
+{
+    match movement {
+        Movement::Deposit => {
+            app.send(Deposit {
+                account,
+                amount,
+                stamped: Default::default(),
+            })
+            .await
+        }
+        Movement::Withdraw => {
+            app.send(Withdraw {
+                account,
+                amount,
+                stamped: Default::default(),
+            })
+            .await
+        }
+    }
 }
 
 /// `POST /transfers`.
-async fn transfer<S, SS, V>(
-    State(app): State<App<S, SS, V>>,
+async fn transfer<Store, Snapshots, Views>(
+    State(app): State<App<Store, Snapshots, Views>>,
     Json(body): Json<TransferRequestBody>,
-) -> impl IntoResponse
+) -> Response
 where
-    S: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync + 'static,
-    SS: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync + 'static,
-    V: eventyr::projection::prelude::ViewStore<Balance> + Send + Sync + 'static,
-    std::sync::Arc<S>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
-    std::sync::Arc<SS>: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync,
+    Store: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync + 'static,
+    Snapshots: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync + 'static,
+    Views: eventyr::projection::prelude::ViewStore<Balance> + Send + Sync + 'static,
+    std::sync::Arc<Store>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
+    std::sync::Arc<Snapshots>:
+        eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync,
 {
-    map_outcome(
+    respond(
         app.send(Transfer {
             from: body.from,
             to: body.to,
@@ -185,18 +244,19 @@ where
 
 /// `GET /accounts/{id}/balance` — the read-your-writes row the
 /// projection maintains.
-async fn balance<S, SS, V>(
-    State(app): State<App<S, SS, V>>,
+async fn balance<Store, Snapshots, Views>(
+    State(app): State<App<Store, Snapshots, Views>>,
     Path(account): Path<u64>,
-) -> impl IntoResponse
+) -> Response
 where
-    S: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync + 'static,
-    SS: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync + 'static,
-    V: eventyr::projection::prelude::ViewStore<Balance> + Send + Sync + 'static,
-    std::sync::Arc<S>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
-    std::sync::Arc<SS>: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync,
+    Store: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync + 'static,
+    Snapshots: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync + 'static,
+    Views: eventyr::projection::prelude::ViewStore<Balance> + Send + Sync + 'static,
+    std::sync::Arc<Store>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
+    std::sync::Arc<Snapshots>:
+        eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync,
 {
-    map_outcome(app.send(GetBalance { account }).await)
+    respond(app.send(GetBalance { account }).await)
 }
 
 /// `GET /healthz` — the process is up.
@@ -210,42 +270,63 @@ async fn readyz() -> &'static str {
     "ok"
 }
 
+/// The edge's routes: one per slice.
+fn routes<Store, Snapshots, Views>() -> Router<App<Store, Snapshots, Views>>
+where
+    Store: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync + 'static,
+    Snapshots: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync + 'static,
+    Views: eventyr::projection::prelude::ViewStore<Balance> + Send + Sync + 'static,
+    std::sync::Arc<Store>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
+    std::sync::Arc<Snapshots>:
+        eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync,
+{
+    Router::new()
+        .route("/accounts", post(open))
+        .route("/accounts/{id}/deposits", post(deposit))
+        .route("/accounts/{id}/withdrawals", post(withdraw))
+        .route("/transfers", post(transfer))
+        .route("/accounts/{id}/balance", get(balance))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let config = Config::from_env()?;
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "eventyr_sample=info,tower_http=warn".into()),
-        )
+        .with_env_filter(config.log_filter.clone())
         .init();
 
-    let backend = Backend::from_env();
-    match compose(&backend).await? {
-        Composed::Memory(sample) => serve(sample).await,
+    match compose(&config.backend).await? {
+        Composed::Memory(sample) => serve(sample, config.listen_addr).await,
         #[cfg(feature = "postgres")]
-        Composed::Postgres(sample) => serve(sample).await,
+        Composed::Postgres(sample) => serve(sample, config.listen_addr).await,
     }
 }
 
 /// Run one composed sample: the projection and the saga as this
 /// process's own replicas, and the edge over the mediator, until
 /// shutdown.
-async fn serve<S, SS, C, L, V, W>(sample: Sample<S, SS, C, L, V, W>) -> anyhow::Result<()>
+async fn serve<Store, Snapshots, Checkpoints, Leases, Views, Signal>(
+    sample: Sample<Store, Snapshots, Checkpoints, Leases, Views, Signal>,
+    listen_addr: std::net::SocketAddr,
+) -> anyhow::Result<()>
 where
-    S: eventyr::store::prelude::EventStore<Event = AccountEvent>
+    Store: eventyr::store::prelude::EventStore<Event = AccountEvent>
         + eventyr::store::prelude::StreamsAll<Event = AccountEvent>
         + Send
         + Sync
         + 'static,
-    SS: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync + 'static,
-    C: eventyr::subscription::prelude::CheckpointStore + Send + Sync + 'static,
-    L: eventyr::subscription::prelude::ProjectorLease + Send + Sync + 'static,
-    V: eventyr::projection::prelude::ViewStore<Balance> + Send + Sync + 'static,
-    W: eventyr::subscription::prelude::CommitSignal + Send + Sync + 'static,
-    std::sync::Arc<S>: eventyr::store::prelude::StreamsAll<Event = AccountEvent> + Send + Sync,
-    std::sync::Arc<S>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
-    std::sync::Arc<SS>: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync,
-    std::sync::Arc<W>: eventyr::subscription::prelude::CommitSignal + Send + Sync,
+    Snapshots: eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync + 'static,
+    Checkpoints: eventyr::subscription::prelude::CheckpointStore + Send + Sync + 'static,
+    Leases: eventyr::subscription::prelude::ProjectorLease + Send + Sync + 'static,
+    Views: eventyr::projection::prelude::ViewStore<Balance> + Send + Sync + 'static,
+    Signal: eventyr::subscription::prelude::CommitSignal + Send + Sync + 'static,
+    std::sync::Arc<Store>: eventyr::store::prelude::StreamsAll<Event = AccountEvent> + Send + Sync,
+    std::sync::Arc<Store>: eventyr::store::prelude::EventStore<Event = AccountEvent> + Send + Sync,
+    std::sync::Arc<Snapshots>:
+        eventyr::store::prelude::SnapshotStore<State = AccountState> + Send + Sync,
+    std::sync::Arc<Signal>: eventyr::subscription::prelude::CommitSignal + Send + Sync,
 {
     let shutdown = sample.shutdown.clone();
     let app = sample.app.clone();
@@ -253,7 +334,7 @@ where
     let projection = tokio::spawn({
         let inputs = sample.inputs.clone();
         let shutdown = sample.shutdown.clone();
-        async move { runners::run_projection_once(&inputs, &shutdown).await }
+        async move { runners::run_projection(&inputs, &shutdown).await }
     });
     let saga = tokio::spawn({
         let inputs = sample.inputs.clone();
@@ -263,20 +344,10 @@ where
     });
 
     let server = axum::serve(
-        tokio::net::TcpListener::bind(
-            std::env::var("EVENTYR_SAMPLE_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".into()),
-        )
-        .await
-        .context("bind the edge")?,
-        Router::new()
-            .route("/accounts", post(open))
-            .route("/accounts/{id}/deposits", post(deposit))
-            .route("/accounts/{id}/withdrawals", post(withdraw))
-            .route("/transfers", post(transfer))
-            .route("/accounts/{id}/balance", get(balance))
-            .route("/healthz", get(healthz))
-            .route("/readyz", get(readyz))
-            .with_state(app),
+        tokio::net::TcpListener::bind(listen_addr)
+            .await
+            .context("bind the edge")?,
+        routes().with_state(app),
     )
     .with_graceful_shutdown(async move {
         shutdown_signal(shutdown).await;
@@ -284,10 +355,9 @@ where
 
     server.await.context("serve the edge")?;
 
-    projection.abort();
-    saga.abort();
-    let _ = projection.await;
-    let _ = saga.await;
+    let _ = sample.shutdown.send(true);
+    let _ = tokio::time::timeout(SHUTDOWN_GRACE, projection).await;
+    let _ = tokio::time::timeout(SHUTDOWN_GRACE, saga).await;
     Ok(())
 }
 
