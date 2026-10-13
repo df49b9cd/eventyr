@@ -63,11 +63,21 @@ fn display(ty: &Type) -> String {
 }
 
 /// Which route kinds share one namespace (and one dispatch enum).
-fn class(kind: RouteKind) -> u8 {
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Class {
+    /// `command` and `query`.
+    Request,
+    /// `stream`.
+    Stream,
+    /// `event`.
+    Notification,
+}
+
+fn class(kind: RouteKind) -> Class {
     match kind {
-        RouteKind::Command | RouteKind::Query => 0,
-        RouteKind::Stream => 1,
-        RouteKind::Event => 2,
+        RouteKind::Command | RouteKind::Query => Class::Request,
+        RouteKind::Stream => Class::Stream,
+        RouteKind::Event => Class::Notification,
     }
 }
 
@@ -98,7 +108,7 @@ fn validate(composition: &Composition) -> syn::Result<()> {
         None => errors = Some(error),
     };
 
-    let mut seen: BTreeMap<(u8, String), &Route> = BTreeMap::new();
+    let mut seen: BTreeMap<(Class, String), &Route> = BTreeMap::new();
     for route in &composition.routes {
         let slot = (class(route.kind), key(&route.message));
         if let Some(first) = seen.get(&slot) {
@@ -126,9 +136,13 @@ fn validate(composition: &Composition) -> syn::Result<()> {
     }
 
     let enums = [
-        (&composition.requests, 0, "request (`command` or `query`)"),
-        (&composition.streams, 1, "`stream`"),
-        (&composition.notifications, 2, "`event`"),
+        (
+            &composition.requests,
+            Class::Request,
+            "request (`command` or `query`)",
+        ),
+        (&composition.streams, Class::Stream, "`stream`"),
+        (&composition.notifications, Class::Notification, "`event`"),
     ];
     for (enumeration, wanted, what) in enums {
         let Some(enumeration) = enumeration else {
@@ -424,8 +438,8 @@ impl<'c> Expansion<'c> {
             }
             KindRoutes { concrete, generic }
         };
-        let requests = routes_of(&|kind| class(kind) == 0);
-        let streams = routes_of(&|kind| kind == RouteKind::Stream);
+        let requests = routes_of(&|kind| class(kind) == Class::Request);
+        let streams = routes_of(&|kind| class(kind) == Class::Stream);
 
         /// A stage list, its probe kind, and the routes it is checked
         /// against.
@@ -784,7 +798,7 @@ impl<'c> Expansion<'c> {
     }
 
     /// The routes of one class with their variants (validated).
-    fn variants(&self, wanted: u8) -> syn::Result<(Vec<&Type>, Vec<Ident>, Vec<String>)> {
+    fn variants(&self, wanted: Class) -> syn::Result<(Vec<&Type>, Vec<Ident>, Vec<String>)> {
         let mut messages = Vec::new();
         let mut variants = Vec::new();
         let mut docs = Vec::new();
@@ -804,7 +818,7 @@ impl<'c> Expansion<'c> {
     /// `requests AnyRequest -> AnyResponse;`
     fn requests(&self, enumeration: &Enumeration) -> syn::Result<TokenStream> {
         let krate = self.krate;
-        let (messages, variants, docs) = self.variants(0)?;
+        let (messages, variants, docs) = self.variants(Class::Request)?;
         let Enumeration {
             attrs,
             name: enum_name,
@@ -880,7 +894,7 @@ impl<'c> Expansion<'c> {
     /// `streams AnyStream -> AnyItem;`
     fn streams(&self, enumeration: &Enumeration) -> syn::Result<TokenStream> {
         let krate = self.krate;
-        let (messages, variants, docs) = self.variants(1)?;
+        let (messages, variants, docs) = self.variants(Class::Stream)?;
         let Enumeration {
             attrs,
             name: enum_name,
@@ -972,7 +986,7 @@ impl<'c> Expansion<'c> {
     /// `notifications AnyNotification -> AnyNotificationError;`
     fn notifications(&self, enumeration: &Enumeration) -> syn::Result<TokenStream> {
         let krate = self.krate;
-        let (messages, variants, docs) = self.variants(2)?;
+        let (messages, variants, docs) = self.variants(Class::Notification)?;
         let Enumeration {
             attrs,
             name: enum_name,
